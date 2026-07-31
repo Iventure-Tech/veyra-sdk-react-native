@@ -21,7 +21,9 @@ which is also the home of the full developer guide.
 
 ## Requirements
 
-- React Native **0.71+** (classic architecture and new architecture via interop).
+- React Native **0.80+** (0.79 with a Kotlin override — the SDK's Kotlin 2.2 metadata
+  needs your app's Kotlin to be 2.1+, which earlier React Native Gradle plugins cannot
+  run). Classic architecture and new architecture (via interop) both work.
 - **Android:** minSdk 28, a physical NFC-capable device.
 - **iOS:** iOS 15+, a physical iPhone, and your Apple Developer **Team ID**.
 - **Veyra onboarding credentials:** artifact-repository username/password, OAuth
@@ -35,14 +37,34 @@ npm install veyra-sdk-react-native
 
 ### Android
 
-The native SDK resolves from the Veyra Maven repository (authenticated). Add your
-repository credentials to `~/.gradle/gradle.properties` (or your CI's environment
-as `VEYRA_REPO_USERNAME` / `VEYRA_REPO_PASSWORD`):
+The native SDK resolves from the Veyra Maven repository (authenticated). Two steps:
 
-```properties
-veyraRepoUsername=your-repo-username
-veyraRepoPassword=your-repo-password
-```
+1. Add your repository credentials to `~/.gradle/gradle.properties` (or your CI's
+   environment as `VEYRA_REPO_USERNAME` / `VEYRA_REPO_PASSWORD`):
+
+   ```properties
+   veyraRepoUsername=your-repo-username
+   veyraRepoPassword=your-repo-password
+   ```
+
+2. Declare the repository in your app's `android/build.gradle` — your app's own
+   classpath pulls the `co.veyra:*` artifacts transitively, so the repository must be
+   visible to it, not just to this package:
+
+   ```groovy
+   allprojects {
+       repositories {
+           maven {
+               name = "veyra"
+               url = "https://repo.veyra.co/releases"
+               credentials {
+                   username = findProperty("veyraRepoUsername") ?: System.getenv("VEYRA_REPO_USERNAME") ?: ""
+                   password = findProperty("veyraRepoPassword") ?: System.getenv("VEYRA_REPO_PASSWORD") ?: ""
+               }
+           }
+       }
+   }
+   ```
 
 Your app also needs the NFC permission and (for tap-to-pay) the SDK's HCE service
 registration in its manifest — copy the manifest block from the sample app's
