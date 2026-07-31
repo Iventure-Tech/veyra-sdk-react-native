@@ -99,7 +99,6 @@ class VeyraSdkReactNative: RCTEventEmitter {
       clientSecret: walletMap["clientSecret"] as? String,
       paymentAppProviderID: walletMap["paymentAppProviderId"] as? String,
       tokenRequestorID: walletMap["tokenRequestorId"] as? String,
-      deviceType: walletMap["deviceType"] as? String,
       appVersion: walletMap["appVersion"] as? String ?? "1.0.0",
       appleTeamID: appleTeamID,
       allowedAcquirerIDs: walletMap["allowedAcquirerIds"] as? [String] ?? [],

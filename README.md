@@ -105,7 +105,6 @@ await Veyra.initialize({
     clientSecret: VEYRA_CLIENT_SECRET,
     paymentAppProviderId: VEYRA_PAYMENT_APP_PROVIDER_ID,
     tokenRequestorId: VEYRA_TOKEN_REQUESTOR_ID,
-    deviceType: 'MOBILE',                    // Android; auto-detected on iOS
     allowedCountryCodes: ['0566'],
     recommendationStandardVersion: '1.0',    // Android
     appleTeamId: 'YOURTEAMID',               // iOS

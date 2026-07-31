@@ -27,11 +27,6 @@ export interface VeyraWalletConfig {
   clientSecret: string;
   paymentAppProviderId: string;
   tokenRequestorId: string;
-  /**
-   * Android: required — one of 'MOBILE' | 'TABLET' | 'WATCH' | 'OTHER'.
-   * iOS: auto-detected; set only to override.
-   */
-  deviceType?: DeviceType;
   /** ISO 3166-1 numeric (4-digit, zero-padded). Android: required (may be empty). */
   allowedCountryCodes?: string[];
   /** Android: required before digitising. iOS: fixed by the SDK. */
@@ -50,8 +45,6 @@ export interface VeyraConfig {
   softpos: VeyraSoftposConfig;
   wallet: VeyraWalletConfig;
 }
-
-export type DeviceType = 'MOBILE' | 'TABLET' | 'WATCH' | 'OTHER';
 
 // ── Wallet: add card / digitise ───────────────────────────────────────────────
 
