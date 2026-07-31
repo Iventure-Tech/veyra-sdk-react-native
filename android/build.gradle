@@ -1,0 +1,86 @@
+// Veyra React Native SDK — Android native module.
+//
+// Dual-mode dependencies (like the Swift package): inside the SDK monorepo the module
+// builds against the sibling projects; consumed from npm (autolinking) it resolves the
+// published co.veyra:* artifacts from the Veyra Maven repository, using the repository
+// credentials from your onboarding pack.
+
+def isMonorepoBuild = rootProject.findProject(':veyra-sdk') != null
+
+// Pinned by the release train to the SDK version this wrapper shipped with.
+def veyraSdkVersion = "1.0.5" // VEYRA-SDK-VERSION-MARKER (pinned by the release train)
+
+def reactNativeVersion = project.hasProperty('veyraReactNativeVersion')
+        ? project.property('veyraReactNativeVersion')
+        : '0.75.4'
+
+buildscript {
+    // Standalone/monorepo safety: when consumed via React Native autolinking the app's
+    // build provides these plugins and this block is effectively a no-op.
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+apply plugin: 'com.android.library'
+apply plugin: 'org.jetbrains.kotlin.android'
+
+android {
+    namespace 'co.veyra.reactnative'
+    compileSdk 34
+
+    defaultConfig {
+        minSdk 28
+        consumerProguardFiles 'consumer-rules.pro'
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+}
+
+repositories {
+    google()
+    mavenCentral()
+    if (!isMonorepoBuild) {
+        maven {
+            name = 'veyra'
+            url = 'https://repo.veyra.co/releases'
+            credentials {
+                username = project.findProperty('veyraRepoUsername') ?: System.getenv('VEYRA_REPO_USERNAME') ?: ''
+                password = project.findProperty('veyraRepoPassword') ?: System.getenv('VEYRA_REPO_PASSWORD') ?: ''
+            }
+        }
+    }
+}
+
+dependencies {
+    if (isMonorepoBuild) {
+        compileOnly "com.facebook.react:react-android:${reactNativeVersion}"
+        api project(':veyra-sdk')
+    } else {
+        // In a consumer app the React Native Gradle plugin pins react-android itself.
+        implementation 'com.facebook.react:react-android'
+        api "co.veyra:veyra-sdk:${veyraSdkVersion}"
+    }
+
+    implementation 'androidx.annotation:annotation:1.7.1'
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.robolectric:robolectric:4.11.1'
+    testImplementation 'androidx.test:core:1.5.0'
+    testImplementation "com.facebook.react:react-android:${reactNativeVersion}"
+}
+
+// Release-train leg (showroom sync + VeyraKMP.podspec + npm publish) — monorepo only.
+if (isMonorepoBuild) {
+    apply from: "${rootDir}/gradle/rn-publish.gradle"
+}

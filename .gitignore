@@ -1,0 +1,6 @@
+node_modules/
+lib/
+android/build/
+android/.gradle/
+Artifacts/
+*.tgz

@@ -1,0 +1,46 @@
+{
+  "name": "veyra-sdk-react-native",
+  "version": "1.0.5",
+  "description": "Official React Native SDK for Veyra contactless payments — SoftPOS merchant acceptance and wallet tap/QR payments.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "react-native": "src/index.ts",
+  "source": "src/index.ts",
+  "files": [
+    "src",
+    "android/build.gradle",
+    "android/src/main",
+    "android/consumer-rules.pro",
+    "ios",
+    "veyra-sdk-react-native.podspec",
+    "README.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "react-native",
+    "veyra",
+    "payments",
+    "softpos",
+    "tap-to-pay",
+    "nfc",
+    "wallet",
+    "tokenisation"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Iventure-Tech/veyra-sdk-react-native.git"
+  },
+  "license": "SEE LICENSE IN README.md",
+  "peerDependencies": {
+    "react": "*",
+    "react-native": ">=0.71.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.0",
+    "react": "18.2.0",
+    "react-native": "0.75.4",
+    "typescript": "^5.4.0"
+  }
+}
