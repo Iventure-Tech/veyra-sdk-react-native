@@ -36,6 +36,7 @@ internal object VeyraPromises {
                 } else {
                     "REQUEST_FAILED" to t.errorCodeString
                 }
+            message.startsWith("AMOUNT_EXCEEDS_CARD_LIMIT:") -> "AMOUNT_EXCEEDS_CARD_LIMIT" to null
             message.startsWith("ONLINE_REQUIRED:") -> "ONLINE_REQUIRED" to null
             message.startsWith("TOKEN_NOT_ACTIVE:") -> "TOKEN_NOT_ACTIVE" to null
             message.startsWith("CDCVM required") -> "CDCVM_REQUIRED" to null

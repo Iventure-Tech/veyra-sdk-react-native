@@ -219,6 +219,12 @@ export interface Card {
   tokenId: string | null;
   maskedPan: string;
   panLastFour: string;
+  /**
+   * The card's display name — the scheme's application label and the masked last four of the
+   * device PAN, e.g. `AFRIGO ****1234`. Not a person's name: a token is not a named credential,
+   * so this carries no personal data. It is also what the card presents to a terminal in EMV tag
+   * `5F20`. Empty on cards digitised before it existed.
+   */
   cardHolderName: string | null;
   expiry: string | null;
   /** iOS only. */
@@ -282,9 +288,15 @@ export interface PaymentOutcome {
   approved: boolean;
   responseCode: string | null;
   message: string | null;
-  /** Android only. */
+  /**
+   * Registered merchant name returned by the gateway — authoritative over the name printed in
+   * the scanned QR. `null` when the gateway did not supply one.
+   */
   merchantName: string | null;
-  /** Android only. */
+  /**
+   * Registered merchant location (`"city, state"`) returned by the gateway. `null` when the
+   * gateway did not supply one — fall back to the scanned QR's `merchantCity`.
+   */
   merchantLocation: string | null;
 }
 
@@ -309,6 +321,10 @@ export interface TransactionSummary {
   transactionCurrencyCode: string | null;
   transactionHash: string | null;
   authorizationStatus: 'PENDING' | 'APPROVED' | 'DECLINED' | 'FAILED' | null;
+  /**
+   * Contactless date/time from the card exchange (EMV tags 9A + 9F21). Android tap rows only —
+   * always `null` on iOS (no tap rail) and on QR rows, which carry `atEpochMillis` instead.
+   */
   localTransactionDateTime: string | null;
   atEpochMillis: number | null;
   entryMethod: EntryMethod | null;
@@ -476,6 +492,14 @@ export interface ScannedCustomerQr {
   maskedCard: string;
   amountMinorUnits: number;
   currencyNumeric: string;
+  /**
+   * The paying card's display name (EMV tag `5F20`), e.g. `AFRIGO ****1234` — the same value a
+   * tap presents. `null` when the QR carries none.
+   *
+   * Display only: unlike the amount and currency it rides outside the QR's cryptogram, so show it
+   * on the confirm screen and receipt but never branch a payment decision on it.
+   */
+  cardholderName: string | null;
 }
 
 export interface CustomerQrChargeOutcome {
@@ -495,12 +519,24 @@ export interface MerchantTransaction {
   transactionTime: string | null;
   currencyCode: string | null;
   transactionId: string | null;
-  /** iOS only: 'TAP' | 'QR_MPM' | 'QR_CPM'. */
-  rail: string | null;
+  /** Which rail took the payment: 'TAP' | 'QR_MPM' | 'QR_CPM'. Display `railLabel`. */
+  rail: string;
+  /**
+   * Human label for `rail` — 'Tap' / 'QR' / 'Scan'. Derived by the SDK so both platforms word it
+   * identically; an unrecognised rail code is passed through unchanged.
+   */
+  railLabel: string;
   /** iOS only. */
   maskedTokenLast4: string | null;
   /** iOS only. */
   transactionHash: string | null;
+  /**
+   * Cardholder Name (EMV tag `5F20`) as the card presented it — on a Veyra token the card's
+   * display name (application label + masked last four, e.g. `AFRIGO ****1234`), not a person's
+   * name. `null` on QR-MPM payments (the merchant never reads the card), on transactions
+   * recorded before this field existed, and when the card carried no `5F20`.
+   */
+  cardholderName: string | null;
 }
 
 export interface MerchantReceipt {
@@ -512,6 +548,13 @@ export interface MerchantReceipt {
   maskedToken: string | null;
   merchantTransactionReference: string;
   transactionHash: string | null;
+  /**
+   * Cardholder Name (EMV tag `5F20`) as the card presented it — on a Veyra token the card's
+   * display name (e.g. `AFRIGO ****1234`), not a person's name. `null` on QR-MPM payments and on
+   * transactions recorded before the SDK captured it. Merchant-side display only: it is not part
+   * of the receipt QR the customer's wallet scans.
+   */
+  cardholderName: string | null;
   /** Android only: ready-made 512×512 PNG. */
   qrCodeBase64: string | null;
   /** iOS only: raw payload for the app to render. */

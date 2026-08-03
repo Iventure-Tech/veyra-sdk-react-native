@@ -700,6 +700,7 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
             putString("maskedCard", "•••• " + scanned.dpan.takeLast(4))
             putDouble("amountMinorUnits", scanned.amountMinorUnits.toDouble())
             putString("currencyNumeric", scanned.currencyNumeric4)
+            putString("cardholderName", scanned.cardholderName)
         })
     }
 

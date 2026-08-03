@@ -3,15 +3,18 @@
 # The native SDK ships as a prebuilt XCFramework hosted on the Veyra artifact server
 # (authenticated: your repository credentials must be in ~/.netrc — see the README).
 # It is downloaded and checksum-verified at `pod install`; nothing else to configure.
+#
+# The Swift API (VeyraSDK / VeyraSoftPOS / VeyraWallet) is compiled from ios/VeyraFacade/,
+# which the release train copies in — so this pod is self-contained: framework + facade + bridge.
 
 require "json"
 
 package = JSON.parse(File.read(File.join(__dir__, "package.json")))
 
 # Pinned by the release train to the SDK version this wrapper shipped with.
-veyra_kmp_version  = "1.0.10" # VEYRA-KMP-VERSION-MARKER (pinned by the release train)
-veyra_kmp_zip_url  = "https://repo.veyra.co/releases/files/VeyraKMP-1.0.10.xcframework.zip" # VEYRA-KMP-URL-MARKER
-veyra_kmp_checksum = "6d49c76c9dc874577f333bb33907e768f0d30845e4c0f35778e0bd0e906bbf8e" # VEYRA-KMP-CHECKSUM-MARKER
+veyra_kmp_version  = "1.0.11" # VEYRA-KMP-VERSION-MARKER (pinned by the release train)
+veyra_kmp_zip_url  = "https://repo.veyra.co/releases/files/VeyraKMP-1.0.11.xcframework.zip" # VEYRA-KMP-URL-MARKER
+veyra_kmp_checksum = "d481ae229a2281e517160eacf850d68ecd27ab1e1469538ddf7c0085720a1676" # VEYRA-KMP-CHECKSUM-MARKER
 
 Pod::Spec.new do |s|
   s.name         = "veyra-sdk-react-native"
@@ -33,18 +36,34 @@ Pod::Spec.new do |s|
     MSG
   end
 
-  # Download + verify + unpack the framework once per pod install. curl -n reads
-  # ~/.netrc for the artifact-server credentials (same mechanism as Swift Package
-  # Manager); the checksum is the SwiftPM one (SHA-256 of the zip).
-  s.prepare_command = <<~CMD
-    set -euo pipefail
-    mkdir -p Artifacts
-    if [ ! -d "Artifacts/VeyraKMP.xcframework" ]; then
-      curl -n -f -L -o Artifacts/VeyraKMP.xcframework.zip "#{veyra_kmp_zip_url}"
-      echo "#{veyra_kmp_checksum}  Artifacts/VeyraKMP.xcframework.zip" | shasum -a 256 -c -
-      (cd Artifacts && unzip -q VeyraKMP.xcframework.zip && rm VeyraKMP.xcframework.zip)
-    fi
-  CMD
+  # Download + verify + unpack the framework, once. curl -n reads ~/.netrc for the
+  # artifact-server credentials (same mechanism as Swift Package Manager); the checksum
+  # is the SwiftPM one (SHA-256 of the zip).
+  #
+  # This runs HERE, in the podspec body, and not in a `prepare_command`: React Native
+  # autolinking installs this package from node_modules as a local (`:path`) pod, and
+  # CocoaPods runs `prepare_command` only for pods it downloads itself — so for every
+  # React Native app that hook never fires. The podspec, by contrast, is evaluated on
+  # every `pod install`. Already unpacked (or dropped in by a local build) ⇒ no-op.
+  artifacts = File.join(__dir__, "Artifacts")
+  unless File.directory?(File.join(artifacts, "VeyraKMP.xcframework"))
+    Pod::UI.puts "[veyra-sdk-react-native] Fetching VeyraKMP #{veyra_kmp_version}…" if defined?(Pod::UI)
+    fetched = system("/bin/bash", "-c", <<~CMD)
+      set -euo pipefail
+      mkdir -p "#{artifacts}"
+      cd "#{artifacts}"
+      curl -n -f -sS -L -o VeyraKMP.xcframework.zip "#{veyra_kmp_zip_url}"
+      echo "#{veyra_kmp_checksum}  VeyraKMP.xcframework.zip" | shasum -a 256 -c -
+      unzip -q VeyraKMP.xcframework.zip
+      rm VeyraKMP.xcframework.zip
+    CMD
+    raise <<~MSG unless fetched
+      [veyra-sdk-react-native] Could not fetch the Veyra framework from
+      #{veyra_kmp_zip_url}
+      The download is authenticated: put your Veyra repository credentials in ~/.netrc
+      (chmod 600) as described in the README, then run `pod install` again.
+    MSG
+  end
 
   s.vendored_frameworks = "Artifacts/VeyraKMP.xcframework"
 

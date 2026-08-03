@@ -315,9 +315,12 @@ internal object Mappers {
         putString("transactionTime", t.transactionTime)
         putString("currencyCode", t.currencyCode)
         putString("transactionId", t.transactionId)
-        putNull("rail")
+        putString("rail", t.rail)
+        putString("railLabel", t.railLabel)
+        // Android's TransactionInfo carries neither — the iOS record does (see the Swift bridge).
         putNull("maskedTokenLast4")
         putNull("transactionHash")
+        putString("cardholderName", t.cardholderName)
     }
 
     fun merchantReceipt(r: TransactionReceiptResult): WritableMap = Arguments.createMap().apply {
@@ -331,5 +334,6 @@ internal object Mappers {
         putString("transactionHash", r.transactionHash)
         putString("qrCodeBase64", r.qrCodeBase64)
         putNull("qrPayload")
+        putString("cardholderName", r.cardholderName)
     }
 }

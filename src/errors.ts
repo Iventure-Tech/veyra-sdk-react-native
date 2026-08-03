@@ -17,6 +17,11 @@ export type VeyraErrorCode =
   | 'MODE_REFUSED'
   /** Card temporarily can't pay; device must come online. SDK self-heals. */
   | 'ONLINE_REQUIRED'
+  /**
+   * The amount is larger than this card can carry in one payment. Unlike `ONLINE_REQUIRED`
+   * this does NOT resolve by going online — offer a smaller amount or another card.
+   */
+  | 'AMOUNT_EXCEEDS_CARD_LIMIT'
   | 'TOKEN_NOT_ACTIVE'
   /** Fresh device authentication (biometric/passcode) required before this payment. */
   | 'CDCVM_REQUIRED'
@@ -59,6 +64,7 @@ const KNOWN_CODES: ReadonlySet<string> = new Set<VeyraErrorCode>([
   'SESSION_REQUIRED',
   'MODE_REFUSED',
   'ONLINE_REQUIRED',
+  'AMOUNT_EXCEEDS_CARD_LIMIT',
   'TOKEN_NOT_ACTIVE',
   'CDCVM_REQUIRED',
   'AUTH_CANCELLED',

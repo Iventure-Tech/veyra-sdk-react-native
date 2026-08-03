@@ -1,8 +1,9 @@
 import Foundation
 import React
-import VeyraSDK
-import VeyraSoftPOS
-import VeyraWallet
+
+// No `import VeyraSDK` / `VeyraSoftPOS` / `VeyraWallet`: the Swift facade is compiled into this
+// pod alongside the bridge, so its types are in the same module. (Swift Package Manager consumers
+// still get the three separate modules from the SPM package.)
 
 /**
  * The Veyra native module (iOS). Classic RCTEventEmitter module; new-architecture apps
@@ -49,6 +50,8 @@ class VeyraSdkReactNative: RCTEventEmitter {
       return ("NOT_CONFIGURED", "Call Veyra.initialize first")
     case let VeyraWalletError.onlineRequired(message):
       return ("ONLINE_REQUIRED", message)
+    case let VeyraWalletError.amountExceedsCardLimit(message):
+      return ("AMOUNT_EXCEEDS_CARD_LIMIT", message)
     case let VeyraWalletError.tokenNotActive(message):
       return ("TOKEN_NOT_ACTIVE", message)
     case let VeyraWalletError.authenticationFailed(message):
@@ -349,7 +352,7 @@ class VeyraSdkReactNative: RCTEventEmitter {
       "tokenId": NSNull(),
       "maskedPan": card.maskedPAN,
       "panLastFour": card.panLastFour,
-      "cardHolderName": card.accountHolderName,
+      "cardHolderName": card.cardHolderName,
       "expiry": card.expiry,
       "bankName": card.bankName as Any,
       "cardScheme": NSNull(),
@@ -374,10 +377,15 @@ class VeyraSdkReactNative: RCTEventEmitter {
   func walletGetActiveCard(_ resolve: @escaping RCTPromiseResolveBlock,
                            rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     guard initialized else { return rejectNotInitialized(rejecter) }
-    if let card = VeyraWallet.shared.tokenisation.activeToken {
-      resolve(cardDict(card))
-    } else {
-      resolve(nil)
+    Task {
+      do {
+        // `activeToken` is an async throwing property (it reads the stored token list).
+        if let card = try await VeyraWallet.shared.tokenisation.activeToken {
+          resolve(self.cardDict(card))
+        } else {
+          resolve(nil)
+        }
+      } catch { self.reject(rejecter, error) }
     }
   }
 
@@ -453,8 +461,8 @@ class VeyraSdkReactNative: RCTEventEmitter {
           "approved": outcome.approved,
           "responseCode": outcome.responseCode as Any,
           "message": outcome.message as Any,
-          "merchantName": NSNull(),
-          "merchantLocation": NSNull(),
+          "merchantName": outcome.merchantName as Any,
+          "merchantLocation": outcome.merchantLocation as Any,
         ])
       } catch { self.reject(rejecter, error) }
     }
@@ -502,7 +510,9 @@ class VeyraSdkReactNative: RCTEventEmitter {
       "transactionCurrencyCode": s.transactionCurrencyCode as Any,
       "transactionHash": s.transactionHash as Any,
       "authorizationStatus": s.authorizationStatus as Any,
-      "localTransactionDateTime": s.localTransactionDateTime as Any,
+      // Always null on iOS: the field carries the contactless date/time from the card exchange
+      // (EMV tags 9A + 9F21), and there is no tap rail on iOS — QR rows use `atEpochMillis`.
+      "localTransactionDateTime": NSNull(),
       "atEpochMillis": s.atEpochMillis as Any,
       "entryMethod": s.entryMethod as Any,
       "merchantLocation": s.merchantLocation as Any,
@@ -893,6 +903,7 @@ class VeyraSdkReactNative: RCTEventEmitter {
           "maskedCard": scanned.maskedCard,
           "amountMinorUnits": scanned.amountMinorUnits,
           "currencyNumeric": scanned.currencyNumeric,
+          "cardholderName": scanned.cardholderName as Any,
         ])
       } catch { self.reject(rejecter, error) }
     }
@@ -930,8 +941,10 @@ class VeyraSdkReactNative: RCTEventEmitter {
       "currencyCode": t.currencyNumeric as Any,
       "transactionId": t.transactionID as Any,
       "rail": t.rail,
+      "railLabel": t.railLabel,
       "maskedTokenLast4": t.maskedTokenLast4,
       "transactionHash": t.transactionHash as Any,
+      "cardholderName": t.cardholderName as Any,
     ]
   }
 
@@ -973,6 +986,7 @@ class VeyraSdkReactNative: RCTEventEmitter {
             "maskedToken": r.maskedToken,
             "merchantTransactionReference": r.reference,
             "transactionHash": r.transactionHash as Any,
+            "cardholderName": r.cardholderName as Any,
             "qrCodeBase64": NSNull(),
             "qrPayload": r.qrPayload,
           ] as [String: Any]
