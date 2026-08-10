@@ -232,18 +232,92 @@ public enum ActivationReason: String, Sendable {
     case other = "OTHER"
 }
 
+/// Machine-readable activation failure kinds (`failure_code`) — branch on this, never on
+/// `message`. The pair that motivated it: `.codeRequestRateLimited` (disable "resend", keep the
+/// flow open) versus `.activationLocked` (terminal — end the flow, contact the issuer), which
+/// used to arrive as identical `status=FAILURE` + English prose.
+public enum ActivationFailureCode: Sendable, Hashable {
+    /// No inactive token exists for the reference — end the flow, re-digitise.
+    case tokenNotFound
+    /// Provisioning status forbids activation — end the flow, contact the issuer.
+    case tokenNotActivatable
+    /// Locked after repeated exhausted cycles — terminal: hide both retry and resend.
+    case activationLocked
+    /// No pending activation — go back to "request a code".
+    case noPendingActivation
+    /// The pending code lapsed — keep the flow open, enable resend.
+    case codeExpired
+    /// Wrong code, attempts remain — stay on entry; `attemptsRemaining` says how many.
+    case codeInvalid
+    /// Attempt cap hit; the cycle is closed — carries the delete recommendation.
+    case maxAttemptsExceeded
+    /// Too many code (re)sends — disable resend until later; do NOT end the flow.
+    case codeRequestRateLimited
+    /// The request itself was malformed or unsupported on this endpoint.
+    case invalidRequest
+    /// The activation failed server-side after a valid code — safe to retry later.
+    case activationFailed
+    /// A code this build does not know — `raw` carries the wire value; never coerced.
+    case unknown(raw: String)
+
+    init?(kmp: VeyraKMP.ActivationFailureCode?, raw: String?) {
+        guard let kmp else { return nil }
+        switch kmp.name {
+        case "TOKEN_NOT_FOUND": self = .tokenNotFound
+        case "TOKEN_NOT_ACTIVATABLE": self = .tokenNotActivatable
+        case "ACTIVATION_LOCKED": self = .activationLocked
+        case "NO_PENDING_ACTIVATION": self = .noPendingActivation
+        case "CODE_EXPIRED": self = .codeExpired
+        case "CODE_INVALID": self = .codeInvalid
+        case "MAX_ATTEMPTS_EXCEEDED": self = .maxAttemptsExceeded
+        case "CODE_REQUEST_RATE_LIMITED": self = .codeRequestRateLimited
+        case "INVALID_REQUEST": self = .invalidRequest
+        case "ACTIVATION_FAILED": self = .activationFailed
+        default: self = .unknown(raw: raw ?? kmp.name)
+        }
+    }
+}
+
+/// The server's token-delete recommendation after an exhausted activation cycle: `.must` after
+/// an exhausted add-card cycle (the token was never legitimately owned — delete it and start
+/// over), `.may` after account verification (deletion is advisory), absent otherwise.
+public enum RecommendDelete: Sendable, Hashable {
+    case must
+    case may
+    /// A value this build does not know — `raw` carries the wire value.
+    case unknown(raw: String)
+
+    init?(kmp: VeyraKMP.RecommendDelete?, raw: String?) {
+        guard let kmp else { return nil }
+        switch kmp.name {
+        case "MUST": self = .must
+        case "MAY": self = .may
+        default: self = .unknown(raw: raw ?? kmp.name)
+        }
+    }
+}
+
 /// Response to an activation-code request.
 public struct ActivationCodeResponse: Sendable, Hashable {
     public let tokenUniqueReference: String?
     public let expirationDateTime: String?
     public let status: String?
     public let message: String?
+    /// Why the request failed, typed — branch on this, never on `message`.
+    public let failureCode: ActivationFailureCode?
+    /// The raw `failure_code` wire value, for logs and forward compatibility.
+    public let failureCodeRaw: String?
 
-    public init(tokenUniqueReference: String?, expirationDateTime: String?, status: String?, message: String?) {
+    public init(
+        tokenUniqueReference: String?, expirationDateTime: String?, status: String?, message: String?,
+        failureCode: ActivationFailureCode? = nil, failureCodeRaw: String? = nil
+    ) {
         self.tokenUniqueReference = tokenUniqueReference
         self.expirationDateTime = expirationDateTime
         self.status = status
         self.message = message
+        self.failureCode = failureCode
+        self.failureCodeRaw = failureCodeRaw
     }
 }
 
@@ -252,11 +326,31 @@ public struct ActivateResponse: Sendable, Hashable {
     public let tokenUniqueReference: String?
     public let status: String?
     public let message: String?
+    /// Why activation failed, typed — branch on this, never on `message`.
+    public let failureCode: ActivationFailureCode?
+    /// The raw `failure_code` wire value, for logs and forward compatibility.
+    public let failureCodeRaw: String?
+    /// Code attempts left in this cycle, where an attempt cap applies (0 when exhausted/locked).
+    public let attemptsRemaining: Int?
+    /// The server's delete recommendation after an exhausted cycle.
+    public let recommendDelete: RecommendDelete?
+    /// The raw `recommend_delete` wire value.
+    public let recommendDeleteRaw: String?
 
-    public init(tokenUniqueReference: String?, status: String?, message: String?) {
+    public init(
+        tokenUniqueReference: String?, status: String?, message: String?,
+        failureCode: ActivationFailureCode? = nil, failureCodeRaw: String? = nil,
+        attemptsRemaining: Int? = nil,
+        recommendDelete: RecommendDelete? = nil, recommendDeleteRaw: String? = nil
+    ) {
         self.tokenUniqueReference = tokenUniqueReference
         self.status = status
         self.message = message
+        self.failureCode = failureCode
+        self.failureCodeRaw = failureCodeRaw
+        self.attemptsRemaining = attemptsRemaining
+        self.recommendDelete = recommendDelete
+        self.recommendDeleteRaw = recommendDeleteRaw
     }
 }
 
@@ -316,10 +410,23 @@ public enum ScanInspection: Sendable {
     case rejected(ScanRejectionReason, detail: String?)
 }
 
-/// Terminal outcome of a scan-to-pay push. `approved` when the rail returned response code 00.
+/// Outcome of a scan-to-pay push, as the gateway stated it.
 public struct PaymentOutcome: Sendable, Hashable {
+    /// Convenience for the happy path only: `responseStatus == "APPROVED"`. It is `false` for a
+    /// declined, failed *and* pending payment alike, so anything that must tell a refusal from an
+    /// unresolved payment reads `responseStatus`.
     public let approved: Bool
     public let responseCode: String?
+    /// What the gateway said the payment **is**: `"APPROVED"`, `"DECLINED"`, `"FAILED"` or
+    /// `"PENDING"`. The push is a synchronous call, but it can still answer `PENDING` — a hop
+    /// below the gateway timed out, errored, or is still settling — and that means *not yet
+    /// known*, never refused. The SDK stores such a payment open and keeps asking until the
+    /// gateway states a final outcome, which then appears on the row in `recentActivity`.
+    ///
+    /// A plain string, not an enum, so a value added after this version shipped still reaches you.
+    public let responseStatus: String?
+    /// The stated cause (`"INSUFFICIENT_FUNDS"`, `"NO_RESPONSE_RECEIVED"`, …) — display and log.
+    public let responseStatusReason: String?
     public let message: String?
     /// Registered merchant name returned by the gateway — authoritative over the name printed in
     /// the scanned QR. Nil when the gateway did not supply one (show the scanned name instead).
@@ -380,6 +487,13 @@ public struct TransactionSummary: Sendable, Hashable {
     public let transactionHash: String?
     /// `"PENDING"`, `"APPROVED"`, `"DECLINED"`, `"FAILED"`, or nil for unknown.
     public let authorizationStatus: String?
+    /// The outcome's response code (`"00"`, `"51"`, `"91"`…), carried verbatim from the rail
+    /// that resolved this row; nil on legacy rows and rows still awaiting their reconcile.
+    /// Receipts and support conversations quote this literal.
+    public let responseCode: String?
+    /// The outcome's stated cause (`"INSUFFICIENT_FUNDS"`, `"QR_EXPIRED"`…), carried verbatim
+    /// as a plain string — display it, never parse it; nil on legacy/unresolved rows.
+    public let responseStatusReason: String?
     /// When the payment was recorded (epoch milliseconds), for the QR rails; nil for tap rows.
     public let atEpochMillis: Int64?
     /// How this wallet paid: `"TAP"`, `"QR_GENERATED"` (showed a CPM QR), `"QR_SCANNED"`
@@ -394,6 +508,27 @@ public struct TransactionSummary: Sendable, Hashable {
     public let merchantTransactionReference: String?
     /// The merchant id from the verified QR context; nil for tap/legacy rows.
     public let merchantId: String?
+    /// The beneficiary credit's identifier (NIP session id inter-bank, batch reference intra-bank)
+    /// — display and support only. The SDK polls the confirmation itself; never pass this back.
+    /// Nil on rows that were not approved, and from gateways predating the credit rail.
+    public let creditTransactionID: String?
+    /// Whether the merchant's (beneficiary) bank can confirm the credit at all — **the gate for
+    /// everything on this rail**. `true` means the SDK is polling in the background and the app
+    /// should render the credit line; `false`/nil means there is nothing to ask, so show no credit
+    /// UI for this transaction. Nil is "unknown", never "not credited".
+    public let isCreditConfirmationSupported: Bool?
+    /// The terminal credit-confirmation state: `"RECEIVED"` (the merchant's bank confirmed the
+    /// funds) or `"UNABLE_TO_CONFIRM"` (the 30-day window closed without a confirmation — the
+    /// give-up state, *not* a statement that the money never arrived).
+    ///
+    /// **Nil while in flight**: an unconfirmed attempt is never stored, so nil means "no answer
+    /// yet". With `isCreditConfirmationSupported == true` that is the "confirming…" state.
+    public let creditConfirmationStatus: String?
+    /// When the beneficiary bank posted the credit (ISO date-time). Present on `"RECEIVED"` only.
+    public let creditedAt: String?
+    /// The beneficiary bank's own reference for the credit — what a customer quotes if a merchant
+    /// says the money never arrived. Present on `"RECEIVED"` only.
+    public let bankReference: String?
 }
 
 /// A scanned merchant receipt, linked to a transaction by `transactionHash`.
@@ -424,6 +559,15 @@ public enum VeyraWalletError: Error, Sendable {
     case notConfigured
     /// A backend call failed; `message` carries the underlying description.
     case requestFailed(message: String)
+    /// The device has **no working internet connection**, so the call never left it — ask the user
+    /// to connect and try again. Nothing was sent, so nothing needs undoing or reconciling.
+    ///
+    /// Distinct from `onlineRequired`, which is easy to confuse because both end with "get online":
+    /// `onlineRequired` means the *card* has run out of payment keys and the wallet must refresh it,
+    /// which is a card state, not a network state. This case means the phone itself has no
+    /// connection. A card that needs refreshing on a device that is online reports `onlineRequired`;
+    /// any call at all on a device in aeroplane mode reports `noNetworkConnection`.
+    case noNetworkConnection(message: String)
     /// The system authentication (Face ID / Touch ID / passcode) failed or was cancelled —
     /// stay on the confirm screen; no payment was attempted.
     case authenticationFailed(message: String)
@@ -437,6 +581,12 @@ public enum VeyraWalletError: Error, Sendable {
     /// this does **not** resolve by going online — offer a smaller amount or another card;
     /// no payment was attempted.
     case amountExceedsCardLimit(message: String)
+    /// Digitisation answered with a response code this SDK version does not recognise, so the
+    /// token was **discarded**: nothing was provisioned and no card was added — even if the
+    /// response carried complete token data. A token whose terms the SDK cannot interpret is
+    /// never installed on a guess. Show the message, offer a retry, and update the Veyra SDK if
+    /// it persists; `message` quotes the raw code for support.
+    case unrecognisedResponseCode(message: String)
 }
 
 // Without LocalizedError, `error.localizedDescription` renders the useless
@@ -450,6 +600,8 @@ extension VeyraWalletError: LocalizedError {
             return "VeyraWallet is not configured — call VeyraWallet.configure(_:) at launch."
         case .requestFailed(let message):
             return message
+        case .noNetworkConnection(let message):
+            return message
         case .authenticationFailed(let message):
             return message
         case .onlineRequired(let message):
@@ -457,6 +609,8 @@ extension VeyraWalletError: LocalizedError {
         case .tokenNotActive(let message):
             return message
         case .amountExceedsCardLimit(let message):
+            return message
+        case .unrecognisedResponseCode(let message):
             return message
         }
     }
@@ -679,7 +833,9 @@ public final class VeyraWallet: @unchecked Sendable {
                     tokenUniqueReference: r.tokenUniqueReference,
                     expirationDateTime: r.expirationDateTime,
                     status: r.status,
-                    message: r.message
+                    message: r.message,
+                    failureCode: ActivationFailureCode(kmp: r.failureCode, raw: r.failureCodeRaw),
+                    failureCodeRaw: r.failureCodeRaw
                 )
             }
         }
@@ -688,7 +844,16 @@ public final class VeyraWallet: @unchecked Sendable {
         public func activate(tokenUniqueReference: String, activationCode: String) async throws -> ActivateResponse {
             try await call { kmp in
                 let r = try await kmp.activate(tokenUniqueReference: tokenUniqueReference, activationCode: activationCode)
-                return ActivateResponse(tokenUniqueReference: r.tokenUniqueReference, status: r.status, message: r.message)
+                return ActivateResponse(
+                    tokenUniqueReference: r.tokenUniqueReference,
+                    status: r.status,
+                    message: r.message,
+                    failureCode: ActivationFailureCode(kmp: r.failureCode, raw: r.failureCodeRaw),
+                    failureCodeRaw: r.failureCodeRaw,
+                    attemptsRemaining: r.attemptsRemaining?.intValue,
+                    recommendDelete: RecommendDelete(kmp: r.recommendDelete, raw: r.recommendDeleteRaw),
+                    recommendDeleteRaw: r.recommendDeleteRaw
+                )
             }
         }
 
@@ -750,6 +915,58 @@ public final class VeyraWallet: @unchecked Sendable {
             try owner.requireKmp().stopActivationObserver(tokenUniqueReference: tokenUniqueReference)
         }
 
+        // ── Payment refusals ───────────────────────────────────────────────────────────────
+
+        /// Observe payments refused before any proof was built.
+        ///
+        /// Two callbacks, because the advice differs and giving the payer the wrong one wastes
+        /// their time:
+        /// - `onRequireOnline` — the card's payment keys need refreshing and the wallet could not
+        ///   reach the server. Tell the payer to connect and try again.
+        /// - `onAmountExceedsCardLimit` — the amount is larger than this card can carry in one
+        ///   payment. **Never tell them to go online here**: a refreshed key carries the same cap,
+        ///   so they would connect, retry and fail identically with no way to learn what was
+        ///   wrong. Tell them to pay less or use another card. `cardLimitMinorUnits` is that cap
+        ///   when it is known, and `nil` when it could not be read — omit the figure rather than
+        ///   show a guess.
+        ///
+        /// Both report **this payment**, not the card's state: `requiresOnline` on a card answers
+        /// the different question "can this card pay *anything* offline?" and stays `false` for a
+        /// card that can still make smaller payments. Show a message about the payment that just
+        /// failed; don't grey the card out on the strength of one refused amount.
+        ///
+        /// On iOS these fire from the QR rails (`rail` is `"CPM_QR"` or `"MPM_QR"`); there is no
+        /// tap-to-pay on iOS, so no `"TAP"` refusal can occur. The pay calls also keep throwing
+        /// `VeyraWalletError.onlineRequired` / `.amountExceedsCardLimit` — this observer is
+        /// additional, for hosts that would rather handle refusals in one place than at every call
+        /// site.
+        ///
+        /// Callbacks arrive on the main thread. Observing again replaces the previous observer.
+        public func observePaymentRefusals(
+            onRequireOnline: @escaping (_ tokenUniqueReference: String?, _ amountMinorUnits: Int64, _ rail: String) -> Void,
+            onAmountExceedsCardLimit: @escaping (_ tokenUniqueReference: String?, _ amountMinorUnits: Int64, _ cardLimitMinorUnits: Int64?, _ rail: String) -> Void
+        ) throws {
+            let kmp = try owner.requireKmp()
+            kmp.observePaymentRefusals(
+                onRequireOnline: { tokenUniqueReference, amountMinorUnits, rail in
+                    onRequireOnline(tokenUniqueReference, amountMinorUnits.int64Value, rail)
+                },
+                onAmountExceedsCardLimit: { tokenUniqueReference, amountMinorUnits, cardLimitMinorUnits, rail in
+                    onAmountExceedsCardLimit(
+                        tokenUniqueReference,
+                        amountMinorUnits.int64Value,
+                        cardLimitMinorUnits?.int64Value,
+                        rail
+                    )
+                }
+            )
+        }
+
+        /// Stop observing payment refusals; no further callbacks fire.
+        public func stopObservingPaymentRefusals() throws {
+            try owner.requireKmp().stopObservingPaymentRefusals()
+        }
+
         // ── Scan-to-pay: inspect → authenticate (Face ID / Touch ID) → pay ─────────────────
 
         /// Inspect a scanned merchant QR payload. Verification happens **on-device** (gateway
@@ -803,14 +1020,17 @@ public final class VeyraWallet: @unchecked Sendable {
 
         /// Pay a verified scanned payment with the wallet's **active token**. Requires a fresh
         /// `authenticateForScannedPayment` (one authentication per payment — the SDK enforces
-        /// it). The delivered outcome — approved or declined — also lands in the paying token's
-        /// `recentActivity`.
+        /// it). Whatever the gateway states — approved, declined, failed or still pending — also
+        /// lands in the paying token's `recentActivity`; a pending row keeps being polled by the
+        /// SDK until the gateway states a final outcome.
         public func payScannedContext(_ payment: VerifiedPayment) async throws -> PaymentOutcome {
             try await call { kmp in
                 let outcome = try await kmp.payScannedContext(verified: payment.raw)
                 return PaymentOutcome(
                     approved: outcome.approved,
                     responseCode: outcome.responseCode,
+                    responseStatus: outcome.responseStatus,
+                    responseStatusReason: outcome.responseStatusReason,
                     message: outcome.message,
                     merchantName: outcome.merchantName,
                     merchantLocation: outcome.merchantLocation
@@ -902,11 +1122,18 @@ public final class VeyraWallet: @unchecked Sendable {
                         transactionCurrencyCode: $0.transactionCurrencyCode,
                         transactionHash: $0.transactionHash,
                         authorizationStatus: $0.authorizationStatus,
+                        responseCode: $0.responseCode,
+                        responseStatusReason: $0.responseStatusReason,
                         atEpochMillis: $0.atEpochMillis?.int64Value,
                         entryMethod: $0.entryMethod,
                         merchantLocation: $0.merchantLocation,
                         merchantTransactionReference: $0.merchantTransactionReference,
-                        merchantId: $0.merchantId
+                        merchantId: $0.merchantId,
+                        creditTransactionID: $0.creditTransactionId,
+                        isCreditConfirmationSupported: $0.isCreditConfirmationSupported?.boolValue,
+                        creditConfirmationStatus: $0.creditConfirmationStatus,
+                        creditedAt: $0.creditedAt,
+                        bankReference: $0.bankReference
                     )
                 }
             }
@@ -971,6 +1198,14 @@ public final class VeyraWallet: @unchecked Sendable {
                 throw error
             } catch {
                 let message = error.localizedDescription
+                // the device has no working connection and the call never left it.
+                // Checked before the card-state refusals below because it is a fact about the phone
+                // rather than about a card, and because on an offline device it is the *only* honest
+                // answer any of these calls can give.
+                if message.contains("NO_NETWORK_CONNECTION") {
+                    throw VeyraWalletError.noNetworkConnection(
+                        message: "No internet connection — connect to the internet and try again")
+                }
                 // the KMP layer codes the generic go-online refusal into the message;
                 // surface it as the typed case so hosts can branch without string matching.
                 // an amount over the card's per-payment limit: going online cannot fix it,
@@ -987,6 +1222,12 @@ public final class VeyraWallet: @unchecked Sendable {
                 // before any proof is built; typed so hosts can branch without string matching.
                 if message.contains("TOKEN_NOT_ACTIVE") {
                     throw VeyraWalletError.tokenNotActive(message: message)
+                }
+                // digitisation answered with a code this build cannot classify: the token was
+                // discarded and nothing was stored. Typed so an add-card screen can offer a
+                // retry instead of showing a generic request failure.
+                if message.contains("UNRECOGNISED_RESPONSE_CODE") {
+                    throw VeyraWalletError.unrecognisedResponseCode(message: message)
                 }
                 throw VeyraWalletError.requestFailed(message: message)
             }

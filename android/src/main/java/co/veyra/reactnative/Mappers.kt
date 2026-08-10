@@ -163,7 +163,8 @@ internal object Mappers {
         putString("expiry", t.expiryDate)
         putNull("bankName")
         putString("cardScheme", t.cardScheme?.name)
-        putNull("status")
+        // the stored lifecycle status (verbatim), so a greyed card can say why.
+        putString("status", t.statusRaw)
         putBoolean("isActive", t.isActive)
         putBoolean("requiresActivation", !t.activationMethods.isNullOrEmpty())
         putArray(
@@ -198,6 +199,10 @@ internal object Mappers {
     fun paymentOutcome(o: MpmPushOutcome): WritableMap = Arguments.createMap().apply {
         putBoolean("approved", o.approved)
         putString("responseCode", o.responseCode)
+        // the status is what the payment IS — `approved` alone cannot tell a decline
+        // from a push the gateway answered PENDING.
+        putString("responseStatus", o.responseStatus)
+        putString("responseStatusReason", o.responseStatusReason)
         putString("message", o.message)
         putString("merchantName", o.merchantName)
         putString("merchantLocation", o.merchantLocation)
@@ -218,12 +223,24 @@ internal object Mappers {
         putString("transactionCurrencyCode", s.transactionCurrencyCode)
         putString("transactionHash", s.transactionHash)
         putString("authorizationStatus", s.authorizationStatus)
+        // the outcome's code and stated cause, verbatim, for the detail view.
+        putString("responseCode", s.responseCode)
+        putString("responseStatusReason", s.responseStatusReason)
         putString("localTransactionDateTime", s.localTransactionDateTime)
         s.atEpochMillis?.let { putDouble("atEpochMillis", it.toDouble()) } ?: putNull("atEpochMillis")
         putString("entryMethod", s.entryMethod)
         putString("merchantLocation", s.merchantLocation)
         putString("merchantTransactionReference", s.merchantTransactionReference)
         putString("merchantId", s.merchantId)
+        // Beneficiary credit confirmation. `isCreditConfirmationSupported` is the gate the screen
+        // reads — true means the SDK is polling and the credit line should render; false/null
+        // means show nothing. `creditConfirmationStatus` is null until terminal.
+        putString("creditTransactionId", s.creditTransactionId)
+        s.isCreditConfirmationSupported?.let { putBoolean("isCreditConfirmationSupported", it) }
+            ?: putNull("isCreditConfirmationSupported")
+        putString("creditConfirmationStatus", s.creditConfirmationStatus)
+        putString("creditedAt", s.creditedAt)
+        putString("bankReference", s.bankReference)
     }
 
     fun receipt(r: TransactionReceipt): WritableMap = Arguments.createMap().apply {
@@ -272,17 +289,18 @@ internal object Mappers {
         putString("merchantStatus", m.merchantStatus)
     }
 
-    fun tapResult(r: SoftposTransactionResponse): WritableMap = Arguments.createMap().apply {
-        putString("responseCode", r.transactionCode)
-        putString(
-            "status",
-            when (r.transactionCode) {
-                "00" -> "APPROVED"
-                "05", "12", "14", "51", "54" -> "DECLINED"
-                "99" -> "PENDING"
-                else -> "FAILED"
-            }
-        )
+    // [into] exists for tests: Arguments.createMap() needs the native bridge, JavaOnlyMap doesn't.
+    fun tapResult(r: SoftposTransactionResponse, into: WritableMap = Arguments.createMap()): WritableMap = into.apply {
+        // carry the outcome the backend stated; never re-derive it from the code. This block
+        // was a code->status mapping of its own — the seventh — and it read every code it did not
+        // recognise as FAILED, so `09`/`68`/`96` (still settling) and `25` (no record) all surfaced to
+        // React Native as failures. `"99"` is retired: pending is said by `status` now.
+        putString("responseCode", r.transactionCode.takeIf { it.isNotEmpty() })
+        putString("status", r.responseStatus?.name)
+        putString("reason", r.responseStatusReason)
+        // Set only when the SDK could not attempt a payment (validation, arming refusal, card read) or
+        // failed inside itself: not a payment outcome, so there is no code and no status beside it.
+        putString("sdkErrorCode", r.sdkErrorCode?.name)
         putString("message", r.message)
         putString("amountDisplay", r.amount)
         putString("cardScheme", r.cardScheme)
@@ -290,6 +308,48 @@ internal object Mappers {
         putString("merchantTransactionReference", r.merchantTransactionReference)
         putString("transactionId", r.transactionId)
         putString("merchantStatus", r.merchantStatus)
+        // an approved sale carries the merchant-bank credit id, and whether the
+        // merchant's bank can confirm the credit at all. `isCreditConfirmationSupported == true`
+        // is the app's cue to show a "confirming credit…" state on the result screen and flip it
+        // from the onCreditConfirmation event; null/false means there is nothing to wait for.
+        putString("creditTransactionId", r.creditTransactionId)
+        r.isCreditConfirmationSupported?.let { putBoolean("isCreditConfirmationSupported", it) }
+            ?: putNull("isCreditConfirmationSupported")
+    }
+
+    /**
+     * The `VeyraTransactionResolvedEvent` payload. Extracted from the module's
+     * observer registration so the shape both platforms must agree on is asserted by
+     * a test rather than by two hand-written map literals — the iOS bridge builds the same keys.
+     *
+     * [into] exists for tests: `Arguments.createMap()` needs the native bridge, `JavaOnlyMap` doesn't.
+     */
+    fun transactionResolved(
+        r: co.veyra.softpos.payment.sdk.merchant.TransactionResolution,
+        into: WritableMap = Arguments.createMap(),
+    ): WritableMap = into.apply {
+        putString("merchantTransactionReference", r.reference)
+        putString("responseCode", r.responseCode)
+        putString("status", r.status)
+        putString("reason", r.reason)
+    }
+
+    /**
+     * The `VeyraCreditConfirmationEvent` payload; same extraction rationale as
+     * [transactionResolved]. `amountMinorUnits` crosses as a JS number — RN has no 64-bit integer,
+     * and a minor-unit amount is far inside the double's exact-integer range.
+     */
+    fun creditConfirmation(
+        c: co.veyra.softpos.payment.sdk.merchant.CreditConfirmation,
+        into: WritableMap = Arguments.createMap(),
+    ): WritableMap = into.apply {
+        putString("merchantTransactionReference", c.reference)
+        putString("creditTransactionId", c.creditTransactionId)
+        putString("status", c.status)
+        c.amountMinorUnits?.let { putDouble("amountMinorUnits", it.toDouble()) }
+            ?: putNull("amountMinorUnits")
+        putString("bankReference", c.bankReference)
+        putString("creditedAt", c.creditedAt)
     }
 
     fun paymentContextQr(c: CreatedPaymentContext): WritableMap = Arguments.createMap().apply {
@@ -307,11 +367,14 @@ internal object Mappers {
         putBoolean("isApproved", s.isApproved)
     }
 
-    fun merchantTransaction(t: TransactionInfo): WritableMap = Arguments.createMap().apply {
+    // [into] exists for tests: Arguments.createMap() needs the native bridge, JavaOnlyMap doesn't.
+    fun merchantTransaction(t: TransactionInfo, into: WritableMap = Arguments.createMap()): WritableMap = into.apply {
         putString("merchantTransactionReference", t.merchantTransactionReference)
         putDouble("amountMinorUnits", t.amount.toDouble())
         putString("status", t.transactionStatus.name)
         putString("responseCode", t.responseCode)
+        // the outcome's stated cause, verbatim, for the detail view.
+        putString("responseStatusReason", t.responseStatusReason)
         putString("transactionTime", t.transactionTime)
         putString("currencyCode", t.currencyCode)
         putString("transactionId", t.transactionId)
@@ -321,6 +384,13 @@ internal object Mappers {
         putNull("maskedTokenLast4")
         putNull("transactionHash")
         putString("cardholderName", t.cardholderName)
+        // the credit id, the supported flag (the result screen's cue to wait) and the
+        // terminal confirmation state — null while unconfirmed ("not confirmed yet", never
+        // "not received").
+        putString("creditTransactionId", t.creditTransactionId)
+        t.isCreditConfirmationSupported?.let { putBoolean("isCreditConfirmationSupported", it) }
+            ?: putNull("isCreditConfirmationSupported")
+        putString("creditConfirmationStatus", t.creditConfirmationStatus)
     }
 
     fun merchantReceipt(r: TransactionReceiptResult): WritableMap = Arguments.createMap().apply {

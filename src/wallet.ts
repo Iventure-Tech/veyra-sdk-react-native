@@ -9,6 +9,7 @@ import type {
   ActivationReason,
   Bank,
   Card,
+  CardStatus,
   DigitiseParams,
   DigitiseResult,
   PaymentOutcome,
@@ -58,6 +59,15 @@ export const wallet = {
   /** One-shot server check: true when the token is active. */
   checkTokenActive(tokenUniqueReference: string): Promise<boolean> {
     return nativeCall(() => VeyraNative.walletCheckTokenActive(tokenUniqueReference));
+  },
+
+  /**
+   * One-shot server check, five-valued: lets the app explain a non-payable card —
+   * SUSPENDED ("call your bank") vs PENDING_ACTIVATION ("enter your code") vs EXPIRED
+   * ("re-add the card"). Values this build does not know pass through verbatim.
+   */
+  tokenStatus(tokenUniqueReference: string): Promise<CardStatus | string> {
+    return nativeCall(() => VeyraNative.walletTokenStatus(tokenUniqueReference));
   },
 
   /**

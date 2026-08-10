@@ -32,6 +32,16 @@ export type VeyraErrorCode =
   | 'MISSING_MANDATORY_CONFIG'
   /** Request-level validation failed; `field` names the offending parameter. */
   | 'VALIDATION'
+  /**
+   * The device has no working internet connection, so the call never left it — tell the user to
+   * connect and try again. Nothing was sent, so nothing needs undoing.
+   *
+   * Not to be confused with `ONLINE_REQUIRED`, which is about the *card* (its payment keys are
+   * used up and the wallet must refresh them) rather than the *device*. Both end with "get
+   * online", and they need different copy: `ONLINE_REQUIRED` on a connected phone resolves by
+   * itself in seconds; this one does not resolve until the user restores their connection.
+   */
+  | 'NO_NETWORK_CONNECTION'
   /** Network/backend failure. */
   | 'REQUEST_FAILED'
   /** Anything not otherwise classified; see message + nativeErrorCode. */
@@ -73,6 +83,7 @@ const KNOWN_CODES: ReadonlySet<string> = new Set<VeyraErrorCode>([
   'CARD_CANNOT_SHOW_QR',
   'MISSING_MANDATORY_CONFIG',
   'VALIDATION',
+  'NO_NETWORK_CONNECTION',
   'REQUEST_FAILED',
   'UNKNOWN',
 ]);

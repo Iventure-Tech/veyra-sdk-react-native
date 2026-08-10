@@ -171,17 +171,48 @@ export interface DigitiseResult {
 
 export type ActivationReason = 'ADD_CARD' | 'VERIFY_ACCOUNT' | 'OTHER';
 
+/**
+ * Machine-readable activation failure kind — branch on this, never on `message`. The
+ * `(string & {})` arm keeps codes added after this build flowing through verbatim.
+ */
+export type ActivationFailureCode =
+  | 'TOKEN_NOT_FOUND'
+  | 'TOKEN_NOT_ACTIVATABLE'
+  | 'ACTIVATION_LOCKED'
+  | 'NO_PENDING_ACTIVATION'
+  | 'CODE_EXPIRED'
+  | 'CODE_INVALID'
+  | 'MAX_ATTEMPTS_EXCEEDED'
+  | 'CODE_REQUEST_RATE_LIMITED'
+  | 'INVALID_REQUEST'
+  | 'ACTIVATION_FAILED'
+  | (string & {});
+
+/**
+ * Server's token-delete recommendation after an exhausted activation cycle: 'MUST' after an
+ * exhausted ADD_CARD cycle, 'MAY' after VERIFY_ACCOUNT, absent otherwise.
+ */
+export type RecommendDelete = 'MUST' | 'MAY' | (string & {});
+
 export interface ActivationCodeResponse {
   tokenUniqueReference: string | null;
   expirationDateTime: string | null;
   status: 'SUCCESS' | 'FAILURE' | null;
   message: string | null;
+  /** Why the request failed — e.g. disable "resend" on CODE_REQUEST_RATE_LIMITED, end the flow on ACTIVATION_LOCKED. */
+  failureCode: ActivationFailureCode | null;
 }
 
 export interface ActivateResponse {
   tokenUniqueReference: string | null;
   status: 'SUCCESS' | 'FAILURE' | null;
   message: string | null;
+  /** Why activation failed — branch on this, never on `message`. */
+  failureCode: ActivationFailureCode | null;
+  /** Code attempts left in this cycle, where an attempt cap applies (0 when exhausted/locked). */
+  attemptsRemaining: number | null;
+  /** Delete recommendation after an exhausted cycle. */
+  recommendDelete: RecommendDelete | null;
 }
 
 export type ActivationEvent =
@@ -245,7 +276,13 @@ export interface Card {
 
 // ── Wallet: payments ──────────────────────────────────────────────────────────
 
-/** Android only (tap-to-pay is not available on iOS). */
+/**
+ * Wallet payment events.
+ *
+ * The tap phases (`transactionStarted` / `transactionCompleted`) are **Android only** —
+ * tap-to-pay is not available on iOS. The two refusal phases fire on **both** platforms, from
+ * whichever rails that platform has: tap and QR on Android, QR only on iOS (see `rail`).
+ */
 export type WalletTapEvent =
   | { type: 'transactionStarted'; tokenId: string }
   | {
@@ -257,7 +294,48 @@ export type WalletTapEvent =
       cardScheme: CardScheme | null;
       reference: string | null;
     }
-  | { type: 'activationFailed'; message: string };
+  | { type: 'activationFailed'; message: string }
+  /**
+   * A payment was refused because the card's payment keys need refreshing and the wallet could
+   * not reach the server. Tell the payer to connect and try again.
+   *
+   * On the tap rail this arrives at the earliest moment it is actually true: immediately when the
+   * device is already offline, otherwise only once the automatic background refresh has failed. A
+   * refresh that succeeds fires **nothing** — the next tap simply works.
+   *
+   * This describes *this payment*, not the card: `WalletCard.requiresOnline` answers the
+   * different question "can this card pay anything offline?" and stays `false` for a card that
+   * can still make smaller payments. Don't grey the card out on the strength of one refusal.
+   */
+  | {
+      type: 'requireOnline';
+      tokenId: string | null;
+      tokenUniqueReference: string | null;
+      amountMinorUnits: number;
+      rail: WalletPayRail;
+      /** Machine-matchable, prefixed `ONLINE_REQUIRED`. */
+      message: string;
+    }
+  /**
+   * A payment was refused because the amount is larger than this card can carry in one payment.
+   *
+   * **Never tell the payer to go online here** — a refreshed key carries the same cap, so they
+   * would connect, retry and fail identically. Tell them to pay a smaller amount or use another
+   * card. `cardLimitMinorUnits` is that cap when known, `null` when it could not be read.
+   */
+  | {
+      type: 'amountExceedCardLimit';
+      tokenId: string | null;
+      tokenUniqueReference: string | null;
+      amountMinorUnits: number;
+      cardLimitMinorUnits: number | null;
+      rail: WalletPayRail;
+      /** Machine-matchable, prefixed `AMOUNT_EXCEEDS_CARD_LIMIT`. */
+      message: string;
+    };
+
+/** Which rail a payment was refused on. `TAP` is Android only. */
+export type WalletPayRail = 'TAP' | 'CPM_QR' | 'MPM_QR';
 
 export type ScanRejectionReason =
   | 'MALFORMED'
@@ -285,8 +363,26 @@ export type ScanInspection =
   | { verified: false; reason: ScanRejectionReason; detail: string | null };
 
 export interface PaymentOutcome {
+  /**
+   * Convenience for the happy path only: `responseStatus === 'APPROVED'`. It is `false` for a
+   * declined, failed *and* pending payment alike, so anything that must tell a refusal from an
+   * unresolved payment reads `responseStatus`.
+   */
   approved: boolean;
   responseCode: string | null;
+  /**
+   * What the gateway said the payment **is** — `'APPROVED'`, `'DECLINED'`, `'FAILED'` or
+   * `'PENDING'`. A push is a synchronous call, but it can still answer `PENDING` (a hop below the
+   * gateway timed out, errored or is still settling): that means *not yet known*, never refused.
+   * The SDK stores such a payment open and keeps asking until the gateway states a final outcome;
+   * the row's final status shows up in the wallet's transaction history.
+   *
+   * A plain string, not a union, so a value added after this version shipped still reaches you.
+   * `null` only if the gateway stated none.
+   */
+  responseStatus: string | null;
+  /** The stated cause (`'INSUFFICIENT_FUNDS'`, `'NO_RESPONSE_RECEIVED'`, …) — display and log. */
+  responseStatusReason: string | null;
   message: string | null;
   /**
    * Registered merchant name returned by the gateway — authoritative over the name printed in
@@ -311,6 +407,50 @@ export interface PaymentQr {
 
 export type QrExpiredEvent = { scope: 'wallet' | 'merchant'; handle: string | null };
 
+/**
+ * A payment the app was left waiting on has resolved — the push half of
+ * `merchant.getTransactions()`.
+ *
+ * A sale that gets no answer resolves to `PENDING`, and the SDK then polls it to a final status in
+ * the background. This fires the moment one settles, including for a payment started in an earlier
+ * app launch, so match `merchantTransactionReference` to the sale you are showing.
+ *
+ * A notification, never the source of truth: there is no replay on subscription, so a screen still
+ * reads the store when it appears and treats this as the live update while it is up.
+ */
+export type TransactionResolvedEvent = {
+  /** The reference passed when the payment was started — match the event to its sale with this. */
+  merchantTransactionReference: string;
+  /** The response code exactly as the backend sent it (`'00'`, `'51'`, `'96'`…). */
+  responseCode: string | null;
+  /** Always one of the three finals — never `'PENDING'`. */
+  status: 'APPROVED' | 'DECLINED' | 'FAILED' | string;
+  /** Why it ended that way, e.g. `'INSUFFICIENT_FUNDS'`. Null when the backend sent none. */
+  reason: string | null;
+};
+
+/**
+ * The funds of an approved sale were confirmed in the merchant's bank account (`RECEIVED`), or
+ * the 30-day confirmation window closed unconfirmed (`UNABLE_TO_CONFIRM` — a give-up, not a
+ * reversal). Settlement confirmation only: it never changes the payment outcome. The SDK owns the
+ * polling (exponential backoff, up to 30 days, app-scoped on both platforms); the app just
+ * reacts. The event fires on Android and iOS alike; the answer is also written to the stored row
+ * (`MerchantTransaction.creditConfirmationStatus`), which is what a screen opened later reads.
+ */
+export type CreditConfirmationEvent = {
+  /** The reference passed when the payment was started — match the event to its sale with this. */
+  merchantTransactionReference: string;
+  /** The beneficiary credit's identifier the payment response carried. */
+  creditTransactionId: string | null;
+  status: 'RECEIVED' | 'UNABLE_TO_CONFIRM' | string;
+  /** Credited amount in minor units, as the merchant's bank reported it. RECEIVED only. */
+  amountMinorUnits: number | null;
+  /** The merchant bank's own reference for the credit. RECEIVED only. */
+  bankReference: string | null;
+  /** When the merchant's bank posted the credit (ISO date-time). RECEIVED only. */
+  creditedAt: string | null;
+};
+
 // ── Wallet: history & receipts ────────────────────────────────────────────────
 
 export type EntryMethod = 'TAP' | 'QR_GENERATED' | 'QR_SCANNED';
@@ -322,6 +462,17 @@ export interface TransactionSummary {
   transactionHash: string | null;
   authorizationStatus: 'PENDING' | 'APPROVED' | 'DECLINED' | 'FAILED' | null;
   /**
+   * The outcome's response code (`"00"`, `"51"`, `"91"`…), carried verbatim from the rail that
+   * resolved this row; `null` on legacy rows and rows still awaiting their reconcile. Receipts
+   * and support conversations quote this literal.
+   */
+  responseCode: string | null;
+  /**
+   * The outcome's stated cause (`"INSUFFICIENT_FUNDS"`, `"QR_EXPIRED"`…), carried verbatim as a
+   * plain string — display it, never parse it; `null` on legacy/unresolved rows.
+   */
+  responseStatusReason: string | null;
+  /**
    * Contactless date/time from the card exchange (EMV tags 9A + 9F21). Android tap rows only —
    * always `null` on iOS (no tap rail) and on QR rows, which carry `atEpochMillis` instead.
    */
@@ -331,6 +482,32 @@ export interface TransactionSummary {
   merchantLocation: string | null;
   merchantTransactionReference: string | null;
   merchantId: string | null;
+  /**
+   * The beneficiary credit's identifier (NIP session id inter-bank, batch reference intra-bank) —
+   * display and support only. The SDK polls the confirmation itself; never pass this back.
+   * `null` on rows that were not approved, and from gateways predating the credit rail.
+   */
+  creditTransactionId: string | null;
+  /**
+   * Whether the merchant's (beneficiary) bank can confirm the credit at all — **the gate for
+   * everything on this rail**. `true` means the SDK is polling in the background and the app
+   * should render the credit line; `false`/`null` means there is nothing to ask, so render no
+   * credit UI for this transaction. `null` is "unknown", never "not credited".
+   */
+  isCreditConfirmationSupported: boolean | null;
+  /**
+   * The terminal credit-confirmation state: `"RECEIVED"` (the merchant's bank confirmed the funds)
+   * or `"UNABLE_TO_CONFIRM"` (the 30-day window closed without a confirmation — the give-up state,
+   * *not* a statement that the money never arrived).
+   *
+   * `null` while in flight: an unconfirmed attempt is never stored. With
+   * `isCreditConfirmationSupported === true`, `null` is the "confirming…" state.
+   */
+  creditConfirmationStatus: string | null;
+  /** When the beneficiary bank posted the credit (ISO date-time). `"RECEIVED"` only. */
+  creditedAt: string | null;
+  /** The beneficiary bank's own reference for the credit. `"RECEIVED"` only. */
+  bankReference: string | null;
 }
 
 export interface TransactionReceipt {
@@ -434,9 +611,13 @@ export interface TapRequest {
 }
 
 /**
- * Tap acceptance events. `cardContactLost` / `unsupportedCard` mean the reader stays
- * armed for a re-tap — show a transient hint, keep the waiting screen up. Only
+ * Tap acceptance events, identical on Android and iOS. `cardContactLost` / `unsupportedCard` mean
+ * the reader stays armed for a re-tap — show a transient hint, keep the waiting screen up. Only
  * `result` (and iOS `ended`) are terminal.
+ *
+ * One iOS nuance worth knowing: `cardContactLost` there is reported when CoreNFC says the tag left
+ * the field, which ends that card's dialogue — the session stays armed for a fresh tap, but the
+ * interrupted attempt still reports its own `result`.
  */
 export type MerchantTapEvent =
   | { type: 'cardDetected'; sessionId: string }
@@ -464,6 +645,18 @@ export interface MerchantTapResult {
   merchantTransactionReference: string | null;
   transactionId: string | null;
   merchantStatus: MerchantStatus | string | null;
+  /**
+   * The merchant-bank credit's identifier (NIP session id inter-bank, batch reference
+   * intra-bank). `null` unless the sale was approved and the gateway sent one.
+   */
+  creditTransactionId: string | null;
+  /**
+   * Whether the merchant's (beneficiary) bank can confirm the credit at all — the backend's
+   * payment-time decision. When `true`, the SDK polls the confirmation rail in the background
+   * and fires `merchant.onCreditConfirmation` — show a "confirming credit…" state on the result
+   * screen and flip it from that event. `false`/`null` means there is nothing to wait for.
+   */
+  isCreditConfirmationSupported: boolean | null;
 }
 
 // ── Merchant: QR rails ────────────────────────────────────────────────────────
@@ -506,7 +699,27 @@ export interface CustomerQrChargeOutcome {
   approved: boolean;
   responseCode: string | null;
   transactionId: string | null;
+  /**
+   * The reference this payment was recorded under — **minted by the SDK** and echoed
+   * by the gateway, not a value you supplied. This is the key a receipt lookup or status poll
+   * must use, because it is the value the gateway actually stored.
+   */
   merchantTransactionReference: string | null;
+  /** Your own order/basket id, echoed back exactly as you passed it to `chargeCustomerQr`. */
+  merchantOrderId: string | null;
+  /**
+   * The merchant-bank credit's identifier. `null` unless the charge was approved and the
+   * gateway sent one.
+   */
+  creditTransactionId: string | null;
+  /**
+   * Whether the merchant's (beneficiary) bank can confirm the credit — the backend's
+   * payment-time decision. `true` means the SDK's app-scoped background sweep polls the
+   * confirmation rail and stamps the answer onto the sale's stored row — show a "confirming
+   * credit…" state on the result screen and flip it from `merchant.onCreditConfirmation`
+   * (Android) or the re-read row (`creditConfirmationStatus`).
+   */
+  isCreditConfirmationSupported: boolean | null;
 }
 
 // ── Merchant: transactions & receipts ─────────────────────────────────────────
@@ -516,6 +729,11 @@ export interface MerchantTransaction {
   amountMinorUnits: number;
   status: 'APPROVED' | 'DECLINED' | 'PENDING' | 'FAILED';
   responseCode: string | null;
+  /**
+   * The outcome's stated cause (`"INSUFFICIENT_FUNDS"`, `"QR_EXPIRED"`…), carried verbatim as a
+   * plain string — display it, never parse it; `null` on legacy/unresolved rows.
+   */
+  responseStatusReason: string | null;
   transactionTime: string | null;
   currencyCode: string | null;
   transactionId: string | null;
@@ -537,6 +755,28 @@ export interface MerchantTransaction {
    * recorded before this field existed, and when the card carried no `5F20`.
    */
   cardholderName: string | null;
+  /**
+   * The beneficiary credit's identifier (NIP session id inter-bank, batch reference intra-bank).
+   * `null` on non-approved rows and from gateways predating the credit-confirmation rail.
+   */
+  creditTransactionId: string | null;
+  /**
+   * Whether the merchant's (beneficiary) bank can confirm the credit at all — the backend's
+   * payment-time decision. `true` means the SDK is polling the confirmation rail in the
+   * background for this sale (show a "confirming credit…" state until
+   * `creditConfirmationStatus` resolves); `false`/`null` means there is nothing to wait for. On
+   * MPM rows the flag is learned from the transaction-status rail shortly after the settle (the
+   * contexts endpoint never carries it), so it can be `null` for a few seconds on a
+   * freshly-settled row.
+   */
+  isCreditConfirmationSupported: boolean | null;
+  /**
+   * Terminal credit-confirmation state: `'RECEIVED'` when the merchant's bank confirmed the
+   * funds, `'UNABLE_TO_CONFIRM'` only as the final give-up after the 30-day window. **`null`
+   * while unconfirmed** — render it as "not confirmed yet" (or nothing), never as "not
+   * received". Settlement fact only; `status` remains the payment outcome.
+   */
+  creditConfirmationStatus: string | null;
 }
 
 export interface MerchantReceipt {

@@ -3,6 +3,7 @@ import { nativeCall } from './errors';
 import { Events, VeyraNative, veyraEmitter } from './native';
 import type {
   Bank,
+  CreditConfirmationEvent,
   CustomerQrChargeOutcome,
   MerchantReceipt,
   MerchantRegistration,
@@ -17,6 +18,7 @@ import type {
   ScannedCustomerQr,
   StoredMerchant,
   TapRequest,
+  TransactionResolvedEvent,
 } from './types';
 
 /** Merchant (Get paid) domain — registration, tap acceptance, QR rails, history. */
@@ -118,16 +120,50 @@ export const merchant = {
     return nativeCall(() => VeyraNative.merchantInspectCustomerQr(payload));
   },
 
+  /**
+   * Charges an inspected customer QR.
+   *
+   * @param merchantOrderId your own order/basket/invoice id for this sale (optional). The SDK
+   *   mints the transaction reference itself — the gateway makes `(merchantId, reference)` unique
+   *   and only the SDK can promise that — and returns it on the outcome. This is the field for
+   *   *your* identifier: it is never used as a key, so you may reuse it across the attempts of one
+   *   sale, which is what links them.
+   */
   chargeCustomerQr(
     handle: string,
-    merchantTransactionReference: string | null = null
+    merchantOrderId: string | null = null
   ): Promise<CustomerQrChargeOutcome> {
     return nativeCall(() =>
-      VeyraNative.merchantChargeCustomerQr(handle, merchantTransactionReference)
+      VeyraNative.merchantChargeCustomerQr(handle, merchantOrderId)
     );
   },
 
   // ── Transactions & receipts ────────────────────────────────────────────────
+
+  /**
+   * Fires when a payment the app was left waiting on resolves — a `PENDING` sale reaching
+   * `APPROVED` / `DECLINED` / `FAILED`. Fires on Android and iOS alike, for any transaction that
+   * settles (including one started in an earlier app launch), so match the event to its sale by
+   * `merchantTransactionReference`.
+   *
+   * There is no replay on subscription: a screen still reads {@link getTransaction} when it
+   * appears, and uses this as the live update while it is up. Subscribe once, at start-up.
+   */
+  onTransactionResolved(listener: (e: TransactionResolvedEvent) => void): EmitterSubscription {
+    return veyraEmitter.addListener(Events.transactionResolved, listener);
+  },
+
+  /**
+   * Fires when the funds of an approved sale are confirmed in the merchant's bank account
+   * (`RECEIVED`), or once with `UNABLE_TO_CONFIRM` if the 30-day window closes unconfirmed.
+   * Settlement confirmation, never a change to the payment outcome; the SDK owns the polling
+   * (app-scoped, on both platforms) — subscribe and match the event to its sale by
+   * `merchantTransactionReference`. Fires on Android and iOS alike; the answer is also written to
+   * the stored row's `creditConfirmationStatus`, which is what a screen opened later reads.
+   */
+  onCreditConfirmation(listener: (e: CreditConfirmationEvent) => void): EmitterSubscription {
+    return veyraEmitter.addListener(Events.creditConfirmation, listener);
+  },
 
   getTransactions(limit = 50): Promise<MerchantTransaction[]> {
     return nativeCall(() => VeyraNative.merchantGetTransactions(limit));

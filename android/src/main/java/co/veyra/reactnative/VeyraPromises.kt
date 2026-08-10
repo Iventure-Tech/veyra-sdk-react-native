@@ -4,6 +4,7 @@ import co.veyra.core.SdkModeException
 import co.veyra.softpos.payment.sdk.SdkErrorCode
 import co.veyra.softpos.payment.sdk.VeyraSdkException
 import co.veyra.wallet.sdk.exception.TokenizationRequestValidationException
+import co.veyra.wallet.sdk.exception.WalletRefusalException
 import com.facebook.react.bridge.Promise
 
 /**
@@ -30,15 +31,25 @@ internal object VeyraPromises {
         return when {
             t is TokenizationRequestValidationException -> "VALIDATION" to t.fieldName
             t is SdkModeException -> "MODE_REFUSED" to null
+            // the device has no working connection. Checked before the SdkErrorCode
+            // branches below so it is never flattened into REQUEST_FAILED, and matched two ways
+            // because the two SDKs report it in their own idioms — SoftPOS as an SdkErrorCode, the
+            // wallet as a message prefix on Result.failure — for the one same condition.
+            t is VeyraSdkException && t.errorCode == SdkErrorCode.NO_NETWORK_CONNECTION ->
+                "NO_NETWORK_CONNECTION" to t.errorCodeString
+            t is co.veyra.common.net.VeyraNetworkException && message.contains("NO_NETWORK_CONNECTION") ->
+                "NO_NETWORK_CONNECTION" to null
             t is VeyraSdkException ->
                 if (t.errorCode == SdkErrorCode.MISSING_MANDATORY_CONFIG) {
                     "MISSING_MANDATORY_CONFIG" to t.errorCodeString
                 } else {
                     "REQUEST_FAILED" to t.errorCodeString
                 }
-            message.startsWith("AMOUNT_EXCEEDS_CARD_LIMIT:") -> "AMOUNT_EXCEEDS_CARD_LIMIT" to null
-            message.startsWith("ONLINE_REQUIRED:") -> "ONLINE_REQUIRED" to null
-            message.startsWith("TOKEN_NOT_ACTIVE:") -> "TOKEN_NOT_ACTIVE" to null
+            // the SDK now throws typed refusals — the prefix table this bridge used to
+            // keep lives in WalletRefusalException.fromMessage, beside the codes it matches.
+            t is WalletRefusalException.AmountExceedsCardLimit -> "AMOUNT_EXCEEDS_CARD_LIMIT" to null
+            t is WalletRefusalException.OnlineRequired -> "ONLINE_REQUIRED" to null
+            t is WalletRefusalException.TokenNotActive -> "TOKEN_NOT_ACTIVE" to null
             message.startsWith("CDCVM required") -> "CDCVM_REQUIRED" to null
             message.startsWith("Authentication cancelled") -> "AUTH_CANCELLED" to null
             message.startsWith("Authentication failed") -> "AUTH_FAILED" to null

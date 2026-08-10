@@ -41,6 +41,9 @@ RCT_EXTERN_METHOD(walletActivate : (NSString *)ref
 RCT_EXTERN_METHOD(walletCheckTokenActive : (NSString *)ref
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(walletTokenStatus : (NSString *)ref
+                  resolver : (RCTPromiseResolveBlock)resolve
+                  rejecter : (RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(walletObserveActivation : (NSString *)ref
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
@@ -136,7 +139,7 @@ RCT_EXTERN_METHOD(merchantInspectCustomerQr : (NSString *)payload
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(merchantChargeCustomerQr : (NSString *)handle
-                  reference : (NSString *)reference
+                  merchantOrderId : (NSString *)merchantOrderId
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(merchantGetTransactions : (double)limit

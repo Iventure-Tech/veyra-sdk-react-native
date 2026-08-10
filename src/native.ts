@@ -31,4 +31,6 @@ export const Events = {
   walletTap: 'VeyraWalletTapEvent',
   merchantTap: 'VeyraMerchantTapEvent',
   qrExpired: 'VeyraQrExpiredEvent',
+  transactionResolved: 'VeyraTransactionResolvedEvent',
+  creditConfirmation: 'VeyraCreditConfirmationEvent',
 } as const;

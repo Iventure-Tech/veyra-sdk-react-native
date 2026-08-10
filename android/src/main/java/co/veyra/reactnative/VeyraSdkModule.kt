@@ -66,6 +66,27 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
 
     init {
         reactContext.addLifecycleEventListener(this)
+        // the RN surface reports a never-attempted payment as its typed sdkErrorCode with
+        // no fabricated wire code. Safe to opt in bridge-wide: the JS mapper nulls an empty
+        // responseCode and carries sdkErrorCode, and the RN guide documents that shape.
+        co.veyra.softpos.payment.sdk.CardPaymentService.typedPreDispatchErrors = true
+        // registered once at module construction rather than per payment — the case
+        // that most needs it is a tap that resolves after the app was backgrounded. The SDK fires on its
+        // poller's thread; hop to the JS thread the way every other event here does.
+        co.veyra.softpos.payment.sdk.merchant.TransactionResolvedObserver.onTransactionResolved { r ->
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                emit(EventNames.TRANSACTION_RESOLVED, Mappers.transactionResolved(r))
+            }
+        }
+        // same registered-once shape for the credit-receipt confirmation — funds can be
+        // confirmed days after the sale, long after any per-payment JS callback is gone. A later change
+        // gave RN iOS the same channel off the Swift facade's forwarder, so this event now fires
+        // identically on both platforms with the same name and the same payload.
+        co.veyra.softpos.payment.sdk.merchant.CreditConfirmationObserver.onCreditConfirmation { c ->
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                emit(EventNames.CREDIT_CONFIRMATION, Mappers.creditConfirmation(c))
+            }
+        }
     }
 
     private fun emit(event: String, payload: WritableMap) {
@@ -258,6 +279,8 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
                         putString("expirationDateTime", r.expirationDateTime)
                         putString("status", r.status)
                         putString("message", r.message)
+                        // Raw wire value: JS carries codes verbatim (unknown codes included).
+                        putString("failureCode", r.failureCodeRaw)
                     })
                 },
                 { VeyraPromises.reject(promise, it) },
@@ -274,6 +297,10 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
                         putString("tokenUniqueReference", r.tokenUniqueReference)
                         putString("status", r.status)
                         putString("message", r.message)
+                        // Raw wire values: JS carries codes verbatim (unknown codes included).
+                        putString("failureCode", r.failureCodeRaw)
+                        r.attemptsRemaining?.let { putInt("attemptsRemaining", it) } ?: putNull("attemptsRemaining")
+                        putString("recommendDelete", r.recommendDeleteRaw)
                     })
                 },
                 { VeyraPromises.reject(promise, it) },
@@ -283,8 +310,16 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun walletCheckTokenActive(ref: String, promise: Promise) = withInit(promise) {
+        @Suppress("DEPRECATION")
         wallet().tokenisationService.checkTokenStatus(ref) { result ->
             result.fold({ promise.resolve(it) }, { VeyraPromises.reject(promise, it) })
+        }
+    }
+
+    @ReactMethod
+    fun walletTokenStatus(ref: String, promise: Promise) = withInit(promise) {
+        wallet().tokenisationService.tokenStatus(ref) { result ->
+            result.fold({ promise.resolve(it.value) }, { VeyraPromises.reject(promise, it) })
         }
     }
 
@@ -388,6 +423,32 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
                 emit(EventNames.WALLET_TAP, Arguments.createMap().apply {
                     putString("type", "activationFailed")
                     putString("message", message)
+                })
+            },
+            // A payment refused before any proof was built. Two phases, not one, because the
+            // advice differs — `requireOnline` means connect and retry, `amountExceedCardLimit`
+            // means this card can never pay this much, so telling the payer to go online would send
+            // them round a loop that cannot succeed.
+            onRequireOnline = { event ->
+                emit(EventNames.WALLET_TAP, Arguments.createMap().apply {
+                    putString("type", "requireOnline")
+                    putString("tokenId", event.tokenId)
+                    putString("tokenUniqueReference", event.tokenUniqueReference)
+                    putDouble("amountMinorUnits", event.amountMinorUnits.toDouble())
+                    putString("rail", event.rail)
+                    putString("message", event.message)
+                })
+            },
+            onAmountExceedCardLimit = { event ->
+                emit(EventNames.WALLET_TAP, Arguments.createMap().apply {
+                    putString("type", "amountExceedCardLimit")
+                    putString("tokenId", event.tokenId)
+                    putString("tokenUniqueReference", event.tokenUniqueReference)
+                    putDouble("amountMinorUnits", event.amountMinorUnits.toDouble())
+                    event.cardLimitMinorUnits?.let { putDouble("cardLimitMinorUnits", it.toDouble()) }
+                        ?: putNull("cardLimitMinorUnits")
+                    putString("rail", event.rail)
+                    putString("message", event.message)
                 })
             },
         )
@@ -596,7 +657,16 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
             countryCode = update.req("countryCode"),
             accountNumber = update.req("accountNumber"),
             institutionCode = update.req("institutionCode"),
-        ) { r -> promise.resolve(r?.merchantStatus) }
+        ) { r ->
+            // null = the update did NOT happen (no stored merchant, no environment, or the
+            // backend call failed) — reject so the app can say so, instead of resolving into
+            // a false "updated" success.
+            if (r == null) {
+                VeyraPromises.reject(promise, "REQUEST_FAILED", "Merchant update failed")
+            } else {
+                promise.resolve(r.merchantStatus)
+            }
+        }
     }
 
     // ── Merchant: tap acceptance ────────────────────────────────────────────────
@@ -607,7 +677,14 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
         val sessionId = UUID.randomUUID().toString()
         val amount = request.getDouble("amountMinorUnits").toLong()
         val currency = request.opt("currency") ?: "0566"
-        val reference = request.opt("merchantTransactionReference")
+        // the app's own order id, NOT a transaction reference — the SDK mints that
+        // (the gateway makes (merchantId, reference) unique and only the SDK can promise it) and
+        // returns it on the result. `merchantTransactionReference` is still read for callers that
+        // have not migrated their JS yet, but it is treated as an order id rather than silently
+        // ignored: passing it as a reference is what this SDK stopped supporting, and dropping it entirely
+        // would lose an identifier the app clearly meant to attach to the sale.
+        val merchantOrderId = request.opt("merchantOrderId")
+            ?: request.opt("merchantTransactionReference")
             ?: "${System.currentTimeMillis()}_${(1000..9999).random()}"
         val txType = TransactionRequest.TxType.valueOf(request.opt("txType") ?: "PURCHASE")
 
@@ -618,7 +695,9 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
 
         currentTapSessionId = sessionId
         softpos().cardPaymentService.makeCardPayment(
-            TransactionRequest.Builder(amount, reference, currency, txType).build(),
+            TransactionRequest.Builder(amount, currency, txType)
+                .merchantOrderId(merchantOrderId)
+                .build(),
             callback = { response ->
                 if (currentTapSessionId == sessionId) currentTapSessionId = null
                 emit(EventNames.MERCHANT_TAP, tapEvent("result").apply {
@@ -705,7 +784,7 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
-    fun merchantChargeCustomerQr(handle: String, reference: String?, promise: Promise) =
+    fun merchantChargeCustomerQr(handle: String, merchantOrderId: String?, promise: Promise) =
         withInit(promise) {
             val scanned = cpmQrs.take(handle)
                 ?: return@withInit VeyraPromises.reject(
@@ -713,12 +792,24 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
                 )
             scope.launch {
                 try {
-                    val response = softpos().cpmCustomerQrService.charge(scanned, reference)
+                    val response = softpos().cpmCustomerQrService
+                        .charge(scanned, merchantOrderId = merchantOrderId)
                     promise.resolve(Arguments.createMap().apply {
                         putBoolean("approved", response.responseCode == "00")
                         putString("responseCode", response.responseCode)
                         putString("transactionId", response.transactionId)
-                        putString("merchantTransactionReference", reference)
+                        // the MINTED reference, from the gateway's echo — not the
+                        // caller's value, which the SDK now ignores. Returning the caller's would
+                        // hand the app a key no gateway had ever seen, so every receipt lookup and
+                        // status poll built on it would miss.
+                        putString("merchantTransactionReference", response.merchantTransactionReference)
+                        putString("merchantOrderId", response.merchantOrderId)
+                        // an approved answer carries the merchant-bank credit id +
+                        // supported flag — the result screen's cue to wait for confirmation.
+                        putString("creditTransactionId", response.creditTransactionId)
+                        response.isCreditConfirmationSupported
+                            ?.let { putBoolean("isCreditConfirmationSupported", it) }
+                            ?: putNull("isCreditConfirmationSupported")
                     })
                 } catch (t: Throwable) {
                     VeyraPromises.reject(promise, t)
@@ -803,5 +894,20 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
         const val WALLET_TAP = "VeyraWalletTapEvent"
         const val MERCHANT_TAP = "VeyraMerchantTapEvent"
         const val QR_EXPIRED = "VeyraQrExpiredEvent"
+
+        /**
+         * a payment the app was left waiting on has resolved. Emitted for any transaction that
+         * stops being pending — including one started in an earlier app session and settled by a later
+         * poll — so a JS confirmation screen showing "processing" can finish without polling the store.
+         */
+        const val TRANSACTION_RESOLVED = "VeyraTransactionResolvedEvent"
+
+        /**
+         * the funds of an approved sale were confirmed in the merchant's bank account
+         * (`RECEIVED`), or the 30-day window closed unconfirmed (`UNABLE_TO_CONFIRM`). Settlement
+         * confirmation only — never a change to the payment outcome. Fires on both platforms
+         * (The iOS bridge is wired to the same shared observer.)
+         */
+        const val CREDIT_CONFIRMATION = "VeyraCreditConfirmationEvent"
     }
 }

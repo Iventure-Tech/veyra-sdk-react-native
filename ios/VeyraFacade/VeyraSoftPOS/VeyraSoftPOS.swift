@@ -154,11 +154,9 @@ public struct ScannedCustomerQr: Sendable {
     public let amountMinorUnits: Int64
     /// ISO 4217 numeric currency as carried in the QR (e.g. `"0566"`).
     public let currencyNumeric: String
-    /// The paying card's display name (EMV tag `5F20`), e.g. `AFRIGO ****1234` — the same value
-    /// a tap presents. `nil` when the QR carries none.
-    ///
-    /// **Display only.** Unlike the amount and currency it rides outside the QR's cryptogram, so
-    /// show it on the confirm screen and the receipt but never branch a payment decision on it.
+    /// Cardholder Name (EMV `5F20`) when the QR carried one — the paying card's display name,
+    /// e.g. "AFRIGO ****1234". Display only (it rides outside the cryptogram-covered data):
+    /// show it on the confirm screen, never branch a payment decision on it.
     public let cardholderName: String?
     /// The KMP-scanned payload, kept for `chargeCustomerQr` (never public API).
     let raw: ScannedCpmQr
@@ -172,6 +170,15 @@ public struct CustomerQrChargeOutcome: Sendable, Hashable {
     /// The merchant transaction reference this charge was submitted (and recorded) under —
     /// pass to `transactions.receipt(forReference:)` to build the receipt QR.
     public let reference: String
+    /// The merchant-bank credit's identifier (NIP session id inter-bank, batch reference
+    /// intra-bank) — the key for `transactions.creditConfirmation(...)`. Nil unless the charge
+    /// was approved and the gateway sent one.
+    public let creditTransactionID: String?
+    /// Whether the merchant's (beneficiary) bank can confirm the credit at all — the backend's
+    /// payment-time decision. When `true`, the SDK's app-scoped background sweep polls the
+    /// confirmation rail and stamps the answer onto the sale's stored row
+    /// (`creditConfirmationStatus`) — show a "confirming credit…" state and render the row.
+    public let isCreditConfirmationSupported: Bool?
 }
 
 public struct PaymentContextQR: Sendable, Hashable {
@@ -248,22 +255,31 @@ public struct MerchantUpdate: Sendable {
     }
 }
 
-/// One transaction's backend status. `amount` is in **minor units**.
+/// One transaction's backend status. `amount` is in **minor units** — nil on a not-found
+/// answer (`25`), where the gateway holds no transaction to take it from.
 public struct TransactionStatus: Sendable, Hashable {
     public let merchantTransactionReference: String
     public let merchantID: String
-    public let amount: Int64
+    public let amount: Int64?
     public let responseCode: String
     public let merchantStatus: String?
     public let transactionID: String?
+    /// The merchant-bank credit's identifier — sent when the transaction is approved, so an app
+    /// that lost local state can still re-learn it from a status poll. See
+    /// `transactions.creditConfirmation`.
+    public let creditTransactionID: String?
+    /// Whether the merchant's (beneficiary) bank can confirm the credit — the fetch gate.
+    public let isCreditConfirmationSupported: Bool?
 
     public init(
         merchantTransactionReference: String,
         merchantID: String,
-        amount: Int64,
+        amount: Int64?,
         responseCode: String,
         merchantStatus: String?,
-        transactionID: String?
+        transactionID: String?,
+        creditTransactionID: String? = nil,
+        isCreditConfirmationSupported: Bool? = nil
     ) {
         self.merchantTransactionReference = merchantTransactionReference
         self.merchantID = merchantID
@@ -271,6 +287,8 @@ public struct TransactionStatus: Sendable, Hashable {
         self.responseCode = responseCode
         self.merchantStatus = merchantStatus
         self.transactionID = transactionID
+        self.creditTransactionID = creditTransactionID
+        self.isCreditConfirmationSupported = isCreditConfirmationSupported
     }
 }
 
@@ -279,51 +297,174 @@ public struct TransactionStatus: Sendable, Hashable {
 /// `"APPROVED"` / `"DECLINED"` / `"PENDING"` / `"FAILED"`.
 public struct MerchantTransaction: Sendable, Hashable {
     public let reference: String
-    /// Which rail took the payment. Display `railLabel`; use this for logic.
     public let rail: String
-    /// Human label for `rail` — "Tap" / "QR" / "Scan". Derived by the SDK so every platform
-    /// words the badge identically; an unrecognised rail code is passed through unchanged.
-    public let railLabel: String
     public let amountMinorUnits: Int64
     public let currencyNumeric: String?
     public let status: String
     public let responseCode: String?
+    /// The outcome's stated cause (`"INSUFFICIENT_FUNDS"`, `"QR_EXPIRED"`…), carried verbatim
+    /// as a plain string — display it, never parse it; nil on legacy/unresolved rows.
+    public let responseStatusReason: String?
     public let transactionTime: String?
     public let transactionID: String?
     public let maskedTokenLast4: String
     public let transactionHash: String?
+    /// Human label for `rail` — "Tap" / "QR" / "Scan". Derived by the SDK so both platforms
+    /// word it identically; an unrecognised rail code is passed through unchanged.
+    public let railLabel: String
     /// Cardholder Name (EMV tag `5F20`) as the card presented it — on a Veyra token the card's
-    /// display name (application label + masked last four, e.g. `AFRIGO ****1234`), not a
-    /// person's name. `nil` on QR-MPM payments (the merchant never reads the card), on rows
-    /// recorded before this field existed, and when the card carried no `5F20`.
+    /// display name (e.g. "AFRIGO ****1234"), not a person's name. Nil on QR-MPM payments and
+    /// on rows recorded before the SDK captured it.
     public let cardholderName: String?
+    /// The beneficiary credit's identifier (NIP session id inter-bank, batch reference
+    /// intra-bank) — the key for `transactions.creditConfirmation(...)`. Nil on non-approved
+    /// rows and from gateways predating the credit-confirmation rail.
+    public let creditTransactionID: String?
+    /// Whether the merchant's (beneficiary) bank can confirm the credit at all — the backend's
+    /// payment-time decision, and the whole gate for fetching a confirmation.
+    public let isCreditConfirmationSupported: Bool?
+    /// Terminal credit-confirmation state: "RECEIVED" when the merchant's bank confirmed the
+    /// funds, "UNABLE_TO_CONFIRM" only as the final give-up after the 30-day window. **Nil while
+    /// unconfirmed** — render it as "not confirmed yet" (or nothing), never as "not received".
+    /// Settlement fact only; `status` remains the payment outcome.
+    public let creditConfirmationStatus: String?
 
     public init(
         reference: String,
         rail: String,
-        railLabel: String,
         amountMinorUnits: Int64,
         currencyNumeric: String?,
         status: String,
         responseCode: String?,
+        responseStatusReason: String? = nil,
         transactionTime: String?,
         transactionID: String?,
         maskedTokenLast4: String,
         transactionHash: String?,
-        cardholderName: String? = nil
+        railLabel: String = "",
+        cardholderName: String? = nil,
+        creditTransactionID: String? = nil,
+        isCreditConfirmationSupported: Bool? = nil,
+        creditConfirmationStatus: String? = nil
     ) {
         self.reference = reference
         self.rail = rail
-        self.railLabel = railLabel
         self.amountMinorUnits = amountMinorUnits
         self.currencyNumeric = currencyNumeric
         self.status = status
         self.responseCode = responseCode
+        self.responseStatusReason = responseStatusReason
         self.transactionTime = transactionTime
         self.transactionID = transactionID
         self.maskedTokenLast4 = maskedTokenLast4
         self.transactionHash = transactionHash
+        self.railLabel = railLabel
         self.cardholderName = cardholderName
+        self.creditTransactionID = creditTransactionID
+        self.isCreditConfirmationSupported = isCreditConfirmationSupported
+        self.creditConfirmationStatus = creditConfirmationStatus
+    }
+}
+
+/// The beneficiary side's answer to "has the merchant's bank actually received the funds?" —
+/// settlement confirmation for an approved sale, never a change to its payment outcome.
+/// `status` is a plain string: "RECEIVED" (terminal — the credit is in the merchant's account,
+/// id resolved and amount matched) or "UNABLE_TO_CONFIRM" (not confirmed yet — ask again later);
+/// unknown values are carried through verbatim. `amountMinorUnits`, `creditedAt` and
+/// `bankReference` are populated on "RECEIVED" only.
+public struct CreditConfirmation: Sendable, Hashable {
+    public let creditTransactionID: String
+    public let status: String
+    public let amountMinorUnits: Int64?
+    public let creditedAt: String?
+    public let bankReference: String?
+    public let message: String?
+
+    public init(
+        creditTransactionID: String,
+        status: String,
+        amountMinorUnits: Int64? = nil,
+        creditedAt: String? = nil,
+        bankReference: String? = nil,
+        message: String? = nil
+    ) {
+        self.creditTransactionID = creditTransactionID
+        self.status = status
+        self.amountMinorUnits = amountMinorUnits
+        self.creditedAt = creditedAt
+        self.bankReference = bankReference
+        self.message = message
+    }
+}
+
+/// How a payment the app was left waiting on finally ended — delivered to
+/// `transactions.onTransactionResolved(_:)` when a stored row stops being pending.
+///
+/// The whole triple, because "it resolved" is not useful on its own: an app showing "processing"
+/// needs to know whether to print a receipt (`status == "APPROVED"`), tell the cashier the card
+/// was refused (`"DECLINED"`, with `reason` naming the cause) or offer a retry (`"FAILED"` —
+/// nothing happened).
+public struct TransactionResolution: Sendable, Hashable {
+    /// The merchant transaction reference passed in when the payment was started. The SDK walks
+    /// every pending row, so this can fire for a sale other than the one on screen — always match
+    /// on it.
+    public let reference: String
+    /// The response code exactly as the backend sent it (`"00"`, `"51"`, `"96"`…). Receipts and
+    /// disputes quote this literal, never a renamed enum. Nil on rows recorded before it existed.
+    public let responseCode: String?
+    /// `"APPROVED"` / `"DECLINED"` / `"FAILED"` — always one of the three finals, never `"PENDING"`.
+    public let status: String
+    /// Why it ended that way, e.g. `"INSUFFICIENT_FUNDS"`. Nil when the backend sent none.
+    public let reason: String?
+
+    public init(reference: String, responseCode: String?, status: String, reason: String?) {
+        self.reference = reference
+        self.responseCode = responseCode
+        self.status = status
+        self.reason = reason
+    }
+}
+
+/// A sale's beneficiary credit confirmation, delivered to `transactions.onCreditConfirmation(_:)`
+/// when the confirmation concludes.
+///
+/// Settlement confirmation only: it says whether the **merchant's bank received the funds**, and
+/// never restates (or alters) the payment outcome the app already has.
+///
+/// Distinct from ``CreditConfirmation``, which is the reply to the on-demand
+/// `transactions.creditConfirmation(merchantID:creditTransactionID:amountMinorUnits:)` fetch: that
+/// one answers a question about a credit you named, so it has no sale reference to carry, while
+/// this one arrives unprompted about whichever sale the SDK's sweep just settled.
+public struct SaleCreditConfirmation: Sendable, Hashable {
+    /// The merchant transaction reference passed in when the payment was started — match the
+    /// confirmation to its sale with this.
+    public let reference: String
+    /// The credit's identifier (NIP session id inter-bank, batch reference intra-bank).
+    public let creditTransactionID: String?
+    /// `"RECEIVED"` (terminal — the funds landed) or `"UNABLE_TO_CONFIRM"` (the 30-day window
+    /// closed without a confirmation: a give-up, **not** a reversal).
+    public let status: String
+    /// Credited amount in **minor units**, as the merchant's bank reported it. `RECEIVED` only.
+    public let amountMinorUnits: Int64?
+    /// The merchant bank's own reference for the credit. `RECEIVED` only.
+    public let bankReference: String?
+    /// When the merchant's bank posted the credit (ISO date-time). `RECEIVED` only.
+    public let creditedAt: String?
+
+    public init(
+        reference: String,
+        creditTransactionID: String?,
+        status: String,
+        amountMinorUnits: Int64?,
+        bankReference: String?,
+        creditedAt: String?
+    ) {
+        self.reference = reference
+        self.creditTransactionID = creditTransactionID
+        self.status = status
+        self.amountMinorUnits = amountMinorUnits
+        self.bankReference = bankReference
+        self.creditedAt = creditedAt
     }
 }
 
@@ -338,12 +479,12 @@ public struct MerchantReceipt: Sendable, Hashable {
     public let maskedToken: String
     public let reference: String
     public let transactionHash: String?
-    /// Cardholder Name (EMV tag `5F20`) as the card presented it — on a Veyra token the card's
-    /// display name (e.g. `AFRIGO ****1234`), not a person's name. `nil` on QR-MPM payments and
-    /// on transactions recorded before the SDK captured it. Merchant-side display only: it is
-    /// not part of `qrPayload`, the format the customer's wallet scans.
-    public let cardholderName: String?
     public let qrPayload: String
+    /// Cardholder Name (EMV tag `5F20`) as the card presented it — the card's display name
+    /// (e.g. "AFRIGO ****1234"), not a person's name. Nil on QR-MPM and on older rows.
+    /// Merchant-side display only: it is not part of `qrPayload`, the format the customer
+    /// wallet scans.
+    public let cardholderName: String?
 
     public init(
         merchantName: String,
@@ -354,8 +495,8 @@ public struct MerchantReceipt: Sendable, Hashable {
         maskedToken: String,
         reference: String,
         transactionHash: String?,
-        cardholderName: String? = nil,
-        qrPayload: String
+        qrPayload: String,
+        cardholderName: String? = nil
     ) {
         self.merchantName = merchantName
         self.merchantAddress = merchantAddress
@@ -365,8 +506,8 @@ public struct MerchantReceipt: Sendable, Hashable {
         self.maskedToken = maskedToken
         self.reference = reference
         self.transactionHash = transactionHash
-        self.cardholderName = cardholderName
         self.qrPayload = qrPayload
+        self.cardholderName = cardholderName
     }
 }
 
@@ -379,6 +520,34 @@ public enum VeyraSoftPOSError: Error, Sendable {
     /// Arming the tap reader was refused — the wallet's payment is mid-flight, or the
     /// combined app bypassed `VeyraSDK` mode handling.
     case tapRefused(message: String)
+    /// The device has **no working internet connection**, so the call never left it — ask the
+    /// merchant to connect and try again. The Android SDK reports the same condition as
+    /// `SdkErrorCode.NO_NETWORK_CONNECTION`.
+    ///
+    /// For a payment this is deliberately **not** an issuer decline or a `91`: nothing reached the
+    /// gateway, so there is no response code, no transaction stored and nothing to reconcile. `91`
+    /// (`ISSUER_SWITCH_NOT_AVAILABLE`) means the SDK *did* reach the network and was refused — a
+    /// different situation with different advice, and the two must stay distinguishable.
+    case noNetworkConnection(message: String)
+}
+
+// Without `LocalizedError`, `error.localizedDescription` renders the useless "The operation
+// couldn't be completed. (VeyraSoftPOS.VeyraSoftPOSError error N.)" and the carried message — the
+// only thing that says what actually went wrong — is invisible to the merchant and to anyone
+// reading a support log. The wallet enum already had this; this one did not.
+extension VeyraSoftPOSError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .notConfigured:
+            return "VeyraSoftPOS is not configured — call VeyraSoftPOS.configure(_:) at launch."
+        case .requestFailed(let message):
+            return message
+        case .tapRefused(let message):
+            return message
+        case .noNetworkConnection(let message):
+            return message
+        }
+    }
 }
 
 /// Entry point of the Veyra SoftPOS SDK on iOS.
@@ -445,7 +614,15 @@ public final class VeyraSoftPOS: @unchecked Sendable {
         } catch let error as VeyraSoftPOSError {
             throw error
         } catch {
-            throw VeyraSoftPOSError.requestFailed(message: error.localizedDescription)
+            let message = error.localizedDescription
+            // the KMP transport codes an offline device into the message, exactly as the
+            // wallet facade does for its own refusals. Typed here so a merchant app can say "check
+            // your connection" instead of showing a generic request failure on every screen.
+            if message.contains("NO_NETWORK_CONNECTION") {
+                throw VeyraSoftPOSError.noNetworkConnection(
+                    message: "No internet connection — connect to the internet and try again")
+            }
+            throw VeyraSoftPOSError.requestFailed(message: message)
         }
     }
 
@@ -659,10 +836,12 @@ public final class VeyraSoftPOS: @unchecked Sendable {
                     TransactionStatus(
                         merchantTransactionReference: $0.merchantTransactionReference,
                         merchantID: $0.merchantId,
-                        amount: $0.amount,
+                        amount: $0.amount?.int64Value,
                         responseCode: $0.responseCode,
                         merchantStatus: $0.merchantStatus,
-                        transactionID: $0.transactionId
+                        transactionID: $0.transactionId,
+                        creditTransactionID: $0.creditTransactionId,
+                        isCreditConfirmationSupported: $0.isCreditConfirmationSupported?.boolValue
                     )
                 }
             }
@@ -677,19 +856,141 @@ public final class VeyraSoftPOS: @unchecked Sendable {
                     MerchantTransaction(
                         reference: r.reference,
                         rail: r.rail,
-                        railLabel: r.railLabel,
                         amountMinorUnits: r.amountMinorUnits,
                         currencyNumeric: r.currencyNumeric,
                         status: r.status,
                         responseCode: r.responseCode,
+                        responseStatusReason: r.responseStatusReason,
                         transactionTime: r.transactionTime,
                         transactionID: r.transactionId,
                         maskedTokenLast4: r.maskedTokenLast4,
                         transactionHash: r.transactionHash,
-                        cardholderName: r.cardholderName
+                        railLabel: r.railLabel,
+                        cardholderName: r.cardholderName,
+                        creditTransactionID: r.creditTransactionId,
+                        isCreditConfirmationSupported: r.isCreditConfirmationSupported?.boolValue,
+                        creditConfirmationStatus: r.creditConfirmationStatus
                     )
                 }
             }
+        }
+
+        /// Beneficiary credit confirmation: has the merchant's bank actually received an approved
+        /// sale's funds? Settlement confirmation only — it never restates the payment outcome.
+        /// Pass the `creditTransactionID` from the transaction's history row (populated when the
+        /// approval said `isCreditConfirmationSupported`) and the sale amount in **minor units**
+        /// (cross-checked by the merchant's bank).
+        ///
+        /// The SDK polls this rail itself, app-scoped, on every platform: on iOS its background
+        /// sweep runs for as long as the app is alive (no OS background execution — it suspends
+        /// and resumes with the app) and persists each answer onto the transaction's stored row
+        /// (`creditConfirmationStatus`) — render that row rather than polling here. This manual
+        /// fetch remains for an on-demand check: "RECEIVED" is terminal — stop asking; anything
+        /// else means ask again later. Mirrors `status(...)`'s shape.
+        public func creditConfirmation(
+            merchantID: String,
+            creditTransactionID: String,
+            amountMinorUnits: Int64
+        ) async throws -> CreditConfirmation {
+            try await owner.call { kmp in
+                let r = try await kmp.creditConfirmation(
+                    merchantId: merchantID,
+                    creditTransactionId: creditTransactionID,
+                    amountMinorUnits: amountMinorUnits
+                )
+                return CreditConfirmation(
+                    creditTransactionID: r.creditTransactionId,
+                    status: r.creditTransactionStatus,
+                    amountMinorUnits: r.amount?.int64Value,
+                    creditedAt: r.creditedAt,
+                    bankReference: r.bankReference,
+                    message: r.message
+                )
+            }
+        }
+
+        // ── Deferred answers: the SDK pushes, instead of the app polling ──────────────────
+
+        /// Observe payments that stop being pending — the push half of `history(limit:)`.
+        ///
+        /// A tap or QR sale that gets no answer hands the app a `PENDING` result, and the SDK then
+        /// polls it to a final status in the background. This fires the moment one settles, so a
+        /// screen showing "processing" can finish without a timer of its own. It fires for **any**
+        /// transaction that resolves — including one started in an earlier app launch and picked up
+        /// by a later poll — so match `resolution.reference` to the sale you care about.
+        ///
+        /// **A notification, never the source of truth.** There is no replay on registration: an
+        /// app that was not running when the row settled learns about it from `history(limit:)`.
+        /// Keep reading the store when a screen appears and treat this as the live update while it
+        /// is up.
+        ///
+        /// Callbacks arrive on the main thread. Observing again replaces the previous observer;
+        /// `stopObservingTransactionResolved()` clears it. Register once, at start-up.
+        ///
+        /// ```swift
+        /// try VeyraSoftPOS.shared.transactions.onTransactionResolved { resolution in
+        ///     guard resolution.reference == self.pendingReference else { return }
+        ///     self.show(status: resolution.status, code: resolution.responseCode)
+        /// }
+        /// ```
+        public func onTransactionResolved(
+            _ observer: @escaping @Sendable (TransactionResolution) -> Void
+        ) throws {
+            let kmp = try owner.requireKmp()
+            kmp.observeTransactionResolved { reference, responseCode, status, reason in
+                observer(
+                    TransactionResolution(
+                        reference: reference,
+                        responseCode: responseCode,
+                        status: status,
+                        reason: reason
+                    )
+                )
+            }
+        }
+
+        /// Stop observing resolved transactions; no further callbacks fire.
+        public func stopObservingTransactionResolved() throws {
+            try owner.requireKmp().stopObservingTransactionResolved()
+        }
+
+        /// Observe beneficiary credit confirmations — the answer the SDK's background sweep is
+        /// waiting for after an approved sale whose response said `isCreditConfirmationSupported`.
+        ///
+        /// Fires once per sale, with `"RECEIVED"` (the funds are in the merchant's account) or
+        /// `"UNABLE_TO_CONFIRM"` (the 30-day window closed unconfirmed — a give-up, not a
+        /// reversal). Settlement confirmation only: it never changes the payment outcome.
+        ///
+        /// The polling is the SDK's and is **app-scoped**, not screen-scoped: it keeps running as
+        /// the merchant navigates away from the result screen, and resumes when the app returns to
+        /// the foreground (iOS suspends timers with the app — there is no OS background execution,
+        /// so a suspended app loses time, never an answer). The confirmation is written to the
+        /// transaction's stored row (`MerchantTransaction.creditConfirmationStatus`) as well as
+        /// announced here, so a screen that appears later still shows it.
+        ///
+        /// Callbacks arrive on the main thread. Observing again replaces the previous observer;
+        /// `stopObservingCreditConfirmation()` clears it. Register once, at start-up.
+        public func onCreditConfirmation(
+            _ observer: @escaping @Sendable (SaleCreditConfirmation) -> Void
+        ) throws {
+            let kmp = try owner.requireKmp()
+            kmp.observeCreditConfirmation { reference, creditTransactionID, status, amountMinorUnits, bankReference, creditedAt in
+                observer(
+                    SaleCreditConfirmation(
+                        reference: reference,
+                        creditTransactionID: creditTransactionID,
+                        status: status,
+                        amountMinorUnits: amountMinorUnits?.int64Value,
+                        bankReference: bankReference,
+                        creditedAt: creditedAt
+                    )
+                )
+            }
+        }
+
+        /// Stop observing credit confirmations; no further callbacks fire.
+        public func stopObservingCreditConfirmation() throws {
+            try owner.requireKmp().stopObservingCreditConfirmation()
         }
 
         /// Build the receipt for one transaction: display fields plus a
@@ -715,8 +1016,8 @@ public final class VeyraSoftPOS: @unchecked Sendable {
                     maskedToken: r.maskedToken,
                     reference: r.reference,
                     transactionHash: r.transactionHash,
-                    cardholderName: r.cardholderName,
-                    qrPayload: r.qrPayload
+                    qrPayload: r.qrPayload,
+                    cardholderName: r.cardholderName
                 )
             }
         }
@@ -734,18 +1035,24 @@ public final class VeyraSoftPOS: @unchecked Sendable {
         /// created QR reaches its `expiry`. Blank/replace the code on this so it can't be scanned
         /// once lapsed. The SDK owns the timer: a new `createContext` supersedes it, and
         /// `cancelQrExpiry()` stops it (call on teardown). Omit to keep the old behaviour.
+        /// - Parameter merchantOrderID: your own order/basket/invoice id for the sale this QR
+        ///   represents (optional). The gateway stores it on the context and copies it onto the
+        ///   settled payment, reading it from its own stored context rather than from the payload
+        ///   the paying wallet echoes back.
         public func createContext(
             merchantID: String,
             amountMinorUnits: Int64,
             currency: String,
-            onExpired: (() -> Void)? = nil
+            onExpired: (() -> Void)? = nil,
+            merchantOrderID: String? = nil
         ) async throws -> PaymentContextQR {
             try await owner.call { kmp in
                 let created = try await kmp.createContextPayment(
                     merchantId: merchantID,
                     amountMinorUnits: amountMinorUnits,
                     currency: currency,
-                    onExpired: onExpired
+                    onExpired: onExpired,
+                    merchantOrderId: merchantOrderID
                 )
                 return PaymentContextQR(
                     txRef: created.txRef,
@@ -796,10 +1103,14 @@ public final class VeyraSoftPOS: @unchecked Sendable {
         /// Charge a merchant-confirmed scanned customer QR over the standard payment rail,
         /// synchronously. The amount charged is the QR's own (cryptogram-bound) amount — a
         /// tampered payload or a different amount declines at the token provider.
-        public func chargeCustomerQr(_ scanned: ScannedCustomerQr) async throws -> CustomerQrChargeOutcome {
-            // Supplied (not SDK-generated) so the outcome can hand it back for the receipt
-            // lookup — mirrors the Android sample's tap-reference idiom.
-            let reference = "\(Int(Date().timeIntervalSince1970 * 1000))_\(Int.random(in: 1000...9999))"
+        /// - Parameter merchantOrderID: your own order/basket/invoice id for this sale (optional).
+        ///   The SDK mints the transaction reference itself; this is the field for *your*
+        ///   identifier, and unlike the reference it is never used as a key, so you may reuse it
+        ///   across the attempts of one sale.
+        public func chargeCustomerQr(
+            _ scanned: ScannedCustomerQr,
+            merchantOrderID: String? = nil
+        ) async throws -> CustomerQrChargeOutcome {
             return try await owner.call { kmp in
                 // Apply the registered merchant so the /payment request carries
                 // merchant_id/acquirer_id/mcc/name/location — the CPM twin of the tap's
@@ -807,13 +1118,20 @@ public final class VeyraSoftPOS: @unchecked Sendable {
                 let response = try await kmp.chargeCpmQr(
                     scanned: scanned.raw,
                     merchant: owner.storedTapMerchant(),
-                    merchantTransactionReference: reference
+                    merchantTransactionReference: nil,
+                    merchantOrderId: merchantOrderID
                 )
+                // the reference comes BACK from the gateway, it is not made here. This
+                // used to mint its own ("\(millis)_\(random)") and hand that to the app as the
+                // receipt key — which the SDK now ignores, so it would have been a value no
+                // gateway had ever seen and every lookup built on it would have missed.
                 return CustomerQrChargeOutcome(
                     approved: response.responseCode == "00",
                     responseCode: response.responseCode,
                     transactionID: response.transactionId,
-                    reference: reference
+                    reference: response.merchantTransactionReference ?? "",
+                    creditTransactionID: response.creditTransactionId,
+                    isCreditConfirmationSupported: response.isCreditConfirmationSupported?.boolValue
                 )
             }
         }
@@ -834,18 +1152,33 @@ public final class VeyraSoftPOS: @unchecked Sendable {
             // Enrich the tap with the registered merchant so 9F4E/9F15/DF0E/DF0F carry real
             // values (the Android reader sources these from MerchantDataStore).
             let merchant = owner.storedTapMerchant()
-            // Settlement capability: the shared payment client the kernel uses to run
-            // TERMINAL_ACTION_ANALYSIS → ONLINE_PROCESSING → COMPLETION. nil if not configured —
-            // the tap then runs the reader dialogue only.
-            let paymentProcessing = try? owner.requireKmp().makePaymentProcessing()
             return TapPaymentSession(
                 amountMinorUnits: amountMinorUnits,
                 currencyCode: currencyCode,
                 merchant: merchant,
-                paymentProcessing: paymentProcessing,
+                kmp: try? owner.requireKmp(),
                 onEvent: onEvent
             )
         }
+    }
+}
+
+/// How a tap reader session ended **without a card dialogue** — the typed form of what used to
+/// be a raw string, so a host `switch` is exhaustive and the compiler flags a missed case.
+public enum TapSessionOutcome: String, Sendable {
+    /// The merchant dismissed the system NFC sheet — dismiss quietly; not an error.
+    case cancelled = "CANCELLED"
+    /// No card was presented before the reader's re-arm budget ran out — "try again".
+    case timeout = "TIMEOUT"
+    /// Any other session invalidation — "something went wrong".
+    case error = "ERROR"
+    /// This device cannot accept taps (no NFC reading) — terminal for the feature.
+    case unavailable = "UNAVAILABLE"
+
+    /// An outcome name this build does not know still ends the session, so it reads as
+    /// `.error` — the "something went wrong" advice is right for it by construction.
+    init(wire: String) {
+        self = TapSessionOutcome(rawValue: wire) ?? .error
     }
 }
 
@@ -856,8 +1189,19 @@ public enum TapPaymentEvent: Sendable {
     case cardDetected
     /// Foreign/non-Veyra target — the reader stays armed; show "card not supported, try again".
     case unsupportedTarget
-    /// The reader session ended without a card: CANCELLED / TIMEOUT / ERROR / UNAVAILABLE.
-    case ended(outcome: String)
+    /// The customer's phone left the field while the card dialogue was still running — show
+    /// "hold steady", keep the waiting screen up. A transient hint, not an outcome: the dialogue
+    /// still ends in `result`.
+    case cardContactLost
+    /// The card conversation is finished and the payment is going online — "you can take the
+    /// phone away; contacting the bank". Nothing talks to the card after this point.
+    case cardReadingComplete
+    /// The settlement request is on its way to the gateway.
+    case sendingRequestOnline
+    /// The gateway's reply has arrived and is being read. The outcome still comes in `result`.
+    case receivingOnlineResponse
+    /// The reader session ended without a card.
+    case ended(outcome: TapSessionOutcome)
     /// The kernel dialogue finished (any status — including the pending-settlement failure
     /// until the shared payment client lands).
     case result(TapPaymentResult)
@@ -868,17 +1212,26 @@ public struct TapPaymentResult: Sendable {
     /// APPROVED / DECLINED / PENDING / FAILED (TransactionStatus names).
     public let status: String
     public let pan: String?
-    /// Cardholder Name (EMV tag `5F20`) as the card presented it, for display and receipts;
-    /// `nil` when the card carried none. On a Veyra token this is the card's display name — the
-    /// scheme's application label and the masked last four, e.g. `AFRIGO ****1234` — not a
-    /// person's name.
-    public let cardholderName: String?
     /// DE55 EMV data (uppercase hex) when the card returned an ARQC — the online leg's input.
     public let iccDataHex: String?
     public let errorMessage: String?
+    /// The SDK error code when the tap failed before or during dispatch — `"NO_NETWORK_CONNECTION"`
+    /// when this device had no working internet connection, so nothing reached the gateway and
+    /// there is nothing to reconcile: tell the merchant to connect and take the payment again.
+    /// Nil for an ordinary outcome, including a decline.
+    public let sdkErrorCode: String?
     /// The merchant transaction reference the settlement request carried — pass to
     /// `transactions.receipt(forReference:)` for the receipt QR.
     public let reference: String?
+    /// The merchant-bank credit's identifier (NIP session id inter-bank, batch reference
+    /// intra-bank). Nil unless the sale was approved and the gateway sent one.
+    public let creditTransactionID: String?
+    /// Whether the merchant's (beneficiary) bank can confirm the credit at all — the backend's
+    /// payment-time decision. When `true`, the SDK polls the confirmation rail in the background
+    /// and announces the answer through `transactions.onCreditConfirmation(_:)`: show a
+    /// "confirming credit…" state on the result screen and flip it from that callback.
+    /// `false`/`nil` means there is nothing to wait for.
+    public let isCreditConfirmationSupported: Bool?
 }
 
 /// One armed tap acceptance. Create per waiting screen; always `cancel()` when the screen
@@ -892,11 +1245,21 @@ public final class TapPaymentSession: @unchecked Sendable {
         amountMinorUnits: Int64,
         currencyCode: Int32,
         merchant: TapMerchant?,
-        paymentProcessing: PaymentProcessingService?,
+        kmp: SoftposKmp?,
         onEvent: @escaping @Sendable (TapPaymentEvent) -> Void
     ) {
         let bridge = EventsBridge(onEvent: onEvent)
         self.bridge = bridge
+        // Settlement capability: the shared payment client the kernel uses to run
+        // TERMINAL_ACTION_ANALYSIS → ONLINE_PROCESSING → COMPLETION. nil if not configured —
+        // the tap then runs the reader dialogue only.
+        //
+        // Built here rather than by the caller because the two online sub-phase hints come off
+        // that client, so it needs the events bridge already in hand.
+        let paymentProcessing = kmp?.makePaymentProcessing(
+            onSendingRequestOnline: { bridge.onSendingRequestOnline() },
+            onReceivingOnlineResponse: { bridge.onReceivingOnlineResponse() }
+        )
         self.kotlin = IosTapAcceptance(
             amountMinorUnits: amountMinorUnits,
             currencyCode: currencyCode,
@@ -932,15 +1295,21 @@ public final class TapPaymentSession: @unchecked Sendable {
 
         func onCardDetected() { emit(.cardDetected) }
         func onUnsupportedTarget() { emit(.unsupportedTarget) }
-        func onEnded(outcome: String) { emit(.ended(outcome: outcome)) }
+        func onCardContactLost() { emit(.cardContactLost) }
+        func onCardReadingComplete() { emit(.cardReadingComplete) }
+        func onSendingRequestOnline() { emit(.sendingRequestOnline) }
+        func onReceivingOnlineResponse() { emit(.receivingOnlineResponse) }
+        func onEnded(outcome: String) { emit(.ended(outcome: TapSessionOutcome(wire: outcome))) }
         func onResult(result: TapKernelResult) {
             emit(.result(TapPaymentResult(
                 status: result.status,
                 pan: result.pan,
-                cardholderName: result.cardholderName,
                 iccDataHex: result.iccDataHex(),
                 errorMessage: result.errorMessage,
-                reference: result.merchantTransactionReference
+                sdkErrorCode: result.sdkErrorCode,
+                reference: result.merchantTransactionReference,
+                creditTransactionID: result.creditTransactionId,
+                isCreditConfirmationSupported: result.isCreditConfirmationSupported?.boolValue
             )))
         }
     }
