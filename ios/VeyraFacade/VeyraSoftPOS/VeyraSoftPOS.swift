@@ -296,7 +296,14 @@ public struct TransactionStatus: Sendable, Hashable {
 /// in **minor units**; `rail` is `"TAP"` / `"QR_MPM"` / `"QR_CPM"`; `status` is
 /// `"APPROVED"` / `"DECLINED"` / `"PENDING"` / `"FAILED"`.
 public struct MerchantTransaction: Sendable, Hashable {
+    /// The sale's reference, **minted by the SDK** (`{terminalID}-YYYYMMDDHHmmssSSS`) and unique
+    /// per merchant at the gateway — the key for receipts, status refreshes and credit confirmation.
     public let reference: String
+    /// The **app's own** order / basket / invoice id for this sale, echoed back by the gateway, or
+    /// nil when none was supplied. Never validated for uniqueness and never a lookup key, so the
+    /// same value may sit on several attempts of one sale — which is what links a retry to its
+    /// original order.
+    public let merchantOrderID: String?
     public let rail: String
     public let amountMinorUnits: Int64
     public let currencyNumeric: String?
@@ -331,6 +338,10 @@ public struct MerchantTransaction: Sendable, Hashable {
 
     public init(
         reference: String,
+        // Defaulted so every existing call site keeps compiling unchanged (additive-only): the
+        // stored property and `map` above were added without this parameter, which left the
+        // explicit initializer unable to accept the field it is required to set.
+        merchantOrderID: String? = nil,
         rail: String,
         amountMinorUnits: Int64,
         currencyNumeric: String?,
@@ -348,6 +359,7 @@ public struct MerchantTransaction: Sendable, Hashable {
         creditConfirmationStatus: String? = nil
     ) {
         self.reference = reference
+        self.merchantOrderID = merchantOrderID
         self.rail = rail
         self.amountMinorUnits = amountMinorUnits
         self.currencyNumeric = currencyNumeric
@@ -852,27 +864,97 @@ public final class VeyraSoftPOS: @unchecked Sendable {
         /// Mirrors Android's `TransactionService.getLastTransactions`.
         public func history(limit: Int = 50) async throws -> [MerchantTransaction] {
             try await owner.call { kmp in
-                try await kmp.merchantTransactions(limit: Int32(limit)).map { r in
-                    MerchantTransaction(
-                        reference: r.reference,
-                        rail: r.rail,
-                        amountMinorUnits: r.amountMinorUnits,
-                        currencyNumeric: r.currencyNumeric,
-                        status: r.status,
-                        responseCode: r.responseCode,
-                        responseStatusReason: r.responseStatusReason,
-                        transactionTime: r.transactionTime,
-                        transactionID: r.transactionId,
-                        maskedTokenLast4: r.maskedTokenLast4,
-                        transactionHash: r.transactionHash,
-                        railLabel: r.railLabel,
-                        cardholderName: r.cardholderName,
-                        creditTransactionID: r.creditTransactionId,
-                        isCreditConfirmationSupported: r.isCreditConfirmationSupported?.boolValue,
-                        creditConfirmationStatus: r.creditConfirmationStatus
-                    )
-                }
+                try await kmp.merchantTransactions(limit: Int32(limit)).map(Self.map)
             }
+        }
+
+        /// Ask the gateway about **one** pending transaction now, and return the updated stored row.
+        ///
+        /// The on-demand counterpart to `history(limit:)`, which only reads what the device already
+        /// knows. The SDK polls a pending transaction for you with exponential backoff and **stops
+        /// after 30 days**; this is how a merchant staring at a row gets an answer sooner than the
+        /// next rung, and the only route to one once that window has closed.
+        ///
+        /// It runs the SDK's own background sweep for this single row — same query, same reading of
+        /// the answer, same write into the same local store — so an on-demand check and a background
+        /// check cannot reach different conclusions. It is **not** a way to force an outcome: a
+        /// payment that is still unsettled answers `PENDING` again, and the SDK invents nothing.
+        ///
+        /// Distinct from `status(merchantID:merchantTransactionReference:transactionDate:)`, which
+        /// stays as the **raw** query: that one returns whatever the gateway said and writes nothing.
+        ///
+        /// - Returns: the transaction as it stands after the check, or `nil` if this device has no
+        ///   such reference. A row that already has a final outcome is returned unchanged, without a
+        ///   network call.
+        /// - Throws: `VeyraSoftPOSError.noNetworkConnection` when the device is offline, and the
+        ///   usual transport errors otherwise. A failed check never changes the stored row, so
+        ///   showing the error and leaving the row as pending is the correct handling.
+        public func refreshStatus(reference: String) async throws -> MerchantTransaction? {
+            try await owner.call { kmp in
+                try await kmp.refreshTransactionStatus(reference: reference).map(Self.map)
+            }
+        }
+
+        /// Check the merchant credit **now** for one approved sale — "has my bank actually received
+        /// the funds?" — and return the updated stored row.
+        ///
+        /// The SDK already asks this in the background, with exponential backoff, for **30 days**
+        /// after the sale, and then records the row as `"UNABLE_TO_CONFIRM"` — which means *"we
+        /// stopped asking"*, never *"the funds were not received"*. This is the escape hatch from
+        /// that give-up and a convenience long before it: it still works once the window has closed,
+        /// and a later `"RECEIVED"` replaces the give-up state.
+        ///
+        /// **Check `isCreditConfirmationSupported` on the transaction first.** Not every merchant's
+        /// bank is on the confirmation rail. Offer this action only while
+        /// ```swift
+        /// txn.status == "APPROVED"
+        ///     && txn.isCreditConfirmationSupported == true
+        ///     && txn.creditConfirmationStatus != "RECEIVED"
+        /// ```
+        /// A call on a row that fails that predicate makes **no network request** and returns the row
+        /// unchanged rather than throwing.
+        ///
+        /// Distinct from `creditConfirmation(merchantID:creditTransactionID:amountMinorUnits:)`,
+        /// which stays as the **raw** fetch: that one returns whatever the gateway said and writes
+        /// nothing, so a `"RECEIVED"` learned that way is gone on the next render. This one writes
+        /// the stored row and fires the credit-confirmation observer, exactly as the background sweep
+        /// does.
+        ///
+        /// Settlement only: nothing on this path can change the sale's `status`, `responseCode` or
+        /// `responseStatusReason`.
+        ///
+        /// - Returns: the transaction as it stands after the check, or `nil` if this device has no
+        ///   such reference.
+        /// - Throws: `VeyraSoftPOSError.noNetworkConnection` when the device is offline, and the
+        ///   usual transport errors otherwise. A failed check never changes the stored row, so
+        ///   showing the error and leaving the credit line reading "not confirmed yet" is the correct
+        ///   handling.
+        public func refreshCreditConfirmation(reference: String) async throws -> MerchantTransaction? {
+            try await owner.call { kmp in
+                try await kmp.refreshCreditConfirmation(reference: reference).map(Self.map)
+            }
+        }
+
+        private static func map(_ r: VeyraKMP.MerchantTransactionRecord) -> MerchantTransaction {
+            MerchantTransaction(
+                reference: r.reference,
+                merchantOrderID: r.merchantOrderId,
+                rail: r.rail,
+                amountMinorUnits: r.amountMinorUnits,
+                currencyNumeric: r.currencyNumeric,
+                status: r.status,
+                responseCode: r.responseCode,
+                responseStatusReason: r.responseStatusReason,
+                transactionTime: r.transactionTime,
+                transactionID: r.transactionId,
+                maskedTokenLast4: r.maskedTokenLast4,
+                transactionHash: r.transactionHash,
+                railLabel: r.railLabel,
+                cardholderName: r.cardholderName,
+                creditTransactionID: r.creditTransactionId,
+                isCreditConfirmationSupported: r.isCreditConfirmationSupported?.boolValue,
+                creditConfirmationStatus: r.creditConfirmationStatus
+            )
         }
 
         /// Beneficiary credit confirmation: has the merchant's bank actually received an approved

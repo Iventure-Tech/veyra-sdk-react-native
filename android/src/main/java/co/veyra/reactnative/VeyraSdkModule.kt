@@ -548,6 +548,41 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
+    /**
+     * The per-transaction counterpart to the reconcile above — one row, keyed by hash,
+     * resolving with the updated stored row rather than nothing. A transport failure rejects with
+     * the typed code (`NO_NETWORK_CONNECTION` when offline) and leaves the row untouched.
+     */
+    @ReactMethod
+    fun walletRefreshTransactionStatus(transactionHash: String, promise: Promise) = withInit(promise) {
+        scope.launch(Dispatchers.IO) {
+            try {
+                val row = wallet().tokenisationService.refreshTransactionStatus(transactionHash)
+                promise.resolve(row?.let { Mappers.transactionSummary(it) })
+            } catch (t: Throwable) {
+                VeyraPromises.reject(promise, t)
+            }
+        }
+    }
+
+    /**
+     * "Check merchant credit now" for one wallet payment. Settlement only — it can never
+     * change the row's outcome triple. A transport failure rejects with the typed code
+     * (`NO_NETWORK_CONNECTION` when offline) and leaves the row untouched; an ineligible row makes no
+     * call at all and resolves unchanged.
+     */
+    @ReactMethod
+    fun walletRefreshCreditConfirmation(transactionHash: String, promise: Promise) = withInit(promise) {
+        scope.launch(Dispatchers.IO) {
+            try {
+                val row = wallet().tokenisationService.refreshCreditConfirmation(transactionHash)
+                promise.resolve(row?.let { Mappers.transactionSummary(it) })
+            } catch (t: Throwable) {
+                VeyraPromises.reject(promise, t)
+            }
+        }
+    }
+
     @ReactMethod
     fun walletProcessReceipt(payload: String, expectedHash: String?, promise: Promise) =
         withInit(promise) {
@@ -726,7 +761,13 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
     // ── Merchant: get-paid QR (MPM) ─────────────────────────────────────────────
 
     @ReactMethod
-    fun merchantCreatePaymentContext(amountMinorUnits: Double, currency: String, promise: Promise) =
+    fun merchantCreatePaymentContext(
+        amountMinorUnits: Double,
+        currency: String,
+        // the merchant's own order id, so the MPM rail carries it like tap and CPM do.
+        merchantOrderId: String?,
+        promise: Promise,
+    ) =
         withInit(promise) {
             val merchantId = softpos().merchantService.getStoredMerchantId()
                 ?: return@withInit VeyraPromises.reject(
@@ -734,7 +775,12 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
                 )
             scope.launch {
                 try {
-                    val created = client().createContextPayment(merchantId, amountMinorUnits.toLong(), currency) {
+                    val created = client().createContextPayment(
+                        merchantId,
+                        amountMinorUnits.toLong(),
+                        currency,
+                        merchantOrderId = merchantOrderId,
+                    ) {
                         emit(EventNames.QR_EXPIRED, Arguments.createMap().apply {
                             putString("scope", "merchant")
                             putNull("handle")
@@ -838,6 +884,40 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
         scope.launch(Dispatchers.IO) {
             try {
                 val row = softpos().transactionService.getTransaction(reference)
+                promise.resolve(row?.let { Mappers.merchantTransaction(it) })
+            } catch (t: Throwable) {
+                VeyraPromises.reject(promise, t)
+            }
+        }
+    }
+
+    /**
+     * The on-demand "check status now" for one merchant transaction. Unlike
+     * [merchantGetTransaction] above this goes to the gateway, so a transport failure is a real
+     * rejection — `VeyraPromises.reject` carries the typed code, `NO_NETWORK_CONNECTION` included.
+     */
+    @ReactMethod
+    fun merchantRefreshTransactionStatus(reference: String, promise: Promise) = withInit(promise) {
+        scope.launch(Dispatchers.IO) {
+            try {
+                val row = softpos().transactionService.refreshTransactionStatus(reference)
+                promise.resolve(row?.let { Mappers.merchantTransaction(it) })
+            } catch (t: Throwable) {
+                VeyraPromises.reject(promise, t)
+            }
+        }
+    }
+
+    /**
+     * "Check merchant credit now" for one sale. Unlike [merchantGetTransaction] this goes
+     * to the gateway, so a transport failure is a real rejection carrying the typed code
+     * (`NO_NETWORK_CONNECTION` included). An ineligible row makes no call and resolves unchanged.
+     */
+    @ReactMethod
+    fun merchantRefreshCreditConfirmation(reference: String, promise: Promise) = withInit(promise) {
+        scope.launch(Dispatchers.IO) {
+            try {
+                val row = softpos().transactionService.refreshCreditConfirmation(reference)
                 promise.resolve(row?.let { Mappers.merchantTransaction(it) })
             } catch (t: Throwable) {
                 VeyraPromises.reject(promise, t)

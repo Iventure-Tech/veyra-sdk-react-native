@@ -598,8 +598,19 @@ export interface TapRequest {
   amountMinorUnits: number;
   /** ISO 4217 numeric, e.g. '566'. Default '566'. */
   currency?: string;
-  /** Android only: caller-supplied reference. iOS generates one (see result). */
-  merchantTransactionReference?: string;
+  /**
+   * Your own order / basket / invoice id for this sale. Optional.
+   *
+   * Echoed back on the result and shown on the transaction detail and receipt. It is never
+   * validated for uniqueness and never used as a lookup key, so the same value may appear on
+   * several attempts of one sale — which is exactly what links a retried sale back to its order.
+   *
+   * The transaction **reference** is not yours to supply: the SDK mints it
+   * (`{terminalId}-YYYYMMDDHHmmssSSS`) so the gateway can guarantee it is unique per merchant, and
+   * it comes back as `merchantTransactionReference` on the result. Key receipts, status refreshes
+   * and credit confirmation off that.
+   */
+  merchantOrderId?: string;
   /** Android only. Default 'PURCHASE'. */
   txType?:
     | 'PURCHASE'

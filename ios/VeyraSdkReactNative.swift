@@ -682,6 +682,41 @@ class VeyraSdkReactNative: RCTEventEmitter {
     }
   }
 
+  /// The per-transaction counterpart to the reconcile above — one row, keyed by hash,
+  /// resolving with the updated stored row rather than nothing. A transport failure rejects with the
+  /// typed code (`NO_NETWORK_CONNECTION` when offline) and leaves the row untouched.
+  @objc(walletRefreshTransactionStatus:resolver:rejecter:)
+  func walletRefreshTransactionStatus(_ transactionHash: String,
+                                      resolver resolve: @escaping RCTPromiseResolveBlock,
+                                      rejecter rejecter: @escaping RCTPromiseRejectBlock) {
+    Task {
+      do {
+        let row = try await VeyraWallet.shared.tokenisation.refreshTransactionStatus(
+          transactionHash: transactionHash
+        )
+        resolve(row.map(self.summaryDict))
+      } catch { self.reject(rejecter, error) }
+    }
+  }
+
+  /// "Check merchant credit now" for one wallet payment. Settlement only — it can never
+  /// change the row's outcome triple. A transport failure rejects with the typed code
+  /// (`NO_NETWORK_CONNECTION` when offline) and leaves the row untouched; an ineligible row makes no
+  /// call at all and resolves unchanged.
+  @objc(walletRefreshCreditConfirmation:resolver:rejecter:)
+  func walletRefreshCreditConfirmation(_ transactionHash: String,
+                                       resolver resolve: @escaping RCTPromiseResolveBlock,
+                                       rejecter rejecter: @escaping RCTPromiseRejectBlock) {
+    Task {
+      do {
+        let row = try await VeyraWallet.shared.tokenisation.refreshCreditConfirmation(
+          transactionHash: transactionHash
+        )
+        resolve(row.map(self.summaryDict))
+      } catch { self.reject(rejecter, error) }
+    }
+  }
+
   @objc(walletProcessReceipt:expectedHash:resolver:rejecter:)
   func walletProcessReceipt(_ payload: String, expectedHash: String?,
                             resolver resolve: @escaping RCTPromiseResolveBlock,
@@ -974,8 +1009,9 @@ class VeyraSdkReactNative: RCTEventEmitter {
 
   // ── Merchant: get-paid QR (MPM) ─────────────────────────────────────────────
 
-  @objc(merchantCreatePaymentContext:currency:resolver:rejecter:)
+  @objc(merchantCreatePaymentContext:currency:merchantOrderId:resolver:rejecter:)
   func merchantCreatePaymentContext(_ amountMinorUnits: Double, currency: String,
+                                    merchantOrderId: String?,
                                     resolver resolve: @escaping RCTPromiseResolveBlock,
                                     rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     guard initialized else { return rejectNotInitialized(rejecter) }
@@ -988,7 +1024,8 @@ class VeyraSdkReactNative: RCTEventEmitter {
           currency: currency,
           onExpired: { [weak self] in
             self?.sendEvent(withName: EventName.qrExpired, body: ["scope": "merchant", "handle": NSNull()])
-          }
+          },
+          merchantOrderID: merchantOrderId
         )
         resolve(["txRef": context.txRef, "mpmPayload": context.mpmPayload, "expiry": context.expiry as Any])
       } catch { self.reject(rejecter, error) }
@@ -1111,6 +1148,38 @@ class VeyraSdkReactNative: RCTEventEmitter {
       do {
         let rows = try await VeyraSoftPOS.shared.transactions.history(limit: 500)
         resolve(rows.first { $0.reference == reference }.map(self.merchantTransactionDict))
+      } catch { self.reject(rejecter, error) }
+    }
+  }
+
+  /// The on-demand "check status now" for one merchant transaction. Unlike
+  /// `merchantGetTransaction` above — a local read over `history` — this goes to the gateway, so a
+  /// transport failure is a real rejection carrying the typed code (`NO_NETWORK_CONNECTION`).
+  @objc(merchantRefreshTransactionStatus:resolver:rejecter:)
+  func merchantRefreshTransactionStatus(_ reference: String,
+                                        resolver resolve: @escaping RCTPromiseResolveBlock,
+                                        rejecter rejecter: @escaping RCTPromiseRejectBlock) {
+    Task {
+      do {
+        let row = try await VeyraSoftPOS.shared.transactions.refreshStatus(reference: reference)
+        resolve(row.map(self.merchantTransactionDict))
+      } catch { self.reject(rejecter, error) }
+    }
+  }
+
+  /// "Check merchant credit now" for one sale. Unlike `merchantGetTransaction` — a local
+  /// read — this goes to the gateway, so a transport failure is a real rejection carrying the typed
+  /// code (`NO_NETWORK_CONNECTION`). An ineligible row makes no call and resolves unchanged.
+  @objc(merchantRefreshCreditConfirmation:resolver:rejecter:)
+  func merchantRefreshCreditConfirmation(_ reference: String,
+                                         resolver resolve: @escaping RCTPromiseResolveBlock,
+                                         rejecter rejecter: @escaping RCTPromiseRejectBlock) {
+    Task {
+      do {
+        let row = try await VeyraSoftPOS.shared.transactions.refreshCreditConfirmation(
+          reference: reference
+        )
+        resolve(row.map(self.merchantTransactionDict))
       } catch { self.reject(rejecter, error) }
     }
   }

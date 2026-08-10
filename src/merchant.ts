@@ -92,11 +92,20 @@ export const merchant = {
    * Creates a payment context QR for the stored merchant. Expiry fires once on the
    * qr-expired channel ({@link onQrExpired}).
    */
+  /**
+   * @param merchantOrderId your own order/basket/invoice id for this sale (optional).
+   *   Stored by the gateway against the context and carried onto the transaction when the wallet's
+   *   push settles. Never validated for uniqueness and never a lookup key — the transaction
+   *   reference is minted by the SDK and comes back on the settled row.
+   */
   createPaymentContext(
     amountMinorUnits: number,
-    currency = '566'
+    currency = '566',
+    merchantOrderId: string | null = null
   ): Promise<PaymentContextQr> {
-    return nativeCall(() => VeyraNative.merchantCreatePaymentContext(amountMinorUnits, currency));
+    return nativeCall(() =>
+      VeyraNative.merchantCreatePaymentContext(amountMinorUnits, currency, merchantOrderId)
+    );
   },
 
   cancelQrExpiry(): Promise<void> {
@@ -171,6 +180,67 @@ export const merchant = {
 
   getTransaction(merchantTransactionReference: string): Promise<MerchantTransaction | null> {
     return nativeCall(() => VeyraNative.merchantGetTransaction(merchantTransactionReference));
+  },
+
+  /**
+   * Ask the gateway about **one** pending transaction now, and resolve with the updated stored row.
+   *
+   * The on-demand counterpart to `getTransaction`, which only reads what the device already knows.
+   * The SDK polls a pending transaction for you with exponential backoff and **stops after 30
+   * days**; this is how a merchant staring at a row gets an answer sooner than the next rung, and
+   * the only route to one once that window has closed.
+   *
+   * Runs the SDK's own background sweep for this single row — same query, same reading of the
+   * answer, same write into the same local store — so an on-demand check and a background check
+   * cannot disagree. It is **not** a way to force an outcome: a payment that is still unsettled
+   * answers `PENDING` again.
+   *
+   * Resolves `null` when this device has no such reference; a row that already has a final outcome
+   * comes back unchanged without a network call. Rejects with `NO_NETWORK_CONNECTION` when the
+   * device is offline — a failed check never changes the stored row, so show the error and leave
+   * the row pending.
+   */
+  refreshTransactionStatus(
+    merchantTransactionReference: string
+  ): Promise<MerchantTransaction | null> {
+    return nativeCall(() =>
+      VeyraNative.merchantRefreshTransactionStatus(merchantTransactionReference)
+    );
+  },
+
+  /**
+   * Check the merchant credit **now** for one approved sale — "has my bank actually received the
+   * funds?" — and resolve with the updated stored row.
+   *
+   * The SDK already asks this in the background, with exponential backoff, for **30 days** after the
+   * sale, and then records the row as `'UNABLE_TO_CONFIRM'` — which means *"we stopped asking"*,
+   * never *"the funds were not received"*. This is the escape hatch from that give-up and a
+   * convenience long before it: it still works once the window has closed, and a later `'RECEIVED'`
+   * replaces the give-up state.
+   *
+   * **Check `isCreditConfirmationSupported` on the transaction first.** Not every merchant's bank is
+   * on the confirmation rail. Offer the action only while
+   * ```ts
+   * txn.status === 'APPROVED' &&
+   *   txn.isCreditConfirmationSupported === true &&
+   *   txn.creditConfirmationStatus !== 'RECEIVED'
+   * ```
+   * A call on a row that fails that predicate makes **no network request** and resolves with the row
+   * unchanged rather than rejecting.
+   *
+   * Settlement only: nothing on this path can change the sale's `status`, `responseCode` or
+   * `responseStatusReason`.
+   *
+   * Resolves `null` when this device has no such reference. Rejects with `NO_NETWORK_CONNECTION`
+   * when the device is offline — a failed check never changes the stored row, so show the error and
+   * leave the credit line reading "not confirmed yet".
+   */
+  refreshCreditConfirmation(
+    merchantTransactionReference: string
+  ): Promise<MerchantTransaction | null> {
+    return nativeCall(() =>
+      VeyraNative.merchantRefreshCreditConfirmation(merchantTransactionReference)
+    );
   },
 
   getReceipt(merchantTransactionReference: string): Promise<MerchantReceipt | null> {

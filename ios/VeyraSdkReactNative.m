@@ -88,6 +88,12 @@ RCT_EXTERN_METHOD(walletGetTransactions : (NSString *)ref
                   rejecter : (RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(walletReconcilePendingTransactions : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(walletRefreshTransactionStatus : (NSString *)transactionHash
+                  resolver : (RCTPromiseResolveBlock)resolve
+                  rejecter : (RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(walletRefreshCreditConfirmation : (NSString *)transactionHash
+                  resolver : (RCTPromiseResolveBlock)resolve
+                  rejecter : (RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(walletProcessReceipt : (NSString *)payload
                   expectedHash : (NSString *)expectedHash
                   resolver : (RCTPromiseResolveBlock)resolve
@@ -128,6 +134,7 @@ RCT_EXTERN_METHOD(merchantTapCancel : (NSString *)sessionId
                   rejecter : (RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(merchantCreatePaymentContext : (double)amountMinorUnits
                   currency : (NSString *)currency
+                  merchantOrderId : (NSString *_Nullable)merchantOrderId
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(merchantCancelQrExpiry : (RCTPromiseResolveBlock)resolve
@@ -146,6 +153,12 @@ RCT_EXTERN_METHOD(merchantGetTransactions : (double)limit
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(merchantGetTransaction : (NSString *)reference
+                  resolver : (RCTPromiseResolveBlock)resolve
+                  rejecter : (RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(merchantRefreshTransactionStatus : (NSString *)reference
+                  resolver : (RCTPromiseResolveBlock)resolve
+                  rejecter : (RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(merchantRefreshCreditConfirmation : (NSString *)reference
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(merchantGetReceipt : (NSString *)reference

@@ -180,6 +180,60 @@ export const wallet = {
     return nativeCall(() => VeyraNative.walletReconcilePendingTransactions());
   },
 
+  /**
+   * Ask the backend about **one** pending transaction now, keyed by its transaction hash, and
+   * resolve with the updated stored row.
+   *
+   * The per-transaction counterpart to `reconcilePendingTransactions`, which asks about every open
+   * row and resolves with nothing — this one answers about the row the customer is looking at. The
+   * SDK polls a pending transaction for you with exponential backoff and **stops after 30 days**;
+   * this is how a customer gets an answer sooner than the next rung, and the only route to one once
+   * that window has closed.
+   *
+   * Runs the SDK's own background sweep for this single row — same query, same reading of the
+   * answer, same write into the same local history — so an on-demand check and a background check
+   * cannot disagree. It is **not** a way to force an outcome: a payment that is still unsettled
+   * answers `PENDING` again.
+   *
+   * Resolves `null` when no row on this device carries that hash; a row that already has a final
+   * outcome comes back unchanged without a network call. Rejects with `NO_NETWORK_CONNECTION` when
+   * the device is offline — a failed check never changes the stored row.
+   */
+  refreshTransactionStatus(transactionHash: string): Promise<TransactionSummary | null> {
+    return nativeCall(() => VeyraNative.walletRefreshTransactionStatus(transactionHash));
+  },
+
+  /**
+   * Check the merchant credit **now** for one approved payment — "has the merchant's bank actually
+   * received the funds I paid?" — and resolve with the updated stored row.
+   *
+   * The SDK already asks this in the background, with exponential backoff, for **30 days** after the
+   * payment, and then records the row as `'UNABLE_TO_CONFIRM'` — which means *"we stopped asking"*,
+   * never *"the merchant was not paid"*. This is how a customer gets an answer sooner than the next
+   * rung, and the only route to one once that window has closed: it still works on a row already
+   * marked `'UNABLE_TO_CONFIRM'`, and a later `'RECEIVED'` replaces that give-up.
+   *
+   * **Check `isCreditConfirmationSupported` on the transaction first.** Not every merchant's bank is
+   * on the confirmation rail. Offer the action only while
+   * ```ts
+   * txn.authorizationStatus === 'APPROVED' &&
+   *   txn.isCreditConfirmationSupported === true &&
+   *   txn.creditConfirmationStatus !== 'RECEIVED'
+   * ```
+   * A call on a row that fails that predicate makes **no network request** and resolves with the row
+   * unchanged rather than rejecting.
+   *
+   * Settlement only: nothing on this path can change the payment's `authorizationStatus`,
+   * `responseCode` or `responseStatusReason`. There is deliberately no event beside it — the
+   * resolved row and the SDK's stored history are the whole surface.
+   *
+   * Resolves `null` when no row on this device carries that hash. Rejects with
+   * `NO_NETWORK_CONNECTION` when the device is offline — a failed check never changes the stored row.
+   */
+  refreshCreditConfirmation(transactionHash: string): Promise<TransactionSummary | null> {
+    return nativeCall(() => VeyraNative.walletRefreshCreditConfirmation(transactionHash));
+  },
+
   /** Verifies and stores a merchant receipt QR scanned by the customer. */
   processReceipt(
     qrPayload: string,

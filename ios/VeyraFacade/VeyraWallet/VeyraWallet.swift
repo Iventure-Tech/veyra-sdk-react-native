@@ -479,8 +479,10 @@ public struct TokenActivity: Sendable, Hashable {
 /// One row of the customer's transaction history — a payment on any rail (MPM or CPM QR).
 public struct TransactionSummary: Sendable, Hashable {
     public let merchantName: String
-    /// Amount in minor units (e.g. kobo).
-    public let amountInMinorUnit: Int
+    /// Amount in minor units (e.g. kobo). 64-bit, matching `MerchantTransaction.amount` and every
+    /// gateway field either side of it — a 32-bit amount could not carry a payment above
+    /// ₦21,474,836.47.
+    public let amountInMinorUnit: Int64
     /// ISO 4217 numeric currency in the stored 4-digit shape (e.g. `"0566"`), or nil.
     public let transactionCurrencyCode: String?
     /// SHA-256(cryptogram‖ATC‖UN) hex — the join key to a `TransactionReceipt`, or nil.
@@ -1115,28 +1117,90 @@ public final class VeyraWallet: @unchecked Sendable {
         /// The token's full transaction history (all rails), most recent first. Local read.
         public func transactionHistory(tokenUniqueReference: String, limit: Int = 100) async throws -> [TransactionSummary] {
             try await call { kmp in
-                try await kmp.transactionHistory(tokenUniqueReference: tokenUniqueReference, limit: Int32(limit)).map {
-                    TransactionSummary(
-                        merchantName: $0.merchantName,
-                        amountInMinorUnit: Int($0.amountInMinorUnit),
-                        transactionCurrencyCode: $0.transactionCurrencyCode,
-                        transactionHash: $0.transactionHash,
-                        authorizationStatus: $0.authorizationStatus,
-                        responseCode: $0.responseCode,
-                        responseStatusReason: $0.responseStatusReason,
-                        atEpochMillis: $0.atEpochMillis?.int64Value,
-                        entryMethod: $0.entryMethod,
-                        merchantLocation: $0.merchantLocation,
-                        merchantTransactionReference: $0.merchantTransactionReference,
-                        merchantId: $0.merchantId,
-                        creditTransactionID: $0.creditTransactionId,
-                        isCreditConfirmationSupported: $0.isCreditConfirmationSupported?.boolValue,
-                        creditConfirmationStatus: $0.creditConfirmationStatus,
-                        creditedAt: $0.creditedAt,
-                        bankReference: $0.bankReference
-                    )
-                }
+                try await kmp.transactionHistory(tokenUniqueReference: tokenUniqueReference, limit: Int32(limit))
+                    .map(Self.map)
             }
+        }
+
+        /// Ask the backend about **one** pending transaction now, keyed by its transaction hash, and
+        /// return the updated stored row.
+        ///
+        /// The per-transaction counterpart to `reconcilePendingTransactions()`, which asks about
+        /// every open row and returns nothing — this one answers about the row the customer is
+        /// actually looking at. The SDK polls a pending transaction for you with exponential backoff
+        /// and **stops after 30 days**; this is how a customer gets an answer sooner than the next
+        /// rung, and the only route to one once that window has closed.
+        ///
+        /// It runs the SDK's own background sweep for this single row — same query, same reading of
+        /// the answer, same write into the same local history — so an on-demand check and a
+        /// background check cannot disagree. It is **not** a way to force an outcome: a payment that
+        /// is still unsettled answers `PENDING` again.
+        ///
+        /// - Returns: the transaction as it stands after the check, or `nil` if no row on this device
+        ///   carries that hash. A row that already has a final outcome is returned unchanged, without
+        ///   a network call.
+        /// - Throws: `VeyraWalletError.noNetworkConnection` when the device is offline, and the usual
+        ///   transport errors otherwise. A failed check never changes the stored row.
+        public func refreshTransactionStatus(transactionHash: String) async throws -> TransactionSummary? {
+            try await call { kmp in
+                try await kmp.refreshTransactionStatus(transactionHash: transactionHash).map(Self.map)
+            }
+        }
+
+        /// Check the merchant credit **now** for one approved payment — "has the merchant's bank
+        /// actually received the funds I paid?" — and return the updated stored row.
+        ///
+        /// The SDK already asks this in the background, with exponential backoff, for **30 days**
+        /// after the payment, and then records the row as `"UNABLE_TO_CONFIRM"` — which means *"we
+        /// stopped asking"*, never *"the merchant was not paid"*. This is how a customer gets an
+        /// answer sooner than the next rung, and the only route to one once that window has closed:
+        /// it still works on a row already marked `"UNABLE_TO_CONFIRM"`, and a later `"RECEIVED"`
+        /// replaces that give-up.
+        ///
+        /// **Check `isCreditConfirmationSupported` on the transaction first.** Not every merchant's
+        /// bank is on the confirmation rail. Offer this action only while
+        /// ```swift
+        /// txn.authorizationStatus == "APPROVED"
+        ///     && txn.isCreditConfirmationSupported == true
+        ///     && txn.creditConfirmationStatus != "RECEIVED"
+        /// ```
+        /// A call on a row that fails that predicate makes **no network request** and returns the row
+        /// unchanged rather than throwing.
+        ///
+        /// Settlement only: nothing on this path can change the payment's `authorizationStatus`,
+        /// `responseCode` or `responseStatusReason`. There is deliberately no callback — the returned
+        /// row and the SDK's stored history are the whole surface.
+        ///
+        /// - Returns: the transaction as it stands after the check, or `nil` if no row on this device
+        ///   carries that hash.
+        /// - Throws: `VeyraWalletError.noNetworkConnection` when the device is offline, and the usual
+        ///   transport errors otherwise. A failed check never changes the stored row.
+        public func refreshCreditConfirmation(transactionHash: String) async throws -> TransactionSummary? {
+            try await call { kmp in
+                try await kmp.refreshCreditConfirmation(transactionHash: transactionHash).map(Self.map)
+            }
+        }
+
+        private static func map(_ r: VeyraKMP.TransactionSummary) -> TransactionSummary {
+            TransactionSummary(
+                merchantName: r.merchantName,
+                amountInMinorUnit: r.amountInMinorUnit,
+                transactionCurrencyCode: r.transactionCurrencyCode,
+                transactionHash: r.transactionHash,
+                authorizationStatus: r.authorizationStatus,
+                responseCode: r.responseCode,
+                responseStatusReason: r.responseStatusReason,
+                atEpochMillis: r.atEpochMillis?.int64Value,
+                entryMethod: r.entryMethod,
+                merchantLocation: r.merchantLocation,
+                merchantTransactionReference: r.merchantTransactionReference,
+                merchantId: r.merchantId,
+                creditTransactionID: r.creditTransactionId,
+                isCreditConfirmationSupported: r.isCreditConfirmationSupported?.boolValue,
+                creditConfirmationStatus: r.creditConfirmationStatus,
+                creditedAt: r.creditedAt,
+                bankReference: r.bankReference
+            )
         }
 
         /// Reconcile still-PENDING transactions against the backend. Call on scene-active

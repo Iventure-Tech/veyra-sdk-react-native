@@ -219,7 +219,10 @@ internal object Mappers {
 
     fun transactionSummary(s: TransactionSummary): WritableMap = Arguments.createMap().apply {
         putString("merchantName", s.merchantName)
-        putInt("amountMinorUnits", s.amountInMinorUnit)
+        // `putDouble`, like every other minor-unit field on this bridge — the summary's amount is a
+        // Long and `putInt` cannot carry one. A JS number holds it exactly up to 2^53, far above
+        // any amount this rail can see.
+        putDouble("amountMinorUnits", s.amountInMinorUnit.toDouble())
         putString("transactionCurrencyCode", s.transactionCurrencyCode)
         putString("transactionHash", s.transactionHash)
         putString("authorizationStatus", s.authorizationStatus)
