@@ -766,10 +766,12 @@ export interface MerchantTransaction {
   /** iOS only. */
   transactionHash: string | null;
   /**
-   * Cardholder Name (EMV tag `5F20`) as the card presented it — on a Veyra token the card's
-   * display name (application label + masked last four, e.g. `AFRIGO ****1234`), not a person's
-   * name. `null` on QR-MPM payments (the merchant never reads the card), on transactions
-   * recorded before this field existed, and when the card carried no `5F20`.
+   * The card's display name — application label + masked last four, e.g. `AFRIGO ****1234`.
+   * **Not a person's name** on any rail. Read off EMV tag `5F20` on a tap, off the scanned
+   * customer QR on CPM, and carried by the gateway on QR-MPM, where the merchant never touches
+   * the card (STORY-93). `null` on transactions recorded before this field existed, when the card
+   * carried no `5F20`, and on an MPM sale paid by a wallet or settled by a gateway older than
+   * that release.
    */
   cardholderName: string | null;
   /**
