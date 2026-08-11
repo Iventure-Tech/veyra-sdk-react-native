@@ -737,6 +737,12 @@ export interface CustomerQrChargeOutcome {
 
 export interface MerchantTransaction {
   merchantTransactionReference: string;
+  /**
+   * Your own order / basket / invoice id for this sale, echoed back, or null when none was
+   * supplied (and on every sale recorded before it existed). Never a lookup key — display it,
+   * reconcile with it, but key receipts and status refreshes off `merchantTransactionReference`.
+   */
+  merchantOrderId: string | null;
   amountMinorUnits: number;
   status: 'APPROVED' | 'DECLINED' | 'PENDING' | 'FAILED';
   responseCode: string | null;

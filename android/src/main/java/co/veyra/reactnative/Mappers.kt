@@ -373,6 +373,9 @@ internal object Mappers {
     // [into] exists for tests: Arguments.createMap() needs the native bridge, JavaOnlyMap doesn't.
     fun merchantTransaction(t: TransactionInfo, into: WritableMap = Arguments.createMap()): WritableMap = into.apply {
         putString("merchantTransactionReference", t.merchantTransactionReference)
+        // the app's own order id, from the stored row — so a transaction detail or history
+        // screen can show it, not just the screen that took the payment.
+        putString("merchantOrderId", t.merchantOrderId)
         putDouble("amountMinorUnits", t.amount.toDouble())
         putString("status", t.transactionStatus.name)
         putString("responseCode", t.responseCode)

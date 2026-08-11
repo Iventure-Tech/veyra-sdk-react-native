@@ -1110,6 +1110,9 @@ class VeyraSdkReactNative: RCTEventEmitter {
   private func merchantTransactionDict(_ t: MerchantTransaction) -> [String: Any] {
     [
       "merchantTransactionReference": t.reference,
+      // the app's own order id, from the stored row — the detail and history screens
+      // need it, not just the screen that took the payment.
+      "merchantOrderId": t.merchantOrderID as Any? ?? NSNull(),
       "amountMinorUnits": t.amountMinorUnits,
       "status": t.status,
       "responseCode": t.responseCode as Any,

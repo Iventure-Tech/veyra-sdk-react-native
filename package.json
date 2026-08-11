@@ -1,6 +1,6 @@
 {
   "name": "veyra-sdk-react-native",
-  "version": "1.0.15",
+  "version": "1.0.16",
   "description": "Official React Native SDK for Veyra contactless payments — SoftPOS merchant acceptance and wallet tap/QR payments.",
   "main": "src/index.ts",
   "types": "src/index.ts",
