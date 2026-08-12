@@ -17,6 +17,13 @@ export interface VeyraSoftposConfig {
   environment: VeyraEnvironment;
   clientId: string;
   clientSecret: string;
+  /**
+   * The payment app provider's globally unique identifier, as issued by the platform — the same
+   * identifier the wallet config carries. Required: the gateway links every registered merchant
+   * to this provider and resolves the acquirer id and MCC from it; the app never supplies an
+   * acquirer id.
+   */
+  paymentAppProviderId: string;
   /** Android only. Defaults to true. */
   enableNfc?: boolean;
 }
@@ -451,6 +458,99 @@ export type CreditConfirmationEvent = {
   creditedAt: string | null;
 };
 
+/**
+ * The issuer changed a card's status — it was suspended, reactivated, expired or deactivated.
+ *
+ * The case this exists for: a card suspended server-side while the customer is looking at a card
+ * screen. Without the event the app finds out only when it reads the card list again, which a
+ * screen already on-screen never does — so the customer taps a card the UI still shows as usable.
+ */
+export type TokenStatusChangedEvent = {
+  /** Which card. Fires per card, so check it if you hold more than one. */
+  tokenUniqueReference: string;
+  /** `'UNKNOWN'` for a status added to the backend after this SDK shipped. */
+  status:
+    | 'ACTIVE'
+    | 'PENDING_ACTIVATION'
+    | 'SUSPENDED'
+    | 'DEACTIVATED'
+    | 'EXPIRED'
+    | 'UNKNOWN'
+    | string;
+  /** The literal as stored. For `'UNKNOWN'` this is the only thing identifying it — log this. */
+  rawStatus: string;
+  /**
+   * Whether the card can pay right now, as the SDK's own payment gates read it.
+   *
+   * Branch on this rather than on `status`: it already accounts for statuses this SDK build does
+   * not recognise, so you cannot end up more permissive than the gate that will refuse the tap.
+   * It answers "is the card alive", not "can it pay this amount" — see {@link CardKeyStateEvent}.
+   */
+  canPay: boolean;
+  /** What the card held before, or null when this is its first status. */
+  previousStatus: string | null;
+};
+
+/**
+ * A **wallet** payment that was left `PENDING` reached its final outcome.
+ *
+ * The payer-side twin of {@link TransactionResolvedEvent}, which is the *merchant's* side of a
+ * payment. They are separate channels on purpose: a merchant identifies a sale by the reference
+ * its own app supplied, and a wallet never sees that reference — it keys on `transactionHash`.
+ */
+export type WalletTransactionResolvedEvent = {
+  /** Identifies this payment on every rail — the value a receipt links on. */
+  transactionHash: string;
+  /** The card that paid. */
+  tokenUniqueReference: string | null;
+  /** Always one of the three finals — never `'PENDING'`. */
+  status: 'APPROVED' | 'DECLINED' | 'FAILED' | string;
+  /** The response code exactly as the backend sent it. */
+  responseCode: string | null;
+  /** Why it ended that way, e.g. `'INSUFFICIENT_FUNDS'`. Display and log it; never parse it. */
+  reason: string | null;
+  /** What was paid, in minor units — so you can render without a second store read. */
+  amountMinorUnits: number;
+  /** The merchant, as the stored row records it. */
+  merchantName: string;
+};
+
+/**
+ * A card ran out of payment keys, or a refresh replenished them.
+ *
+ * `requiresOnline` is the same value the card carries in `getCards()` — the SDK reads one
+ * function for both, so this can never contradict the list you are about to draw.
+ *
+ * **Covers key consumption and refresh, not expiry by clock.** Keys also expire on a timer, which
+ * happens with no SDK code running, so nothing fires for it; such a card simply reads as
+ * `requiresOnline` on your next card read. Keep reading the card list when a screen appears.
+ */
+export type CardKeyStateEvent = {
+  tokenUniqueReference: string;
+  /** True when the card cannot pay until the SDK refreshes its keys. */
+  requiresOnline: boolean;
+};
+
+/**
+ * The merchant's backend status changed — deactivated, suspended, or activated.
+ *
+ * Lets an app stop offering to take payments the moment the merchant is deactivated, rather than
+ * at the next screen load; it is also how the post-registration activation moment arrives.
+ */
+export type MerchantStatusEvent = {
+  merchantId: string;
+  /** e.g. `'ACTIVE'`, `'INACTIVE'`, `'SUSPENDED'`. */
+  status: string;
+  /**
+   * Whether the merchant may take payments now. Branch on this, not on `status` — it is the same
+   * reading the SDK's payment gate uses, so you cannot be more permissive than it. Anything that
+   * is not `'ACTIVE'`, including a status newer than this SDK, is false.
+   */
+  canAcceptPayments: boolean;
+  /** What was stored before, or null when this device had no status for the merchant yet. */
+  previousStatus: string | null;
+};
+
 // ── Wallet: history & receipts ────────────────────────────────────────────────
 
 export type EntryMethod = 'TAP' | 'QR_GENERATED' | 'QR_SCANNED';
@@ -508,6 +608,14 @@ export interface TransactionSummary {
   creditedAt: string | null;
   /** The beneficiary bank's own reference for the credit. `"RECEIVED"` only. */
   bankReference: string | null;
+  /**
+   * The merchant's own order/basket id for this sale, as the merchant's app supplied it at charge
+   * time — the id the merchant's systems know the sale by. A scanned-QR (MPM) row carries it from
+   * payment time; tap/CPM rows learn it from the status poll, so `null` on a still-open row means
+   * "not learned yet", not "no order id". Display only — never a lookup key; receipts and
+   * refreshes still key off `transactionHash`/`merchantTransactionReference`.
+   */
+  merchantOrderId: string | null;
 }
 
 export interface TransactionReceipt {
@@ -545,11 +653,12 @@ export interface MerchantRegistration {
   countryCode: string;
   accountNumber: string;
   institutionCode: string;
-  acquirerId: string;
-  /** Required for PERSONAL. */
+  /** Required for PERSONAL; optional for BUSINESS (the account holder has a BVN too). */
   bvn?: string;
   /** Required for BUSINESS. */
   cacNumber?: string;
+  /** Optional — the merchant's wallet account id, stored verbatim by the gateway. */
+  walletAccountId?: string;
 }
 
 export interface MerchantRegistrationResult {
@@ -573,10 +682,13 @@ export interface StoredMerchant {
   countryCode: string;
   accountNumber: string;
   institutionCode: string;
+  /** Gateway-resolved from the payment app provider; learned from responses, never app-supplied. */
   acquirerId: string;
   merchantCategoryCode: string;
   terminalId: string;
   merchantStatus: MerchantStatus | string | null;
+  /** The merchant's wallet account id as stored by the gateway, if any. */
+  walletAccountId?: string | null;
 }
 
 export interface MerchantUpdate {
@@ -590,6 +702,10 @@ export interface MerchantUpdate {
   countryCode: string;
   accountNumber: string;
   institutionCode: string;
+  /** Optional — stored verbatim by the gateway when supplied. */
+  walletAccountId?: string;
+  /** Optional — how an already-registered BUSINESS merchant supplies its BVN. */
+  bvn?: string;
 }
 
 // ── Merchant: tap acceptance ──────────────────────────────────────────────────
@@ -766,12 +882,10 @@ export interface MerchantTransaction {
   /** iOS only. */
   transactionHash: string | null;
   /**
-   * The card's display name — application label + masked last four, e.g. `AFRIGO ****1234`.
-   * **Not a person's name** on any rail. Read off EMV tag `5F20` on a tap, off the scanned
-   * customer QR on CPM, and carried by the gateway on QR-MPM, where the merchant never touches
-   * the card (STORY-93). `null` on transactions recorded before this field existed, when the card
-   * carried no `5F20`, and on an MPM sale paid by a wallet or settled by a gateway older than
-   * that release.
+   * Cardholder Name (EMV tag `5F20`) as the card presented it — on a Veyra token the card's
+   * display name (application label + masked last four, e.g. `AFRIGO ****1234`), not a person's
+   * name. `null` on QR-MPM payments (the merchant never reads the card), on transactions
+   * recorded before this field existed, and when the card carried no `5F20`.
    */
   cardholderName: string | null;
   /**

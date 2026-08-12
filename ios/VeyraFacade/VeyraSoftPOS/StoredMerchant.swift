@@ -26,7 +26,10 @@ public struct StoredMerchant: Sendable, Hashable, Codable {
     public let cacNumber: String?
     public let accountNumber: String
     public let institutionCode: String
+    /// Backend-assigned: resolved by the gateway from the payment app provider.
     public let acquirerID: String
+    /// The merchant's wallet account id, as stored by the gateway.
+    public let walletAccountID: String?
     /// Backend-assigned at registration.
     public let merchantCategoryCode: String
     /// Backend-assigned at registration.
@@ -52,7 +55,8 @@ public struct StoredMerchant: Sendable, Hashable, Codable {
         acquirerID: String,
         merchantCategoryCode: String,
         terminalID: String,
-        merchantStatus: String?
+        merchantStatus: String?,
+        walletAccountID: String? = nil
     ) {
         self.merchantID = merchantID
         self.merchantType = merchantType
@@ -69,6 +73,7 @@ public struct StoredMerchant: Sendable, Hashable, Codable {
         self.accountNumber = accountNumber
         self.institutionCode = institutionCode
         self.acquirerID = acquirerID
+        self.walletAccountID = walletAccountID
         self.merchantCategoryCode = merchantCategoryCode
         self.terminalID = terminalID
         self.merchantStatus = merchantStatus
@@ -78,6 +83,8 @@ public struct StoredMerchant: Sendable, Hashable, Codable {
 extension StoredMerchant {
     /// Folds a successful registration response over the submitted values (response wins;
     /// terminal ID falls back to the merchant ID) — same fold as Android's `MerchantService`.
+    /// The acquirer id has no submitted value to fall back to — it is gateway-resolved
+    /// (from the payment app provider) and comes ONLY from the response.
     init(
         registration: MerchantRegistration,
         merchantID: String,
@@ -85,7 +92,8 @@ extension StoredMerchant {
         merchantStatus: String?,
         merchantCategoryCode: String?,
         countryCode: String?,
-        acquirerID: String?
+        acquirerID: String?,
+        walletAccountID: String? = nil
     ) {
         self.init(
             merchantID: merchantID,
@@ -102,10 +110,11 @@ extension StoredMerchant {
             cacNumber: registration.cacNumber,
             accountNumber: registration.accountNumber,
             institutionCode: registration.institutionCode,
-            acquirerID: acquirerID ?? registration.acquirerID,
+            acquirerID: acquirerID ?? "",
             merchantCategoryCode: merchantCategoryCode ?? "",
             terminalID: terminalID ?? merchantID,
-            merchantStatus: merchantStatus
+            merchantStatus: merchantStatus,
+            walletAccountID: walletAccountID ?? registration.walletAccountID
         )
     }
 
@@ -135,13 +144,22 @@ extension StoredMerchant {
             acquirerID: acquirerID,
             merchantCategoryCode: merchantCategoryCode,
             terminalID: terminalID,
-            merchantStatus: status ?? merchantStatus
+            merchantStatus: status ?? merchantStatus,
+            walletAccountID: walletAccountID
         )
     }
 
     /// Folds a successful profile update over the stored copy; backend-assigned fields
-    /// (terminalID, merchantCategoryCode) are preserved (mirrors Android `updateMerchant`).
-    func applying(_ update: MerchantUpdate, status: String?) -> StoredMerchant {
+    /// (terminalID, merchantCategoryCode, acquirerID) are preserved unless the response
+    /// re-states them (mirrors Android `updateMerchant`). The update carries no
+    /// acquirer id — it is gateway-resolved and arrives on the response.
+    func applying(
+        _ update: MerchantUpdate,
+        status: String?,
+        terminalID responseTerminalID: String? = nil,
+        acquirerID responseAcquirerID: String? = nil,
+        walletAccountID responseWalletAccountID: String? = nil
+    ) -> StoredMerchant {
         StoredMerchant(
             merchantID: merchantID,
             merchantType: merchantType,
@@ -153,14 +171,15 @@ extension StoredMerchant {
             city: update.city,
             state: update.state,
             countryCode: update.countryCode,
-            bvn: bvn,
+            bvn: update.bvn ?? bvn,
             cacNumber: cacNumber,
             accountNumber: update.accountNumber,
             institutionCode: update.institutionCode,
-            acquirerID: update.acquirerID,
+            acquirerID: responseAcquirerID ?? acquirerID,
             merchantCategoryCode: merchantCategoryCode,
-            terminalID: terminalID,
-            merchantStatus: status ?? merchantStatus
+            terminalID: responseTerminalID ?? terminalID,
+            merchantStatus: status ?? merchantStatus,
+            walletAccountID: responseWalletAccountID ?? update.walletAccountID ?? walletAccountID
         )
     }
 }

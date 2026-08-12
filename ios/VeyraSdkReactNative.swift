@@ -28,6 +28,16 @@ class VeyraSdkReactNative: RCTEventEmitter {
     /// An approved sale's funds were confirmed in the merchant's bank account (or the 30-day
     /// window closed unconfirmed). Same name and payload as Android's.
     static let creditConfirmation = "VeyraCreditConfirmationEvent"
+    /// The issuer changed a card's status. Same name/payload as Android's.
+    static let tokenStatusChanged = "VeyraTokenStatusChangedEvent"
+    /// A **wallet** payment left pending reached a final outcome. Distinct
+    /// from `transactionResolved`, which is the merchant's side of a payment and keys on a
+    /// reference the wallet never sees.
+    static let walletTransactionResolved = "VeyraWalletTransactionResolvedEvent"
+    /// A card's payment keys ran out, or a refresh replenished them.
+    static let cardKeyState = "VeyraCardKeyStateEvent"
+    /// The merchant was deactivated, suspended or activated.
+    static let merchantStatus = "VeyraMerchantStatusEvent"
   }
 
   private var initialized = false
@@ -46,6 +56,10 @@ class VeyraSdkReactNative: RCTEventEmitter {
       EventName.qrExpired,
       EventName.transactionResolved,
       EventName.creditConfirmation,
+      EventName.tokenStatusChanged,
+      EventName.walletTransactionResolved,
+      EventName.cardKeyState,
+      EventName.merchantStatus,
     ]
   }
 
@@ -109,8 +123,11 @@ class VeyraSdkReactNative: RCTEventEmitter {
     guard let appleTeamID = walletMap["appleTeamId"] as? String, !appleTeamID.isEmpty
     else { return rejectValidation(reject, "wallet.appleTeamId is required on iOS") }
 
+    guard let softposProviderID = softposMap["paymentAppProviderId"] as? String, !softposProviderID.isEmpty
+    else { return rejectValidation(reject, "softpos.paymentAppProviderId is required") }
     let softpos = VeyraSoftPOSConfiguration(
       environment: softposEnv,
+      paymentAppProviderID: softposProviderID,
       clientID: softposMap["clientId"] as? String,
       clientSecret: softposMap["clientSecret"] as? String
     )
@@ -160,6 +177,54 @@ class VeyraSdkReactNative: RCTEventEmitter {
         "amountMinorUnits": confirmation.amountMinorUnits.map { NSNumber(value: $0) } ?? NSNull(),
         "bankReference": confirmation.bankReference.map { $0 as Any } ?? NSNull(),
         "creditedAt": confirmation.creditedAt.map { $0 as Any } ?? NSNull(),
+      ])
+    }
+    observeStateChanges()
+  }
+
+  /// Subscribe to the four "stored truth changed" channels and re-emit them as the same
+  /// JS events the Android module emits.
+  ///
+  /// Key names here are hand-written and must match `Mappers.tokenStatusChanged` /
+  /// `walletTransactionResolved` / `cardKeyState` / `merchantStatusChanged` on Android exactly —
+  /// shared JS reads one shape. Android's side is pinned by `MappersTest`; this side is pinned by
+  /// the guides and by the RN sample subscribing to both.
+  ///
+  /// Same contract as the two deferred answers above: single-listener, no replay, notifications
+  /// rather than the source of truth — screens keep reading the store when they appear (§16).
+  private func observeStateChanges() {
+    try? VeyraWallet.shared.tokenisation.observeTokenLifecycle { [weak self] change in
+      self?.sendEvent(withName: EventName.tokenStatusChanged, body: [
+        "tokenUniqueReference": change.tokenUniqueReference,
+        "status": change.status,
+        "rawStatus": change.rawStatus,
+        "canPay": change.canPay,
+        "previousStatus": change.previousStatus.map { $0 as Any } ?? NSNull(),
+      ])
+    }
+    try? VeyraWallet.shared.tokenisation.observeTransactionResolved { [weak self] resolution in
+      self?.sendEvent(withName: EventName.walletTransactionResolved, body: [
+        "transactionHash": resolution.transactionHash,
+        "tokenUniqueReference": resolution.tokenUniqueReference.map { $0 as Any } ?? NSNull(),
+        "status": resolution.status,
+        "responseCode": resolution.responseCode.map { $0 as Any } ?? NSNull(),
+        "reason": resolution.reason.map { $0 as Any } ?? NSNull(),
+        "amountMinorUnits": NSNumber(value: resolution.amountMinorUnits),
+        "merchantName": resolution.merchantName,
+      ])
+    }
+    try? VeyraWallet.shared.tokenisation.observeCardKeyState { [weak self] tokenUniqueReference, requiresOnline in
+      self?.sendEvent(withName: EventName.cardKeyState, body: [
+        "tokenUniqueReference": tokenUniqueReference,
+        "requiresOnline": requiresOnline,
+      ])
+    }
+    try? VeyraSoftPOS.shared.merchant.onMerchantStatusChanged { [weak self] change in
+      self?.sendEvent(withName: EventName.merchantStatus, body: [
+        "merchantId": change.merchantID,
+        "status": change.status,
+        "canAcceptPayments": change.canAcceptPayments,
+        "previousStatus": change.previousStatus.map { $0 as Any } ?? NSNull(),
       ])
     }
   }
@@ -536,19 +601,8 @@ class VeyraSdkReactNative: RCTEventEmitter {
     } catch { self.reject(rejecter, error) }
   }
 
-  @objc(walletAuthenticateForPayment:subtitle:allowDeviceCredential:resolver:rejecter:)
-  func walletAuthenticateForPayment(_ title: String, subtitle: String?, allowDeviceCredential: Bool,
-                                    resolver resolve: @escaping RCTPromiseResolveBlock,
-                                    rejecter rejecter: @escaping RCTPromiseRejectBlock) {
-    Task {
-      do {
-        try await VeyraWallet.shared.tokenisation.authenticateForScannedPayment(
-          reason: title, allowDeviceCredential: allowDeviceCredential
-        )
-        resolve(nil)
-      } catch { self.reject(rejecter, error) }
-    }
-  }
+  // `walletAuthenticateForPayment` was removed — the SDK raises the
+  // LocalAuthentication sheet itself inside walletPayScannedContext / walletShowQrToPay.
 
   @objc(walletPayScannedContext:resolver:rejecter:)
   func walletPayScannedContext(_ handle: String, resolver resolve: @escaping RCTPromiseResolveBlock,
@@ -638,6 +692,9 @@ class VeyraSdkReactNative: RCTEventEmitter {
       "creditConfirmationStatus": s.creditConfirmationStatus as Any,
       "creditedAt": s.creditedAt as Any,
       "bankReference": s.bankReference as Any,
+      // The merchant's order id — from the verified QR at payment time (MPM) or the status
+      // poll (CPM). Display only; null until the row learns it.
+      "merchantOrderId": s.merchantOrderID as Any,
     ]
   }
 
@@ -766,8 +823,7 @@ class VeyraSdkReactNative: RCTEventEmitter {
           let state = registration["state"] as? String,
           let countryCode = registration["countryCode"] as? String,
           let accountNumber = registration["accountNumber"] as? String,
-          let institutionCode = registration["institutionCode"] as? String,
-          let acquirerID = registration["acquirerId"] as? String
+          let institutionCode = registration["institutionCode"] as? String
     else { return rejectValidation(rejecter, "required merchant registration fields missing") }
     let reg = MerchantRegistration(
       merchantType: merchantType,
@@ -783,7 +839,7 @@ class VeyraSdkReactNative: RCTEventEmitter {
       cacNumber: registration["cacNumber"] as? String,
       accountNumber: accountNumber,
       institutionCode: institutionCode,
-      acquirerID: acquirerID
+      walletAccountID: registration["walletAccountId"] as? String
     )
     Task {
       do {
@@ -835,6 +891,7 @@ class VeyraSdkReactNative: RCTEventEmitter {
       "merchantCategoryCode": m.merchantCategoryCode,
       "terminalId": m.terminalID,
       "merchantStatus": m.merchantStatus as Any,
+      "walletAccountId": m.walletAccountID as Any,
     ]
   }
 
@@ -909,7 +966,6 @@ class VeyraSdkReactNative: RCTEventEmitter {
           let accountNumber = update["accountNumber"] as? String,
           let institutionCode = update["institutionCode"] as? String
     else { return rejectValidation(rejecter, "required merchant update fields missing") }
-    let acquirerID = VeyraSoftPOS.shared.merchant.stored?.acquirerID ?? ""
     let merchantUpdate = MerchantUpdate(
       merchantName: merchantName,
       emailAddress: emailAddress,
@@ -921,7 +977,8 @@ class VeyraSdkReactNative: RCTEventEmitter {
       countryCode: countryCode,
       accountNumber: accountNumber,
       institutionCode: institutionCode,
-      acquirerID: acquirerID
+      walletAccountID: update["walletAccountId"] as? String,
+      bvn: update["bvn"] as? String
     )
     Task {
       do { resolve(try await VeyraSoftPOS.shared.merchant.update(merchantID: merchantID, merchantUpdate).status) }

@@ -96,10 +96,10 @@ internal object Mappers {
             countryCode = map.req("countryCode"),
             accountNumber = map.req("accountNumber"),
             institutionCode = map.req("institutionCode"),
-            acquirerId = map.req("acquirerId"),
             addressLine2 = map.opt("addressLine2") ?: "",
             bvn = map.opt("bvn"),
             cacNumber = map.opt("cacNumber"),
+            walletAccountId = map.opt("walletAccountId"),
         )
     }
 
@@ -244,6 +244,9 @@ internal object Mappers {
         putString("creditConfirmationStatus", s.creditConfirmationStatus)
         putString("creditedAt", s.creditedAt)
         putString("bankReference", s.bankReference)
+        // The merchant's order id — from the verified QR at payment time (MPM) or the status
+        // poll (tap/CPM). Display only; null until the row learns it.
+        putString("merchantOrderId", s.merchantOrderId)
     }
 
     fun receipt(r: TransactionReceipt): WritableMap = Arguments.createMap().apply {
@@ -290,6 +293,7 @@ internal object Mappers {
         putString("merchantCategoryCode", m.merchantCategoryCode)
         putString("terminalId", m.terminalId)
         putString("merchantStatus", m.merchantStatus)
+        putString("walletAccountId", m.walletAccountId)
     }
 
     // [into] exists for tests: Arguments.createMap() needs the native bridge, JavaOnlyMap doesn't.
@@ -353,6 +357,75 @@ internal object Mappers {
             ?: putNull("amountMinorUnits")
         putString("bankReference", c.bankReference)
         putString("creditedAt", c.creditedAt)
+    }
+
+    /**
+     * The `VeyraTokenStatusChangedEvent` payload — the issuer changed a
+     * card's status.
+     *
+     * `canPay` crosses deliberately rather than being left for JS to derive from `status`: JS
+     * deriving it would be a second reading of the payability rule, and the first status added to
+     * the backend after this SDK shipped would be classified by a `switch` that has never heard of
+     * it. `rawStatus` is what to log — for an unrecognised status it is the only identifying value.
+     */
+    fun tokenStatusChanged(
+        c: co.veyra.wallet.sdk.api.TokenStatusChange,
+        into: WritableMap = Arguments.createMap(),
+    ): WritableMap = into.apply {
+        putString("tokenUniqueReference", c.tokenUniqueReference)
+        putString("status", c.status.value)
+        putString("rawStatus", c.rawStatus)
+        putBoolean("canPay", c.canPay)
+        putString("previousStatus", c.previousRawStatus)
+    }
+
+    /**
+     * The `VeyraWalletTransactionResolvedEvent` payload — a wallet payment
+     * that was left `PENDING` reached a final outcome.
+     *
+     * Distinct from [transactionResolved], which is the **merchant** side of a payment: that one
+     * keys on the merchant's own `merchantTransactionReference`, which a wallet never sees. This
+     * keys on `transactionHash`. Same event shape, different question — do not merge them.
+     * `amountMinorUnits` crosses as a JS number (see [creditConfirmation]).
+     */
+    fun walletTransactionResolved(
+        r: co.veyra.wallet.sdk.api.WalletTransactionResolution,
+        into: WritableMap = Arguments.createMap(),
+    ): WritableMap = into.apply {
+        putString("transactionHash", r.transactionHash)
+        putString("tokenUniqueReference", r.tokenUniqueReference)
+        putString("status", r.status)
+        putString("responseCode", r.responseCode)
+        putString("reason", r.reason)
+        putDouble("amountMinorUnits", r.amountInMinorUnit.toDouble())
+        putString("merchantName", r.merchantName)
+    }
+
+    /**
+     * The `VeyraCardKeyStateEvent` payload — a card ran out of payment keys,
+     * or got them back. `requiresOnline` is the same value `StoredCard.requiresOnline` carries.
+     */
+    fun cardKeyState(
+        s: co.veyra.wallet.sdk.api.CardKeyState,
+        into: WritableMap = Arguments.createMap(),
+    ): WritableMap = into.apply {
+        putString("tokenUniqueReference", s.tokenUniqueReference)
+        putBoolean("requiresOnline", s.requiresOnline)
+    }
+
+    /**
+     * The `VeyraMerchantStatusEvent` payload — the merchant was deactivated,
+     * suspended or activated. `canAcceptPayments` crosses for the same reason `canPay` does above:
+     * so JS never has to re-derive a gate the SDK already owns.
+     */
+    fun merchantStatusChanged(
+        c: co.veyra.softpos.payment.sdk.merchant.MerchantStatusChange,
+        into: WritableMap = Arguments.createMap(),
+    ): WritableMap = into.apply {
+        putString("merchantId", c.merchantId)
+        putString("status", c.status)
+        putBoolean("canAcceptPayments", c.canAcceptPayments)
+        putString("previousStatus", c.previousStatus)
     }
 
     fun paymentContextQr(c: CreatedPaymentContext): WritableMap = Arguments.createMap().apply {

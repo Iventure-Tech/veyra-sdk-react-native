@@ -9,6 +9,7 @@ import type {
   ActivationReason,
   Bank,
   Card,
+  CardKeyStateEvent,
   CardStatus,
   DigitiseParams,
   DigitiseResult,
@@ -16,11 +17,13 @@ import type {
   PaymentQr,
   QrExpiredEvent,
   ScanInspection,
+  TokenStatusChangedEvent,
   TransactionReceipt,
   TransactionSummary,
   VerifyAccountParams,
   VerifyAccountResponse,
   WalletTapEvent,
+  WalletTransactionResolvedEvent,
 } from './types';
 
 /** Wallet (Pay) domain — add card, activation, card states, payments, history. */
@@ -131,19 +134,10 @@ export const wallet = {
     return nativeCall(() => VeyraNative.walletInspectScannedQr(payload));
   },
 
-  /**
-   * Fresh, single-use device authentication (biometric/passcode) for the next
-   * scanned payment or QR render.
-   */
-  authenticateForPayment(
-    title: string,
-    subtitle: string | null = null,
-    allowDeviceCredential = true
-  ): Promise<void> {
-    return nativeCall(() =>
-      VeyraNative.walletAuthenticateForPayment(title, subtitle, allowDeviceCredential)
-    );
-  },
+  // `authenticateForPayment` was removed. The SDK raises the device
+  // authentication sheet itself from inside `payScannedContext` and `showQrToPay`, so there is
+  // nothing to call first and no way to forget. Cancel/failure surface as AUTH_CANCELLED /
+  // AUTH_FAILED / AUTH_UNAVAILABLE on those calls.
 
   payScannedContext(handle: string): Promise<PaymentOutcome> {
     return nativeCall(() => VeyraNative.walletPayScannedContext(handle));
@@ -167,6 +161,54 @@ export const wallet = {
     return veyraEmitter.addListener(Events.qrExpired, (e: QrExpiredEvent) => {
       if (e.scope === 'wallet') listener(e);
     });
+  },
+
+  // ── The SDK tells you when stored truth changes ────────────────────────────
+
+  /**
+   * Fires when the issuer changes a card's status — suspended, reactivated, expired, deactivated.
+   *
+   * Subscribe **once, at start-up**, not per card screen: it fires for any stored card, including
+   * ones no screen is showing, and that is the case that matters. An issuer suspending a card
+   * while the customer is looking at it is otherwise invisible until something makes the app read
+   * the card list again.
+   *
+   * Branch on `canPay`, not on `status`. There is no replay — read `getCards()` at start-up.
+   */
+  onTokenStatusChanged(
+    listener: (e: TokenStatusChangedEvent) => void
+  ): EmitterSubscription {
+    return veyraEmitter.addListener(Events.tokenStatusChanged, listener);
+  },
+
+  /**
+   * Fires when a wallet payment that was left `PENDING` reaches its final outcome — from the
+   * SDK's background sweep, an on-demand status check, or the scan-to-pay push.
+   *
+   * Match the event to its payment by `transactionHash`. Subscribe once, at start-up: a payment
+   * can settle days later, long after the screen that made it is gone. No replay, so a screen
+   * still reads `getTransactions()` when it appears.
+   */
+  onTransactionResolved(
+    listener: (e: WalletTransactionResolvedEvent) => void
+  ): EmitterSubscription {
+    return veyraEmitter.addListener(Events.walletTransactionResolved, listener);
+  },
+
+  /**
+   * Fires when a card runs out of payment keys, or a refresh gives it new ones — `requiresOnline`
+   * flipping.
+   *
+   * Covers key **consumption** and **refresh** only. Keys also expire by clock, with no SDK code
+   * running, so nothing fires for that; such a card reads as `requiresOnline` on your next
+   * `getCards()`. Do not word your UI as though this were live coverage of every case.
+   *
+   * Observation only — there is deliberately no API to trigger a key refresh.
+   */
+  onCardKeyStateChanged(
+    listener: (e: CardKeyStateEvent) => void
+  ): EmitterSubscription {
+    return veyraEmitter.addListener(Events.cardKeyState, listener);
   },
 
   // ── History & receipts ─────────────────────────────────────────────────────

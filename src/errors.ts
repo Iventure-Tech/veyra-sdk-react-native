@@ -23,10 +23,19 @@ export type VeyraErrorCode =
    */
   | 'AMOUNT_EXCEEDS_CARD_LIMIT'
   | 'TOKEN_NOT_ACTIVE'
-  /** Fresh device authentication (biometric/passcode) required before this payment. */
-  | 'CDCVM_REQUIRED'
+  /**
+   * The customer dismissed the device authentication sheet the SDK raised. Nothing was sent —
+   * offer the payment again.
+   */
   | 'AUTH_CANCELLED'
+  /** The customer attempted authentication and the device rejected it. Nothing was sent. */
   | 'AUTH_FAILED'
+  /**
+   * This device can perform no authentication at all: no enrolled biometric AND no screen lock.
+   * Unlike `AUTH_FAILED`, a retry cannot help — send the user to system settings to set a
+   * screen lock.
+   */
+  | 'AUTH_UNAVAILABLE'
   | 'NO_ACTIVE_CARD'
   | 'CARD_CANNOT_SHOW_QR'
   | 'MISSING_MANDATORY_CONFIG'
@@ -76,9 +85,9 @@ const KNOWN_CODES: ReadonlySet<string> = new Set<VeyraErrorCode>([
   'ONLINE_REQUIRED',
   'AMOUNT_EXCEEDS_CARD_LIMIT',
   'TOKEN_NOT_ACTIVE',
-  'CDCVM_REQUIRED',
   'AUTH_CANCELLED',
   'AUTH_FAILED',
+  'AUTH_UNAVAILABLE',
   'NO_ACTIVE_CARD',
   'CARD_CANNOT_SHOW_QR',
   'MISSING_MANDATORY_CONFIG',

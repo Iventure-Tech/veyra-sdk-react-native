@@ -33,4 +33,16 @@ export const Events = {
   qrExpired: 'VeyraQrExpiredEvent',
   transactionResolved: 'VeyraTransactionResolvedEvent',
   creditConfirmation: 'VeyraCreditConfirmationEvent',
+  /** The issuer changed a card's status — suspended, reactivated, expired, deactivated. */
+  tokenStatusChanged: 'VeyraTokenStatusChangedEvent',
+  /**
+   * A **wallet** payment left pending reached a final outcome. Not the same channel as
+   * `transactionResolved`, which is the merchant's side of a payment and identifies it by a
+   * reference the wallet never sees.
+   */
+  walletTransactionResolved: 'VeyraWalletTransactionResolvedEvent',
+  /** A card ran out of payment keys, or a refresh replenished them. */
+  cardKeyState: 'VeyraCardKeyStateEvent',
+  /** The merchant was deactivated, suspended or activated. */
+  merchantStatus: 'VeyraMerchantStatusEvent',
 } as const;

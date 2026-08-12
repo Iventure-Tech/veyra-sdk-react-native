@@ -27,15 +27,21 @@ public struct VeyraSoftPOSConfiguration: Sendable {
     }
 
     public let environment: Environment
+    /// The payment app provider's globally unique identifier, as issued by the platform.
+    /// Required — the gateway links every registered merchant to this provider and resolves the
+    /// acquirer id and MCC from it; the app never supplies an acquirer id.
+    public let paymentAppProviderID: String
     public let clientID: String?
     public let clientSecret: String?
 
     public init(
         environment: Environment,
+        paymentAppProviderID: String,
         clientID: String? = nil,
         clientSecret: String? = nil
     ) {
         self.environment = environment
+        self.paymentAppProviderID = paymentAppProviderID
         self.clientID = clientID
         self.clientSecret = clientSecret
     }
@@ -78,7 +84,8 @@ public struct MerchantRegistration: Sendable {
     public let cacNumber: String?
     public let accountNumber: String
     public let institutionCode: String
-    public let acquirerID: String
+    /// Optional — the merchant's wallet account id, stored verbatim by the gateway.
+    public let walletAccountID: String?
 
     public init(
         merchantType: MerchantType,
@@ -94,7 +101,7 @@ public struct MerchantRegistration: Sendable {
         cacNumber: String? = nil,
         accountNumber: String,
         institutionCode: String,
-        acquirerID: String
+        walletAccountID: String? = nil
     ) {
         self.merchantType = merchantType
         self.merchantName = merchantName
@@ -109,7 +116,7 @@ public struct MerchantRegistration: Sendable {
         self.cacNumber = cacNumber
         self.accountNumber = accountNumber
         self.institutionCode = institutionCode
-        self.acquirerID = acquirerID
+        self.walletAccountID = walletAccountID
     }
 }
 
@@ -139,6 +146,22 @@ public struct MerchantStatus: Sendable, Hashable {
         self.merchantID = merchantID
         self.status = status
     }
+}
+
+/// The merchant's backend status changed — delivered to `merchant.onMerchantStatusChanged`.
+public struct MerchantStatusChange: Sendable, Hashable {
+    /// The merchant this is about.
+    public let merchantID: String
+    /// The new status as the backend stated it, e.g. `"ACTIVE"`, `"INACTIVE"`, `"SUSPENDED"`.
+    public let status: String
+    /// Whether the merchant may take payments now.
+    ///
+    /// Branch on this, not on `status`. It is the same reading the SDK's own payment gate uses, so
+    /// acting on it can never leave you more permissive than the gate that will refuse the sale.
+    /// Anything that is not `ACTIVE` is `false`, including a status added after this SDK shipped.
+    public let canAcceptPayments: Bool
+    /// What was stored before, or `nil` when this device had no status for the merchant yet.
+    public let previousStatus: String?
 }
 
 /// A gateway-signed merchant-presented (MPM) payment context.
@@ -226,7 +249,10 @@ public struct MerchantUpdate: Sendable {
     public let countryCode: String
     public let accountNumber: String
     public let institutionCode: String
-    public let acquirerID: String
+    /// Optional — stored verbatim by the gateway when supplied.
+    public let walletAccountID: String?
+    /// Optional — how an already-registered BUSINESS merchant supplies its BVN.
+    public let bvn: String?
 
     public init(
         merchantName: String,
@@ -239,7 +265,8 @@ public struct MerchantUpdate: Sendable {
         countryCode: String,
         accountNumber: String,
         institutionCode: String,
-        acquirerID: String
+        walletAccountID: String? = nil,
+        bvn: String? = nil
     ) {
         self.merchantName = merchantName
         self.emailAddress = emailAddress
@@ -251,7 +278,8 @@ public struct MerchantUpdate: Sendable {
         self.countryCode = countryCode
         self.accountNumber = accountNumber
         self.institutionCode = institutionCode
-        self.acquirerID = acquirerID
+        self.walletAccountID = walletAccountID
+        self.bvn = bvn
     }
 }
 
@@ -576,25 +604,39 @@ public final class VeyraSoftPOS: @unchecked Sendable {
     private let lock = NSLock()
     private var kmp: SoftposKmp?
     private var merchantStorage: MerchantStorage = FileMerchantStorage()
+    // The provider credential from the configuration — sent on merchant
+    // register/update so the gateway can resolve the acquirer id and MCC.
+    fileprivate var paymentAppProviderID: String = ""
 
     private init() {}
 
     /// Configure the SDK. Call once, before any service use (subsequent calls reconfigure).
     public static func configure(_ configuration: VeyraSoftPOSConfiguration) {
-        shared.lock.lock()
-        defer { shared.lock.unlock() }
-        shared.kmp = SoftposKmp(
-            config: SoftposKmpConfig(
-                environmentName: configuration.environment.rawValue,
-                clientId: configuration.clientID,
-                clientSecret: configuration.clientSecret,
-                // Internal plumbing, not developer API: nil selects the SDK's
-                // environment-resolved defaults. ObjC-exported initializers carry no
-                // default arguments, so these parameters must be passed explicitly.
-                localBaseUrlOverride: nil,
-                remoteLogsUrlOverride: nil
+        // Scoped rather than `defer`-ed: the merchant-status watch below must be armed *outside*
+        // the lock, because it reads stored-merchant state through `withMerchantStorage`, which
+        // takes this same non-reentrant lock. A `defer` that unlocks at function exit would
+        // deadlock the first configure on a device with a registered merchant.
+        do {
+            shared.lock.lock()
+            defer { shared.lock.unlock() }
+            shared.paymentAppProviderID = configuration.paymentAppProviderID
+            shared.kmp = SoftposKmp(
+                config: SoftposKmpConfig(
+                    environmentName: configuration.environment.rawValue,
+                    clientId: configuration.clientID,
+                    clientSecret: configuration.clientSecret,
+                    // Internal plumbing, not developer API: nil selects the SDK's
+                    // environment-resolved defaults. ObjC-exported initializers carry no
+                    // default arguments, so these parameters must be passed explicitly.
+                    localBaseUrlOverride: nil,
+                    remoteLogsUrlOverride: nil
+                )
             )
-        )
+        }
+        // Arm the merchant-status watch at configure. Unconditional and app-scoped — there is no
+        // event that "starts" interest in the merchant's status, only a merchant that already has
+        // one, and the case that matters most is a merchant deactivated while the app was shut.
+        shared.startMerchantStatusWatchIfRegistered()
     }
 
     /// Merchant lifecycle — registration, status, activate/deactivate, profile update, banks.
@@ -681,18 +723,62 @@ public final class VeyraSoftPOS: @unchecked Sendable {
     }
 
     /// Refresh the stored status; a response for a different merchant leaves storage untouched.
+    ///
+    /// This is iOS's **single fire site** for the merchant-status observer — the twin of Android's
+    /// `MerchantDataStore.updateMerchantStatus`. Every route that changes the stored status arrives
+    /// here (the SDK-owned watch, and the host calling `status`/`activate`/`deactivate`), so one
+    /// hook covers them all. The store is written first and the observer told after; the shared
+    /// Kotlin rule decides whether anything actually changed, so the two platforms cannot disagree
+    /// about what counts as a change.
     internal func updateStoredMerchantStatus(merchantID: String, status: String?) {
-        withMerchantStorage { storage in
-            guard let stored = storage.load(), stored.merchantID == merchantID else { return }
+        let previous: String? = withMerchantStorage { storage in
+            guard let stored = storage.load(), stored.merchantID == merchantID else { return nil }
+            let was = stored.merchantStatus
             storage.save(stored.updatingStatus(status))
+            return was
+        }
+        // No stored merchant, or a response for a different one — nothing was written, so there is
+        // nothing to announce. `status` nil means "not stated", which is not a change to report.
+        guard let status, let kmp = try? requireKmp() else { return }
+        kmp.notifyMerchantStatusChanged(merchantId: merchantID, previousStatus: previous, newStatus: status)
+    }
+
+    /// Start the SDK-owned merchant-status watch for the stored merchant, if there is one.
+    ///
+    /// §16: the SDK owns the waiting and the app process is its scope. Called at `configure` and
+    /// after a successful registration — never by a screen, and never stopped by one. Before this,
+    /// iOS had no merchant-status polling at all: a merchant deactivated mid-session stayed
+    /// "active" on the device until a host happened to ask.
+    internal func startMerchantStatusWatchIfRegistered() {
+        guard let merchant = loadStoredMerchant(), let kmp = try? requireKmp() else { return }
+        kmp.startMerchantStatusWatch(
+            merchantId: merchant.merchantID,
+            intervalSeconds: Int64(Self.merchantStatusWatchIntervalSeconds)
+        ) { [weak self] status in
+            // Land it in the Keychain, which is what fires the observer (above).
+            self?.updateStoredMerchantStatus(merchantID: merchant.merchantID, status: status)
         }
     }
 
+    /// How often the merchant-status watch asks, in seconds. Matches the Android scheduler's
+    /// 5-minute default; the Kotlin side floors it so a bad value cannot become a request storm.
+    private static let merchantStatusWatchIntervalSeconds = 300
+
     /// Fold a successful profile update into storage (same different-merchant guard as above).
-    internal func applyStoredMerchantUpdate(merchantID: String, update: MerchantUpdate, status: String?) {
+    /// the response's gateway-assigned identity (terminal id, provider-resolved
+    /// acquirer id, wallet account id) is folded in with it.
+    internal func applyStoredMerchantUpdate(
+        _ update: MerchantUpdate,
+        merchantID: String,
+        terminalID: String?,
+        acquirerID: String?,
+        walletAccountID: String?,
+        status: String?
+    ) {
         withMerchantStorage { storage in
             guard let stored = storage.load(), stored.merchantID == merchantID else { return }
-            storage.save(stored.applying(update, status: status))
+            storage.save(stored.applying(update, status: status, terminalID: terminalID,
+                                         acquirerID: acquirerID, walletAccountID: walletAccountID))
         }
     }
 
@@ -748,7 +834,10 @@ public final class VeyraSoftPOS: @unchecked Sendable {
                         cacNumber: registration.cacNumber,
                         accountNumber: registration.accountNumber,
                         institutionCode: registration.institutionCode,
-                        acquirerId: registration.acquirerID
+                        // The provider credential from the configuration; the gateway
+                        // resolves the acquirer id and MCC from it. No acquirer id is sent.
+                        paymentAppProviderId: owner.paymentAppProviderID,
+                        walletAccountId: registration.walletAccountID
                     )
                 )
                 // Persist the registration — same fold as Android's MerchantService:
@@ -762,9 +851,17 @@ public final class VeyraSoftPOS: @unchecked Sendable {
                             merchantStatus: r.merchantStatus,
                             merchantCategoryCode: r.merchantCategoryCode,
                             countryCode: r.countryCode,
-                            acquirerID: r.acquirerId
+                            // Gateway-resolved; there is no submitted value to fall
+                            // back to any more.
+                            acquirerID: r.acquirerId,
+                            walletAccountID: r.walletAccountId ?? registration.walletAccountID
                         )
                     )
+                    // There is now a merchant to watch. This is also the
+                    // activation moment — a merchant registered as PENDING and activated minutes
+                    // later is exactly the transition the app is waiting on, and before this the
+                    // only way to see it was to keep asking.
+                    owner.startMerchantStatusWatchIfRegistered()
                 }
                 return MerchantRegistrationResult(
                     success: r.success,
@@ -820,11 +917,66 @@ public final class VeyraSoftPOS: @unchecked Sendable {
                         countryCode: update.countryCode,
                         accountNumber: update.accountNumber,
                         institutionCode: update.institutionCode,
-                        acquirerId: update.acquirerID
+                        paymentAppProviderId: owner.paymentAppProviderID,
+                        walletAccountId: update.walletAccountID,
+                        bvn: update.bvn
                     )
                 )
+                // Fold the gateway-assigned identity from the update response into
+                // the stored merchant (terminal id, provider-resolved acquirer id, wallet account).
+                owner.applyStoredMerchantUpdate(update, merchantID: r.merchantId,
+                                                terminalID: r.terminalId,
+                                                acquirerID: r.acquirerId,
+                                                walletAccountID: r.walletAccountId,
+                                                status: r.merchantStatus)
                 return MerchantStatus(merchantID: r.merchantId, status: r.merchantStatus)
             }
+        }
+
+        /// Observe the merchant's backend status changing — deactivated, suspended, or activated.
+        ///
+        /// **Why you want this.** A merchant deactivated or suspended mid-session should stop your
+        /// app offering to take payments *at once*, not whenever a screen next happens to read
+        /// `merchant.status`. It is also how you see the **activation** moment after registering,
+        /// without polling for it yourself.
+        ///
+        /// The SDK owns the polling and it is **app-scoped**, not screen-scoped: it starts at
+        /// `configure` (and after a successful `register`) and keeps running as the merchant
+        /// navigates — no screen starts it and no screen may stop it.
+        ///
+        /// One platform boundary, stated rather than implied: iOS suspends timers when the OS
+        /// suspends the app, so polling pauses while backgrounded and resumes on foreground. **No
+        /// answer is lost** — the status lives in the SDK's store and the comparison is against
+        /// what was persisted, so a change that happened while you were away is still reported on
+        /// the first poll after you return.
+        ///
+        /// Act on `canAcceptPayments`, not on `status`: it is the SDK's own reading, so you can
+        /// never be more permissive than the gate that would refuse the sale. Anything that is not
+        /// `ACTIVE` — including a status added to the backend after this SDK shipped — is `false`.
+        ///
+        /// `previousStatus` is `nil` when this device had no status for the merchant yet.
+        ///
+        /// Callbacks arrive on the main thread. Observing again replaces the previous observer;
+        /// `stopObservingMerchantStatus()` clears it. Register once, at start-up.
+        public func onMerchantStatusChanged(
+            _ observer: @escaping @Sendable (MerchantStatusChange) -> Void
+        ) throws {
+            let kmp = try owner.requireKmp()
+            kmp.observeMerchantStatus { merchantID, status, canAcceptPayments, previousStatus in
+                observer(
+                    MerchantStatusChange(
+                        merchantID: merchantID,
+                        status: status,
+                        canAcceptPayments: canAcceptPayments.boolValue,
+                        previousStatus: previousStatus
+                    )
+                )
+            }
+        }
+
+        /// Stop observing merchant status; no further callbacks fire.
+        public func stopObservingMerchantStatus() throws {
+            try owner.requireKmp().stopObservingMerchantStatus()
         }
     }
 
@@ -1035,6 +1187,7 @@ public final class VeyraSoftPOS: @unchecked Sendable {
         public func stopObservingTransactionResolved() throws {
             try owner.requireKmp().stopObservingTransactionResolved()
         }
+
 
         /// Observe beneficiary credit confirmations — the answer the SDK's background sweep is
         /// waiting for after an approved sale whose response said `isCreditConfirmationSupported`.

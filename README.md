@@ -160,12 +160,16 @@ const sub = merchant.tap.onEvent((e) => {
   if (e.type === 'result') showOutcome(e.result);   // '00' approved, '05' declined…
 });
 
-// Typed errors — never string-match messages
+// Typed errors — never string-match messages.
+// payScannedContext raises the device authentication sheet itself; you make no auth call.
 try {
   await wallet.payScannedContext(handle);
 } catch (e) {
-  if (e instanceof VeyraError && e.code === 'CDCVM_REQUIRED') {
-    await wallet.authenticateForPayment('Confirm payment');
+  if (e instanceof VeyraError && e.code === 'AUTH_CANCELLED') {
+    // The customer dismissed the sheet — nothing was sent; let them try again.
+  }
+  if (e instanceof VeyraError && e.code === 'AUTH_UNAVAILABLE') {
+    // No biometric and no screen lock on this device — send them to system settings.
   }
 }
 ```

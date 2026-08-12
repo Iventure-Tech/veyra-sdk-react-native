@@ -4,6 +4,7 @@ import { Events, VeyraNative, veyraEmitter } from './native';
 import type {
   Bank,
   CreditConfirmationEvent,
+  MerchantStatusEvent,
   CustomerQrChargeOutcome,
   MerchantReceipt,
   MerchantRegistration,
@@ -172,6 +173,25 @@ export const merchant = {
    */
   onCreditConfirmation(listener: (e: CreditConfirmationEvent) => void): EmitterSubscription {
     return veyraEmitter.addListener(Events.creditConfirmation, listener);
+  },
+
+  /**
+   * Fires when the merchant's backend status changes — deactivated, suspended, or activated.
+   *
+   * Two uses. It lets you stop offering to take payments the moment a merchant is deactivated
+   * mid-session, instead of at the next screen load; and it is how the **activation** moment
+   * arrives after registration, without your app polling for it.
+   *
+   * Branch on `canAcceptPayments`, not on `status` — it is the same reading the SDK's own payment
+   * gate uses, so you cannot end up more permissive than the gate that will refuse the sale.
+   *
+   * The SDK owns the polling and it is app-scoped on both platforms. On iOS it pauses while the
+   * app is suspended and resumes on foreground; nothing is lost, because the comparison is against
+   * the stored status, so a change that happened while you were away still arrives on the first
+   * poll after you return. Subscribe once, at start-up; there is no replay.
+   */
+  onMerchantStatusChanged(listener: (e: MerchantStatusEvent) => void): EmitterSubscription {
+    return veyraEmitter.addListener(Events.merchantStatus, listener);
   },
 
   getTransactions(limit = 50): Promise<MerchantTransaction[]> {

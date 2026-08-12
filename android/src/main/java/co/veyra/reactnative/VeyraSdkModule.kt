@@ -87,6 +87,34 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
                 emit(EventNames.CREDIT_CONFIRMATION, Mappers.creditConfirmation(c))
             }
         }
+        // The four "stored truth changed" channels. Registered at module construction for the same
+        // reason as the two above — the changes that matter most (a card suspended, a merchant
+        // deactivated, a payment settling) happen while no screen is watching, so a per-screen
+        // subscription would miss exactly the cases these exist for.
+        //
+        // The SDKs now hop to the main thread themselves, so the Handler.post here is strictly
+        // belt-and-braces; it is kept so this file reads the same for every channel and so nothing
+        // depends on that install having happened before the first event.
+        co.veyra.wallet.sdk.api.TokenLifecycleObserver.onTokenStatusChanged { c ->
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                emit(EventNames.TOKEN_STATUS_CHANGED, Mappers.tokenStatusChanged(c))
+            }
+        }
+        co.veyra.wallet.sdk.api.WalletTransactionResolvedObserver.onTransactionResolved { r ->
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                emit(EventNames.WALLET_TRANSACTION_RESOLVED, Mappers.walletTransactionResolved(r))
+            }
+        }
+        co.veyra.wallet.sdk.api.WalletKeyStateObserver.onKeyStateChanged { s ->
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                emit(EventNames.CARD_KEY_STATE, Mappers.cardKeyState(s))
+            }
+        }
+        co.veyra.softpos.payment.sdk.merchant.MerchantStatusObserver.onMerchantStatusChanged { c ->
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                emit(EventNames.MERCHANT_STATUS, Mappers.merchantStatusChanged(c))
+            }
+        }
     }
 
     private fun emit(event: String, payload: WritableMap) {
@@ -126,6 +154,7 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
             val softpos = VeyraSoftPosSdkConfig.builder(
                 environment = Environment.fromString(softposMap.req("environment"))
                     ?: throw IllegalArgumentException("environment must be TEST or LIVE"),
+                paymentAppProviderId = softposMap.req("paymentAppProviderId"),
                 clientId = softposMap.req("clientId"),
                 clientSecret = softposMap.req("clientSecret"),
             ).apply {
@@ -471,20 +500,11 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
         promise.resolve(Mappers.scanInspection(result, handle))
     }
 
-    @ReactMethod
-    fun walletAuthenticateForPayment(
-        title: String, subtitle: String?, allowDeviceCredential: Boolean, promise: Promise
-    ) = withInit(promise) {
-        val activity = hostActivity() as? FragmentActivity
-            ?: return@withInit VeyraPromises.reject(promise, "NOT_CONFIGURED", "No Activity attached")
-        activity.runOnUiThread {
-            wallet().tokenisationService.authenticateForScannedPayment(
-                activity, title, subtitle, allowDeviceCredential
-            ) { result ->
-                result.fold({ promise.resolve(null) }, { VeyraPromises.reject(promise, it) })
-            }
-        }
-    }
+    // `walletAuthenticateForPayment` was removed. The SDK raises the device
+    // authentication sheet itself inside `walletPayScannedContext` / `walletShowQrToPay`,
+    // including the main-looper hop this method used to do with `runOnUiThread`. Note that this
+    // bridge always sourced the Activity itself via `hostActivity()` — an RN developer never
+    // passed one — which is part of why the SDK asking was always the right shape.
 
     @ReactMethod
     fun walletPayScannedContext(handle: String, promise: Promise) = withInit(promise) {
@@ -692,6 +712,8 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
             countryCode = update.req("countryCode"),
             accountNumber = update.req("accountNumber"),
             institutionCode = update.req("institutionCode"),
+            walletAccountId = update.opt("walletAccountId"),
+            bvn = update.opt("bvn"),
         ) { r ->
             // null = the update did NOT happen (no stored merchant, no environment, or the
             // backend call failed) — reject so the app can say so, instead of resolving into
@@ -989,5 +1011,33 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
          * (The iOS bridge is wired to the same shared observer.)
          */
         const val CREDIT_CONFIRMATION = "VeyraCreditConfirmationEvent"
+
+        /**
+         * The issuer changed a card's status — suspended, reactivated,
+         * expired, deactivated. The sharp case is a card suspended server-side while the customer
+         * is looking at a card screen: without this the app finds out only if it reads again, and
+         * a screen already on-screen never does.
+         */
+        const val TOKEN_STATUS_CHANGED = "VeyraTokenStatusChangedEvent"
+
+        /**
+         * A **wallet** payment left `PENDING` reached a final outcome. The
+         * payer-side twin of [TRANSACTION_RESOLVED], which is the merchant's side of the same
+         * payment — the two carry different identifiers and are not interchangeable.
+         */
+        const val WALLET_TRANSACTION_RESOLVED = "VeyraWalletTransactionResolvedEvent"
+
+        /**
+         * A card's payment keys ran out, or a refresh replenished them —
+         * `requiresOnline` flipping. Covers key consumption and refresh, **not** keys expiring by
+         * clock (nothing runs then); such a card reads as requires-online on the next card read.
+         */
+        const val CARD_KEY_STATE = "VeyraCardKeyStateEvent"
+
+        /**
+         * The merchant was deactivated, suspended or activated. Lets an app
+         * stop accepting payments at once rather than at the next screen load.
+         */
+        const val MERCHANT_STATUS = "VeyraMerchantStatusEvent"
     }
 }

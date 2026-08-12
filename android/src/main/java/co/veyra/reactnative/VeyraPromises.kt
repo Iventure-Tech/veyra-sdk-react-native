@@ -50,9 +50,13 @@ internal object VeyraPromises {
             t is WalletRefusalException.AmountExceedsCardLimit -> "AMOUNT_EXCEEDS_CARD_LIMIT" to null
             t is WalletRefusalException.OnlineRequired -> "ONLINE_REQUIRED" to null
             t is WalletRefusalException.TokenNotActive -> "TOKEN_NOT_ACTIVE" to null
-            message.startsWith("CDCVM required") -> "CDCVM_REQUIRED" to null
-            message.startsWith("Authentication cancelled") -> "AUTH_CANCELLED" to null
-            message.startsWith("Authentication failed") -> "AUTH_FAILED" to null
+            // The CDCVM sheet the SDK raises itself. `CDCVM_REQUIRED` used to sit
+            // here, meaning "the app forgot to authenticate" — it no longer exists, because the
+            // SDK asks rather than refusing. These three are what a customer's answer produces,
+            // and they carry the code in the message like every other refusal.
+            message.contains("AUTH_CANCELLED") -> "AUTH_CANCELLED" to null
+            message.contains("AUTH_UNAVAILABLE") -> "AUTH_UNAVAILABLE" to null
+            message.contains("AUTH_FAILED") -> "AUTH_FAILED" to null
             message.startsWith("No active card") -> "NO_ACTIVE_CARD" to null
             message.contains("can't show a payment QR") -> "CARD_CANNOT_SHOW_QR" to null
             t is IllegalArgumentException -> "VALIDATION" to null
