@@ -484,7 +484,8 @@ public struct PaymentQr: Sendable, Hashable {
 public struct LukState: Sendable, Hashable {
     /// How many provisioned keys can still pay (not expired, under their thresholds).
     public let usableKeyCount: Int
-    /// True when the SDK considers a key refresh due (low on usable keys, or a key nears expiry).
+    /// True when the SDK considers a key refresh due — the card is running low on
+    /// full-capacity keys. The SDK refreshes automatically; this is observe-only.
     public let refreshDue: Bool
 }
 
@@ -1452,12 +1453,17 @@ public final class VeyraWallet: @unchecked Sendable {
             }
         }
 
-        /// Scene-active wallet maintenance. Call when the app becomes active (e.g. from a
-        /// `scenePhase` observer): the SDK syncs each stored card's server status (a suspended
-        /// card becomes non-payable until polled active again; a deactivated one is removed),
-        /// self-heals cards the server marks as needing refresh, and tops up the active card's
-        /// payment keys if they're running low — the key check also runs automatically before
-        /// every payment. Best-effort: a no-op without cards; failures never throw.
+        /// Run wallet maintenance **now**: the SDK syncs each stored card's server status (a
+        /// suspended card becomes non-payable until polled active again; a deactivated one is
+        /// removed), self-heals cards the server marks as needing refresh, and tops up the
+        /// active card's payment keys if they're running low — the key check also runs
+        /// automatically before every payment.
+        ///
+        /// The SDK already runs all of this itself — at `configure`, whenever the app becomes
+        /// active, and every 15 minutes while the app is running — so calling it is **optional**:
+        /// an immediate nudge (e.g. after your own "refresh" gesture), not required wiring. A
+        /// call landing while an automatic run is in flight is a no-op. Best-effort: a no-op
+        /// without cards; failures never throw.
         public func topUpKeysIfNeeded() async throws {
             try await call { kmp in
                 try await kmp.topUpKeysIfNeeded()
