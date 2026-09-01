@@ -113,6 +113,7 @@ export type TokenizationRecommendationReason =
 export interface VerifyAccountParams {
   accountNumber: string;
   institutionCode: string;
+  /** See {@link DigitiseParams.walletAccountId} — the account's registered email or phone. */
   walletAccountId: string;
   accountHolderName?: string;
   accountNumberSource?: AccountNumberSource;
@@ -128,6 +129,13 @@ export interface DigitiseParams {
   accountNumber: string;
   institutionCode: string;
   accountHolderName: string;
+  /**
+   * The wallet's own identifier for this user — **use the account's registered email address or
+   * phone number**. The SDK hashes it and the issuer recomputes that hash from the email/phone on
+   * its own record and compares. A value the bank does not hold (a GUID, an internal user id, a
+   * placeholder) hashes fine and matches nothing, costing the digitisation its identity-match
+   * signal and raising its risk score.
+   */
   walletAccountId: string;
   emailAddress: string;
   /** The wallet provider's own judgement — never defaulted by the SDK. */
