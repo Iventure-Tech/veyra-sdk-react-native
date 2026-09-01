@@ -134,7 +134,7 @@ export interface DigitiseParams {
    * phone number**. The SDK hashes it and the issuer recomputes that hash from the email/phone on
    * its own record and compares. A value the bank does not hold (a GUID, an internal user id, a
    * placeholder) hashes fine and matches nothing, costing the digitisation its identity-match
-   * signal and raising its risk score (ISSUE-221).
+   * signal and raising its risk score.
    */
   walletAccountId: string;
   emailAddress: string;
