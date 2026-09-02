@@ -140,9 +140,7 @@ class VeyraSdkReactNative: RCTEventEmitter {
       appVersion: walletMap["appVersion"] as? String ?? "1.0.0",
       appleTeamID: appleTeamID,
       allowedAcquirerIDs: walletMap["allowedAcquirerIds"] as? [String] ?? [],
-      allowedMerchantIDs: walletMap["allowedMerchantIds"] as? [String] ?? [],
-      allowedCountryCodes: walletMap["allowedCountryCodes"] as? [String] ?? [],
-      allowedMCCs: walletMap["allowedMccs"] as? [String] ?? []
+      allowedMerchantIDs: walletMap["allowedMerchantIds"] as? [String] ?? []
     )
 
     VeyraSDK.configure(softpos: softpos, wallet: wallet)

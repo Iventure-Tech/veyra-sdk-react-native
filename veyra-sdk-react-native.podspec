@@ -12,9 +12,9 @@ require "json"
 package = JSON.parse(File.read(File.join(__dir__, "package.json")))
 
 # Pinned by the release train to the SDK version this wrapper shipped with.
-veyra_kmp_version  = "1.0.20" # VEYRA-KMP-VERSION-MARKER (pinned by the release train)
-veyra_kmp_zip_url  = "https://repo.veyra.co/releases/files/VeyraKMP-1.0.20.xcframework.zip" # VEYRA-KMP-URL-MARKER
-veyra_kmp_checksum = "f174ad817365c632ccc043b4a7f561f90ff1c5d8a3eef3260ad230b7211d15e2" # VEYRA-KMP-CHECKSUM-MARKER
+veyra_kmp_version  = "1.1.0" # VEYRA-KMP-VERSION-MARKER (pinned by the release train)
+veyra_kmp_zip_url  = "https://repo.veyra.co/releases/files/VeyraKMP-1.1.0.xcframework.zip" # VEYRA-KMP-URL-MARKER
+veyra_kmp_checksum = "b9ee5d626c59fa2a14f55410cba1db972733c3c3129ba9fda3bff04b0b03d5dc" # VEYRA-KMP-CHECKSUM-MARKER
 
 Pod::Spec.new do |s|
   s.name         = "veyra-sdk-react-native"

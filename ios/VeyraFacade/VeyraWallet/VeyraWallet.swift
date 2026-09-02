@@ -42,14 +42,14 @@ public struct VeyraWalletConfiguration: Sendable {
     /// App Attest attests the *app*, so this is your team — not the SDK vendor's. **Mandatory:**
     /// `digitise` fails fast if it is missing.
     public let appleTeamID: String
-    /// Digitise `provision_context` allow-lists (mirror Android's `VeyraWalletSdkConfig`).
-    /// The token product can restrict provisioning to these — a restricted dimension that the
-    /// request omits is declined (e.g. `country_code … do not match any of allowed`).
-    /// Country codes are ISO 3166-1 *numeric*, 3–4 digits (`"0566"` Nigeria, `"0826"` UK).
+    /// Digitise `provision_context` allow-lists the integrating app decides (mirror Android's
+    /// `VeyraWalletSdkConfig`). The token product can restrict provisioning to these — a
+    /// restricted dimension that the request omits is declined.
+    ///
+    /// Country, currency and MCC are **not** here: the SDK declares those itself, identically on
+    /// every platform, so they can neither be supplied nor overridden by the app.
     public let allowedAcquirerIDs: [String]
     public let allowedMerchantIDs: [String]
-    public let allowedCountryCodes: [String]
-    public let allowedMCCs: [String]
     /// Whether the device passcode may satisfy the payment authentication the SDK raises, inside
     /// the same system sheet, for customers with no enrolled biometry. Default `true` — Apple Pay
     /// treats the device passcode as CDCVM, and biometry-only needs a bespoke "unavailable on this
@@ -77,8 +77,6 @@ public struct VeyraWalletConfiguration: Sendable {
         appleTeamID: String,
         allowedAcquirerIDs: [String] = [],
         allowedMerchantIDs: [String] = [],
-        allowedCountryCodes: [String] = [],
-        allowedMCCs: [String] = [],
         cdcvmAllowDeviceCredential: Bool = true,
         cdcvmPayTitle: String? = nil,
         cdcvmPaySubtitle: String? = nil,
@@ -95,8 +93,6 @@ public struct VeyraWalletConfiguration: Sendable {
         self.appleTeamID = appleTeamID
         self.allowedAcquirerIDs = allowedAcquirerIDs
         self.allowedMerchantIDs = allowedMerchantIDs
-        self.allowedCountryCodes = allowedCountryCodes
-        self.allowedMCCs = allowedMCCs
         self.cdcvmAllowDeviceCredential = cdcvmAllowDeviceCredential
         self.cdcvmPayTitle = cdcvmPayTitle
         self.cdcvmPaySubtitle = cdcvmPaySubtitle
@@ -743,8 +739,6 @@ public final class VeyraWallet: @unchecked Sendable {
                 recommendationStandardVersion: "1.0",
                 allowedAcquirerIds: configuration.allowedAcquirerIDs,
                 allowedMerchantIds: configuration.allowedMerchantIDs,
-                allowedCountryCodes: configuration.allowedCountryCodes,
-                allowedMccs: configuration.allowedMCCs,
                 // Same ObjC-export rule as the overrides above: these carry Kotlin defaults that
                 // do not survive the export, so they are passed explicitly.
                 cdcvmAllowDeviceCredential: configuration.cdcvmAllowDeviceCredential,

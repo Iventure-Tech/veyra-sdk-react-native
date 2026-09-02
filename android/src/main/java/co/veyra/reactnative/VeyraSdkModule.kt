@@ -166,7 +166,6 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
                     ?: throw IllegalArgumentException("environment must be TEST or LIVE"),
                 paymentAppProviderId = walletMap.req("paymentAppProviderId"),
                 tokenRequestorId = walletMap.req("tokenRequestorId"),
-                allowedCountryCodes = walletMap.optStringList("allowedCountryCodes") ?: emptyList(),
                 clientId = walletMap.req("clientId"),
                 clientSecret = walletMap.req("clientSecret"),
             ).apply {
@@ -176,7 +175,6 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
                     ?.let { walletProviderTokenizationRecommendationStandardVersion(it) }
                 walletMap.optStringList("allowedAcquirerIds")?.let { allowedAcquirerIds(it) }
                 walletMap.optStringList("allowedMerchantIds")?.let { allowedMerchantIds(it) }
-                walletMap.optStringList("allowedMccs")?.let { allowedMccs(it) }
             }.build()
 
             // Umbrella first: installs the exclusive arbiter + InertBackstop and resets

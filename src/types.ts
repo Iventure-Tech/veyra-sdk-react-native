@@ -34,16 +34,17 @@ export interface VeyraWalletConfig {
   clientSecret: string;
   paymentAppProviderId: string;
   tokenRequestorId: string;
-  /** ISO 3166-1 numeric (4-digit, zero-padded). Android: required (may be empty). */
-  allowedCountryCodes?: string[];
   /** Android: required before digitising. iOS: fixed by the SDK. */
   recommendationStandardVersion?: string;
   appVersion?: string;
   /** iOS only: your Apple Developer Team ID. Required on iOS. */
   appleTeamId?: string;
+  /**
+   * Digitise provision-context allow-lists your app decides. Country, currency and merchant
+   * category code are NOT configurable: the SDK declares Veyra's provisioning domain itself.
+   */
   allowedAcquirerIds?: string[];
   allowedMerchantIds?: string[];
-  allowedMccs?: string[];
   /** Android only. Defaults to true. */
   enableNfc?: boolean;
 }
