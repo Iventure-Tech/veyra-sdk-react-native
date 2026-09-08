@@ -166,7 +166,6 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
                     ?: throw IllegalArgumentException("environment must be TEST or LIVE"),
                 paymentAppProviderId = walletMap.req("paymentAppProviderId"),
                 tokenRequestorId = walletMap.req("tokenRequestorId"),
-                allowedCountryCodes = walletMap.optStringList("allowedCountryCodes") ?: emptyList(),
                 clientId = walletMap.req("clientId"),
                 clientSecret = walletMap.req("clientSecret"),
             ).apply {
@@ -176,7 +175,6 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
                     ?.let { walletProviderTokenizationRecommendationStandardVersion(it) }
                 walletMap.optStringList("allowedAcquirerIds")?.let { allowedAcquirerIds(it) }
                 walletMap.optStringList("allowedMerchantIds")?.let { allowedMerchantIds(it) }
-                walletMap.optStringList("allowedMccs")?.let { allowedMccs(it) }
             }.build()
 
             // Umbrella first: installs the exclusive arbiter + InertBackstop and resets
@@ -485,9 +483,12 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
-    fun walletDeactivateCard(ref: String, promise: Promise) = withInit(promise) {
+    fun walletDeactivateToken(ref: String, promise: Promise) = withInit(promise) {
         wallet().tokenisationService.deactivateToken(ref) { result ->
-            result.fold({ promise.resolve(null) }, { VeyraPromises.reject(promise, it) })
+            result.fold(
+                { r -> promise.resolve(Mappers.tokenStatusUpdate(r)) },
+                { VeyraPromises.reject(promise, it) },
+            )
         }
     }
 

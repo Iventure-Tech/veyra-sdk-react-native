@@ -140,9 +140,7 @@ class VeyraSdkReactNative: RCTEventEmitter {
       appVersion: walletMap["appVersion"] as? String ?? "1.0.0",
       appleTeamID: appleTeamID,
       allowedAcquirerIDs: walletMap["allowedAcquirerIds"] as? [String] ?? [],
-      allowedMerchantIDs: walletMap["allowedMerchantIds"] as? [String] ?? [],
-      allowedCountryCodes: walletMap["allowedCountryCodes"] as? [String] ?? [],
-      allowedMCCs: walletMap["allowedMccs"] as? [String] ?? []
+      allowedMerchantIDs: walletMap["allowedMerchantIds"] as? [String] ?? []
     )
 
     VeyraSDK.configure(softpos: softpos, wallet: wallet)
@@ -566,11 +564,19 @@ class VeyraSdkReactNative: RCTEventEmitter {
     )
   }
 
-  @objc(walletDeactivateCard:resolver:rejecter:)
-  func walletDeactivateCard(_ ref: String, resolver resolve: @escaping RCTPromiseResolveBlock,
-                            rejecter rejecter: @escaping RCTPromiseRejectBlock) {
+  @objc(walletDeactivateToken:resolver:rejecter:)
+  func walletDeactivateToken(_ ref: String, resolver resolve: @escaping RCTPromiseResolveBlock,
+                             rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     Task {
-      do { _ = try await VeyraWallet.shared.tokenisation.deactivate(ref); resolve(nil) }
+      do {
+        // The backend's answer reaches JS, as it does on the two native surfaces.
+        let response = try await VeyraWallet.shared.tokenisation.deactivateToken(ref)
+        resolve([
+          "tokenUniqueReference": response.tokenUniqueReference as Any,
+          "status": response.status as Any,
+          "message": response.message as Any,
+        ])
+      }
       catch { self.reject(rejecter, error) }
     }
   }

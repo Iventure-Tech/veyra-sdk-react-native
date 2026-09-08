@@ -42,14 +42,14 @@ public struct VeyraWalletConfiguration: Sendable {
     /// App Attest attests the *app*, so this is your team — not the SDK vendor's. **Mandatory:**
     /// `digitise` fails fast if it is missing.
     public let appleTeamID: String
-    /// Digitise `provision_context` allow-lists (mirror Android's `VeyraWalletSdkConfig`).
-    /// The token product can restrict provisioning to these — a restricted dimension that the
-    /// request omits is declined (e.g. `country_code … do not match any of allowed`).
-    /// Country codes are ISO 3166-1 *numeric*, 3–4 digits (`"0566"` Nigeria, `"0826"` UK).
+    /// Digitise `provision_context` allow-lists the integrating app decides (mirror Android's
+    /// `VeyraWalletSdkConfig`). The token product can restrict provisioning to these — a
+    /// restricted dimension that the request omits is declined.
+    ///
+    /// Country, currency and MCC are **not** here: the SDK declares those itself, identically on
+    /// every platform, so they can neither be supplied nor overridden by the app.
     public let allowedAcquirerIDs: [String]
     public let allowedMerchantIDs: [String]
-    public let allowedCountryCodes: [String]
-    public let allowedMCCs: [String]
     /// Whether the device passcode may satisfy the payment authentication the SDK raises, inside
     /// the same system sheet, for customers with no enrolled biometry. Default `true` — Apple Pay
     /// treats the device passcode as CDCVM, and biometry-only needs a bespoke "unavailable on this
@@ -77,8 +77,6 @@ public struct VeyraWalletConfiguration: Sendable {
         appleTeamID: String,
         allowedAcquirerIDs: [String] = [],
         allowedMerchantIDs: [String] = [],
-        allowedCountryCodes: [String] = [],
-        allowedMCCs: [String] = [],
         cdcvmAllowDeviceCredential: Bool = true,
         cdcvmPayTitle: String? = nil,
         cdcvmPaySubtitle: String? = nil,
@@ -95,8 +93,6 @@ public struct VeyraWalletConfiguration: Sendable {
         self.appleTeamID = appleTeamID
         self.allowedAcquirerIDs = allowedAcquirerIDs
         self.allowedMerchantIDs = allowedMerchantIDs
-        self.allowedCountryCodes = allowedCountryCodes
-        self.allowedMCCs = allowedMCCs
         self.cdcvmAllowDeviceCredential = cdcvmAllowDeviceCredential
         self.cdcvmPayTitle = cdcvmPayTitle
         self.cdcvmPaySubtitle = cdcvmPaySubtitle
@@ -743,8 +739,6 @@ public final class VeyraWallet: @unchecked Sendable {
                 recommendationStandardVersion: "1.0",
                 allowedAcquirerIds: configuration.allowedAcquirerIDs,
                 allowedMerchantIds: configuration.allowedMerchantIDs,
-                allowedCountryCodes: configuration.allowedCountryCodes,
-                allowedMccs: configuration.allowedMCCs,
                 // Same ObjC-export rule as the overrides above: these carry Kotlin defaults that
                 // do not survive the export, so they are passed explicitly.
                 cdcvmAllowDeviceCredential: configuration.cdcvmAllowDeviceCredential,
@@ -894,15 +888,6 @@ public final class VeyraWallet: @unchecked Sendable {
             }
         }
 
-        /// Delete a token from the wallet: best-effort server deactivate, then — always — a full
-        /// local wipe of the token and all its payment material, promoting the next token when
-        /// the deleted one was active. Use for the user's "remove card" action.
-        public func delete(_ tokenUniqueReference: String) async throws {
-            try await call { kmp in
-                try await kmp.deleteToken(tokenUniqueReference: tokenUniqueReference)
-            }
-        }
-
         /// Wipe every token and all SDK-held data from this device (local only).
         public func wipeAll() async throws {
             try await call { kmp in
@@ -954,7 +939,7 @@ public final class VeyraWallet: @unchecked Sendable {
         /// Deactivate a token on the backend. On success the SDK also wipes every on-device
         /// artefact for the token and promotes the next token when the active one was removed;
         /// on failure nothing local changes.
-        public func deactivate(_ tokenUniqueReference: String) async throws -> TokenStatusUpdateResponse {
+        public func deactivateToken(_ tokenUniqueReference: String) async throws -> TokenStatusUpdateResponse {
             try await call { kmp in
                 let r = try await kmp.deactivateToken(tokenUniqueReference: tokenUniqueReference)
                 return TokenStatusUpdateResponse(tokenUniqueReference: r.tokenUniqueReference, status: r.status, message: r.message)

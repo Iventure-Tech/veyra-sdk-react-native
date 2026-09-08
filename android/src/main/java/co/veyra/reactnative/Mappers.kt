@@ -12,6 +12,7 @@ import co.veyra.softpos.payment.sdk.merchant.TransactionReceiptResult
 import co.veyra.wallet.sdk.AccountNumberSource
 import co.veyra.wallet.sdk.Bank
 import co.veyra.wallet.sdk.CpmPaymentQr
+import co.veyra.wallet.sdk.TokenStatusUpdateResponse
 import co.veyra.wallet.sdk.Token
 import co.veyra.wallet.sdk.TokenisationResponse
 import co.veyra.wallet.sdk.TokenizationRecommendation
@@ -331,6 +332,20 @@ internal object Mappers {
      *
      * [into] exists for tests: `Arguments.createMap()` needs the native bridge, `JavaOnlyMap` doesn't.
      */
+    /**
+     * The answer to a token status change — today `walletDeactivateToken`. JS gets the same three
+     * fields the Android and iOS surfaces return, so a caller can tell a stated status from the
+     * server having said nothing.
+     */
+    fun tokenStatusUpdate(
+        r: TokenStatusUpdateResponse,
+        into: WritableMap = Arguments.createMap(),
+    ): WritableMap = into.apply {
+        putString("tokenUniqueReference", r.tokenUniqueReference)
+        putString("status", r.status)
+        putString("message", r.message)
+    }
+
     fun transactionResolved(
         r: co.veyra.softpos.payment.sdk.merchant.TransactionResolution,
         into: WritableMap = Arguments.createMap(),

@@ -3,6 +3,7 @@ import { nativeCall } from './errors';
 import { Events, VeyraNative, veyraEmitter } from './native';
 import type {
   ActivateResponse,
+  TokenStatusUpdateResponse,
   ActivationCodeResponse,
   ActivationEvent,
   ActivationMedium,
@@ -117,9 +118,15 @@ export const wallet = {
     return nativeCall(() => VeyraNative.walletSetActiveCard(cardId));
   },
 
-  /** Deactivates the token server-side and removes the card. */
-  deactivateCard(tokenUniqueReference: string): Promise<void> {
-    return nativeCall(() => VeyraNative.walletDeactivateCard(tokenUniqueReference));
+  /**
+   * Deactivates the token server-side and removes the card, returning the backend's answer —
+   * the same call and the same shape as Android's `deactivateToken` and iOS's
+   * `tokenisation.deactivateToken`.
+   */
+  deactivateToken(
+    tokenUniqueReference: string
+  ): Promise<TokenStatusUpdateResponse> {
+    return nativeCall(() => VeyraNative.walletDeactivateToken(tokenUniqueReference));
   },
 
   /** Android-only tap-to-pay outcome stream (armed via {@link setActiveCard}). */
