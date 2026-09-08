@@ -231,6 +231,16 @@ export interface ActivateResponse {
   recommendDelete: RecommendDelete | null;
 }
 
+/**
+ * The backend's answer to a token status change — today, {@link WalletApi.deactivateToken}.
+ * `status` is the token's status as token-provider reports it, carried verbatim.
+ */
+export interface TokenStatusUpdateResponse {
+  tokenUniqueReference: string | null;
+  status: string | null;
+  message: string | null;
+}
+
 export type ActivationEvent =
   | { tokenUniqueReference: string; event: 'activated' }
   | { tokenUniqueReference: string; event: 'timeout' }

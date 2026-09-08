@@ -888,15 +888,6 @@ public final class VeyraWallet: @unchecked Sendable {
             }
         }
 
-        /// Delete a token from the wallet: best-effort server deactivate, then — always — a full
-        /// local wipe of the token and all its payment material, promoting the next token when
-        /// the deleted one was active. Use for the user's "remove card" action.
-        public func delete(_ tokenUniqueReference: String) async throws {
-            try await call { kmp in
-                try await kmp.deleteToken(tokenUniqueReference: tokenUniqueReference)
-            }
-        }
-
         /// Wipe every token and all SDK-held data from this device (local only).
         public func wipeAll() async throws {
             try await call { kmp in
@@ -948,7 +939,7 @@ public final class VeyraWallet: @unchecked Sendable {
         /// Deactivate a token on the backend. On success the SDK also wipes every on-device
         /// artefact for the token and promotes the next token when the active one was removed;
         /// on failure nothing local changes.
-        public func deactivate(_ tokenUniqueReference: String) async throws -> TokenStatusUpdateResponse {
+        public func deactivateToken(_ tokenUniqueReference: String) async throws -> TokenStatusUpdateResponse {
             try await call { kmp in
                 let r = try await kmp.deactivateToken(tokenUniqueReference: tokenUniqueReference)
                 return TokenStatusUpdateResponse(tokenUniqueReference: r.tokenUniqueReference, status: r.status, message: r.message)

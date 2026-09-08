@@ -483,9 +483,12 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
-    fun walletDeactivateCard(ref: String, promise: Promise) = withInit(promise) {
+    fun walletDeactivateToken(ref: String, promise: Promise) = withInit(promise) {
         wallet().tokenisationService.deactivateToken(ref) { result ->
-            result.fold({ promise.resolve(null) }, { VeyraPromises.reject(promise, it) })
+            result.fold(
+                { r -> promise.resolve(Mappers.tokenStatusUpdate(r)) },
+                { VeyraPromises.reject(promise, it) },
+            )
         }
     }
 

@@ -63,7 +63,7 @@ RCT_EXTERN_METHOD(walletGetActiveCard : (RCTPromiseResolveBlock)resolve
 RCT_EXTERN_METHOD(walletSetActiveCard : (NSString *)cardId
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
-RCT_EXTERN_METHOD(walletDeactivateCard : (NSString *)ref
+RCT_EXTERN_METHOD(walletDeactivateToken : (NSString *)ref
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(walletInspectScannedQr : (NSString *)payload
