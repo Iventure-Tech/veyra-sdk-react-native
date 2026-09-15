@@ -123,6 +123,17 @@ export interface VerifyAccountParams {
 export interface VerifyAccountResponse {
   responseCode: DigitiseResponseCode | null;
   message: string | null;
+  /**
+   * What the **call** did, as distinct from what the issuer decided: `'APPROVED'`, `'DECLINED'`
+   * (the check ran, the answer is no), `'FAILED'` (it could not be run, so nothing was decided
+   * about the account) or `'PENDING'`. `null` on a backend older than this field.
+   */
+  responseStatus: string | null;
+  /**
+   * **Why** — the symbolic cause, and the field to branch on. Same vocabulary as
+   * {@link DigitiseResult.responseStatusReason}.
+   */
+  responseStatusReason: string | null;
   isApproved: boolean;
 }
 
@@ -172,6 +183,29 @@ export type ActivationMedium =
 
 export interface DigitiseResult {
   responseCode: DigitiseResponseCode | null;
+  /**
+   * What the **call** did, as distinct from what the issuer decided: `'APPROVED'`, `'DECLINED'`,
+   * `'FAILED'` or `'PENDING'`. `null` on a backend older than this field, and carried verbatim —
+   * a value this SDK has never heard of still reaches you.
+   */
+  responseStatus: string | null;
+  /**
+   * **Why** — the symbolic cause, and the field to branch on.
+   *
+   * Carries the issuer's own cause verbatim (`'ACCOUNT_NAME_MISMATCH'`, `'BVN_MISMATCH'`,
+   * `'ACCOUNT_NOT_LINKED_TO_BVN'`, `'ACCOUNT_ADDRESS_MISMATCH'`, `'ACCOUNT_BLOCKED'`,
+   * `'MAX_ACTIVE_TOKENS_EXCEEDED'`, `'RISK_SCORE_BELOW_THRESHOLD'`, …), the token provider's when
+   * it decided this itself (`'INVALID_ACCOUNT_NUMBER'`, `'UNKNOWN_ISSUER'`, …), or an API failure
+   * on a `'FAILED'` call.
+   *
+   * **Present on `'APPROVE_REQUIRE_AUTH'` too**, which is the case worth handling: it says why
+   * step-up is required — usually an identity mismatch — so your activation screen can say
+   * something truthful instead of a generic "verification needed".
+   *
+   * Typed as a plain `string` on purpose: the vocabulary grows without an SDK release, so keep a
+   * default branch.
+   */
+  responseStatusReason: string | null;
   tokenUniqueReference: string | null;
   activationMethods: ActivationMethodInfo[];
   message: string | null;

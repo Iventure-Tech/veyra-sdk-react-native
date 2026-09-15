@@ -128,6 +128,11 @@ internal object Mappers {
 
     fun digitiseResult(r: TokenisationResponse): WritableMap = Arguments.createMap().apply {
         putString("responseCode", r.responseCode)
+        // The cause is a field, not prose: `responseCode` is the issuer's decision,
+        // `responseStatus` what the call did, and `responseStatusReason` why — carried verbatim so
+        // a cause added after this build still reaches JS.
+        putString("responseStatus", r.responseStatus)
+        putString("responseStatusReason", r.responseStatusReason)
         putString("tokenUniqueReference", r.tokenUniqueReference)
         putArray("activationMethods", activationMethods(r.activationMethods?.map { it.medium to it.contact }))
         putString("message", r.message)

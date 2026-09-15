@@ -272,6 +272,9 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
                     promise.resolve(Arguments.createMap().apply {
                         putString("responseCode", r.responseCode)
                         putString("message", r.message)
+                        // What the call did, and why it decided that — carried verbatim.
+                        putString("responseStatus", r.responseStatus)
+                        putString("responseStatusReason", r.responseStatusReason)
                         putBoolean("isApproved", r.responseCode == "APPROVED" || r.responseCode == "APPROVE_REQUIRE_AUTH")
                     })
                 },

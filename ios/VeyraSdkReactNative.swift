@@ -302,6 +302,9 @@ class VeyraSdkReactNative: RCTEventEmitter {
         resolve([
           "responseCode": response.responseCode as Any,
           "message": response.message as Any,
+          // What the call did, and why it decided that — carried verbatim to JS.
+          "responseStatus": response.responseStatus as Any,
+          "responseStatusReason": response.responseStatusReason as Any,
           "isApproved": response.responseCode == "APPROVED" || response.responseCode == "APPROVE_REQUIRE_AUTH",
         ])
       } catch { self.reject(rejecter, error) }
@@ -341,6 +344,9 @@ class VeyraSdkReactNative: RCTEventEmitter {
         )
         resolve([
           "responseCode": result.responseCode as Any,
+          // The issuer's decision, what the call did, and why it decided that.
+          "responseStatus": result.responseStatus as Any,
+          "responseStatusReason": result.responseStatusReason as Any,
           "tokenUniqueReference": result.tokenUniqueReference as Any,
           "activationMethods": result.activationMethods.map {
             ["medium": $0.medium, "contact": $0.contact as Any]

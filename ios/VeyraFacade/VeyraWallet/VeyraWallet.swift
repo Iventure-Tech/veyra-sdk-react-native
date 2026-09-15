@@ -192,6 +192,25 @@ public struct DigitiseResult: Sendable, Hashable {
     public let tokenUniqueReference: String?
     public let responseCode: String?
     public let message: String?
+    /// What the **call** did, as distinct from what the issuer decided: `"APPROVED"`,
+    /// `"DECLINED"`, `"FAILED"` or `"PENDING"`. Nil on a backend older than this field, and
+    /// carried verbatim — a value this SDK has never heard of still reaches you.
+    public let responseStatus: String?
+    /// **Why** — the symbolic cause, and the field to branch on.
+    ///
+    /// Carries the issuer's own cause verbatim (`ACCOUNT_NAME_MISMATCH`, `BVN_MISMATCH`,
+    /// `ACCOUNT_NOT_LINKED_TO_BVN`, `ACCOUNT_ADDRESS_MISMATCH`, `ACCOUNT_BLOCKED`,
+    /// `MAX_ACTIVE_TOKENS_EXCEEDED`, `RISK_SCORE_BELOW_THRESHOLD`, …), the token provider's when
+    /// it decided this itself (`INVALID_ACCOUNT_NUMBER`, `UNKNOWN_ISSUER`, …), or an API failure
+    /// on a `FAILED` call.
+    ///
+    /// **Present on `APPROVE_REQUIRE_AUTH` too**, which is the case worth handling: it says why
+    /// step-up is required — usually an identity mismatch — so the activation prompt can say
+    /// something truthful instead of a generic "verification needed".
+    ///
+    /// Before this existed the cause reached apps only inside `message`, prose the backend is free
+    /// to reword. Keep a default branch: the vocabulary grows without an SDK release.
+    public let responseStatusReason: String?
     public let activationMethods: [DigitiseActivationMethod]
     /// True when provisioning data was decrypted + stored (the wallet now holds the token material).
     public let tokenStored: Bool
@@ -230,13 +249,23 @@ public struct Bank: Sendable, Hashable, Identifiable {
 public struct VerifyAccountResponse: Sendable, Hashable {
     public let responseCode: String?
     public let message: String?
+    /// What the **call** did: `"APPROVED"`, `"DECLINED"` (the check ran, the answer is no),
+    /// `"FAILED"` (it could not be run, so nothing was decided about the account) or `"PENDING"`.
+    public let responseStatus: String?
+    /// **Why** — the symbolic cause, and the field to branch on. Same vocabulary as
+    /// `DigitiseResult.responseStatusReason`; see it for the values and the warning about
+    /// defaulting.
+    public let responseStatusReason: String?
 
     /// Convenience: the account is within the allowed range and digitise may proceed.
     public var isApproved: Bool { responseCode == "APPROVED" }
 
-    public init(responseCode: String?, message: String?) {
+    public init(responseCode: String?, message: String?,
+                responseStatus: String? = nil, responseStatusReason: String? = nil) {
         self.responseCode = responseCode
         self.message = message
+        self.responseStatus = responseStatus
+        self.responseStatusReason = responseStatusReason
     }
 }
 
@@ -798,7 +827,12 @@ public final class VeyraWallet: @unchecked Sendable {
                     accountHolderName: accountHolderName,
                     accountNumberSource: accountNumberSource
                 )
-                return VerifyAccountResponse(responseCode: r.responseCode, message: r.message)
+                return VerifyAccountResponse(
+                    responseCode: r.responseCode,
+                    message: r.message,
+                    responseStatus: r.responseStatus,
+                    responseStatusReason: r.responseStatusReason
+                )
             }
         }
 
@@ -845,6 +879,8 @@ public final class VeyraWallet: @unchecked Sendable {
                     tokenUniqueReference: r.tokenUniqueReference,
                     responseCode: r.responseCode,
                     message: r.message,
+                    responseStatus: r.responseStatus,
+                    responseStatusReason: r.responseStatusReason,
                     activationMethods: r.activationMethods.map { DigitiseActivationMethod(medium: $0.medium, contact: $0.contact) },
                     tokenStored: r.tokenStored
                 )
