@@ -12,8 +12,8 @@ require "json"
 package = JSON.parse(File.read(File.join(__dir__, "package.json")))
 
 # Pinned by the release train to the SDK version this wrapper shipped with.
-veyra_kmp_version  = "1.2.5" # VEYRA-KMP-VERSION-MARKER (pinned by the release train)
-veyra_kmp_zip_url  = "https://repo.veyra.co/releases/files/VeyraKMP-1.2.5.xcframework.zip" # VEYRA-KMP-URL-MARKER
+veyra_kmp_version  = "1.2.6" # VEYRA-KMP-VERSION-MARKER (pinned by the release train)
+veyra_kmp_zip_url  = "https://repo.veyra.co/releases/files/VeyraKMP-1.2.6.xcframework.zip" # VEYRA-KMP-URL-MARKER
 veyra_kmp_checksum = "ede851a2617387efe5dfd4fe719f30e82cdddcc409a6e283049cd7383a0b67c5" # VEYRA-KMP-CHECKSUM-MARKER
 
 Pod::Spec.new do |s|
