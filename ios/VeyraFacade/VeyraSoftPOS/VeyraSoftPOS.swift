@@ -1447,9 +1447,25 @@ public struct TapPaymentResult: Sendable {
     /// APPROVED / DECLINED / PENDING / FAILED (TransactionStatus names).
     public let status: String
     public let pan: String?
+    /// Cardholder Name (EMV tag `5F20`) as the tapped card presented it — on a Veyra token the
+    /// card's display label (`AFRIGO ****1234`), not a person's name. Nil when the card carried
+    /// none.
+    public let cardholderName: String?
     /// DE55 EMV data (uppercase hex) when the card returned an ARQC — the online leg's input.
     public let iccDataHex: String?
     public let errorMessage: String?
+    /// The wire literal the payment server stated (`"00"`, `"51"`, `"96"`…). Display it on
+    /// receipts and quote it in support; **never branch on it** — branch on ``responseStatus``.
+    /// Nil when nothing was dispatched (see ``sdkErrorCode``) or the backend stated none.
+    public let responseCode: String?
+    /// The outcome **as stated by the backend** — `"APPROVED"` / `"DECLINED"` / `"FAILED"` /
+    /// `"PENDING"`, or `"Unknown"` for a value newer than this build. This is what you branch on;
+    /// only the first three are final, and `"PENDING"` always means "ask again". Nil against a
+    /// backend predating the field — treat absent as unresolved, never as a specific outcome.
+    public let responseStatus: String?
+    /// Why the payment ended as it did, e.g. `"INSUFFICIENT_FUNDS"`. Display and log; a plain
+    /// string by design, so a cause added later can never fail to parse.
+    public let responseStatusReason: String?
     /// The SDK error code when the tap failed before or during dispatch — `"NO_NETWORK_CONNECTION"`
     /// when this device had no working internet connection, so nothing reached the gateway and
     /// there is nothing to reconcile: tell the merchant to connect and take the payment again.
@@ -1539,8 +1555,12 @@ public final class TapPaymentSession: @unchecked Sendable {
             emit(.result(TapPaymentResult(
                 status: result.status,
                 pan: result.pan,
+                cardholderName: result.cardholderName,
                 iccDataHex: result.iccDataHex(),
                 errorMessage: result.errorMessage,
+                responseCode: result.responseCode,
+                responseStatus: result.responseStatus,
+                responseStatusReason: result.responseStatusReason,
                 sdkErrorCode: result.sdkErrorCode,
                 reference: result.merchantTransactionReference,
                 creditTransactionID: result.creditTransactionId,

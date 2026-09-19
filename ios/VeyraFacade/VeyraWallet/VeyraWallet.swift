@@ -1032,7 +1032,11 @@ public final class VeyraWallet: @unchecked Sendable {
 
         // ── Payment refusals ───────────────────────────────────────────────────────────────
 
-        /// Observe payments refused before any proof was built.
+        /// Observe payments refused before any proof was built, **for one card**.
+        ///
+        /// Handlers are registered against a token's unique reference and only ever hear about
+        /// that card. Registering the same card again replaces its handlers; other cards are
+        /// untouched. Call ``stopObservingPaymentRefusals(forTokenUniqueReference:)`` to clear one.
         ///
         /// Two callbacks, because the advice differs and giving the payer the wrong one wastes
         /// their time:
@@ -1050,19 +1054,25 @@ public final class VeyraWallet: @unchecked Sendable {
         /// card that can still make smaller payments. Show a message about the payment that just
         /// failed; don't grey the card out on the strength of one refused amount.
         ///
-        /// On iOS these fire from the QR rails (`rail` is `"CPM_QR"` or `"MPM_QR"`); there is no
+        /// These fire from the QR rails (`rail` is `"CPM_QR"` or `"MPM_QR"`); there is no
         /// tap-to-pay on iOS, so no `"TAP"` refusal can occur. The pay calls also keep throwing
         /// `VeyraWalletError.onlineRequired` / `.amountExceedsCardLimit` — this observer is
         /// additional, for hosts that would rather handle refusals in one place than at every call
         /// site.
         ///
-        /// Callbacks arrive on the main thread. Observing again replaces the previous observer.
+        /// A refusal the SDK could not attribute to a card reaches **every** registered handler
+        /// rather than none: the payer was refused either way. The callback's own
+        /// `tokenUniqueReference` is `nil` in that case, so a host can tell the two apart.
+        ///
+        /// Callbacks arrive on the main thread.
         public func observePaymentRefusals(
+            forTokenUniqueReference tokenUniqueReference: String,
             onRequireOnline: @escaping (_ tokenUniqueReference: String?, _ amountMinorUnits: Int64, _ rail: String) -> Void,
             onAmountExceedsCardLimit: @escaping (_ tokenUniqueReference: String?, _ amountMinorUnits: Int64, _ cardLimitMinorUnits: Int64?, _ rail: String) -> Void
         ) throws {
             let kmp = try owner.requireKmp()
             kmp.observePaymentRefusals(
+                tokenUniqueReference: tokenUniqueReference,
                 onRequireOnline: { tokenUniqueReference, amountMinorUnits, rail in
                     onRequireOnline(tokenUniqueReference, amountMinorUnits.int64Value, rail)
                 },
@@ -1077,9 +1087,10 @@ public final class VeyraWallet: @unchecked Sendable {
             )
         }
 
-        /// Stop observing payment refusals; no further callbacks fire.
-        public func stopObservingPaymentRefusals() throws {
-            try owner.requireKmp().stopObservingPaymentRefusals()
+        /// Stop observing payment refusals for one card; its handlers fire no more. Other cards'
+        /// registrations are unaffected.
+        public func stopObservingPaymentRefusals(forTokenUniqueReference tokenUniqueReference: String) throws {
+            try owner.requireKmp().stopObservingPaymentRefusals(tokenUniqueReference: tokenUniqueReference)
         }
 
         // ── The SDK tells you when stored truth changes ────────────────────────────────────

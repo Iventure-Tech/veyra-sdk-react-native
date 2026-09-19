@@ -455,12 +455,23 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
                     putString("message", message)
                 })
             },
-            // A payment refused before any proof was built. Two phases, not one, because the
-            // advice differs — `requireOnline` means connect and retry, `amountExceedCardLimit`
-            // means this card can never pay this much, so telling the payer to go online would send
-            // them round a loop that cannot succeed.
+            // Refusals are NOT registered here any more. They are per card and
+            // reach JS through `wallet.onPaymentRefusal`, which arms them for whichever card the
+            // app is listening to — not only the active one.
+        )
+        promise.resolve(null)
+    }
+
+    /**
+     * Arm refusal delivery for one card. JS keeps the listener map; this decides
+     * whether a refusal for that card crosses the bridge at all.
+     */
+    @ReactMethod
+    fun walletObservePaymentRefusals(tokenUniqueReference: String, promise: Promise) = withInit(promise) {
+        wallet().tokenisationService.observePaymentRefusals(
+            tokenUniqueReference = tokenUniqueReference,
             onRequireOnline = { event ->
-                emit(EventNames.WALLET_TAP, Arguments.createMap().apply {
+                emit(EventNames.PAYMENT_REFUSAL, Arguments.createMap().apply {
                     putString("type", "requireOnline")
                     putString("tokenId", event.tokenId)
                     putString("tokenUniqueReference", event.tokenUniqueReference)
@@ -470,7 +481,7 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
                 })
             },
             onAmountExceedCardLimit = { event ->
-                emit(EventNames.WALLET_TAP, Arguments.createMap().apply {
+                emit(EventNames.PAYMENT_REFUSAL, Arguments.createMap().apply {
                     putString("type", "amountExceedCardLimit")
                     putString("tokenId", event.tokenId)
                     putString("tokenUniqueReference", event.tokenUniqueReference)
@@ -482,6 +493,13 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
                 })
             },
         )
+        promise.resolve(null)
+    }
+
+    /** Release one card's refusal registration; other cards are unaffected. */
+    @ReactMethod
+    fun walletStopObservingPaymentRefusals(tokenUniqueReference: String, promise: Promise) = withInit(promise) {
+        wallet().tokenisationService.stopObservingPaymentRefusals(tokenUniqueReference)
         promise.resolve(null)
     }
 
@@ -1000,6 +1018,13 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
         const val WALLET_TAP = "VeyraWalletTapEvent"
         const val MERCHANT_TAP = "VeyraMerchantTapEvent"
         const val QR_EXPIRED = "VeyraQrExpiredEvent"
+
+        /**
+         * a payment was refused before any proof was built. Its own channel rather than a
+         * `walletTap` phase: refusals are per card and fire on the QR rails too,
+         * neither of which is a tap.
+         */
+        const val PAYMENT_REFUSAL = "VeyraPaymentRefusalEvent"
 
         /**
          * a payment the app was left waiting on has resolved. Emitted for any transaction that

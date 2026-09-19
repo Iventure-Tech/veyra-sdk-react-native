@@ -354,18 +354,32 @@ export type WalletTapEvent =
       cardScheme: CardScheme | null;
       reference: string | null;
     }
-  | { type: 'activationFailed'; message: string }
+  | { type: 'activationFailed'; message: string };
+
+/** Which rail a payment was refused on. `TAP` is Android only. */
+export type WalletPayRail = 'TAP' | 'CPM_QR' | 'MPM_QR';
+
+/**
+ * A payment refused **before any proof was built**, delivered to the handler registered for that
+ * card with `wallet.onPaymentRefusal`.
+ *
+ * Two shapes, not one, because the advice differs and a host that cannot tell them apart will
+ * misdirect the payer. These describe **this payment**, not the card: `Card.requiresOnline`
+ * answers the different question "can this card pay anything offline at all?" and stays `false`
+ * for a card that can still make smaller payments — so don't grey a card out on the strength of
+ * one refusal.
+ *
+ * `tokenUniqueReference` is `null` when the SDK could not attribute the refusal to a card. Such a
+ * refusal reaches **every** registered handler rather than none: the payer was refused either way.
+ */
+export type WalletPaymentRefusal =
   /**
-   * A payment was refused because the card's payment keys need refreshing and the wallet could
-   * not reach the server. Tell the payer to connect and try again.
+   * The card's payment keys need refreshing and the wallet could not reach the server. Tell the
+   * payer to connect and try again.
    *
    * On the tap rail this arrives at the earliest moment it is actually true: immediately when the
    * device is already offline, otherwise only once the automatic background refresh has failed. A
    * refresh that succeeds fires **nothing** — the next tap simply works.
-   *
-   * This describes *this payment*, not the card: `WalletCard.requiresOnline` answers the
-   * different question "can this card pay anything offline?" and stays `false` for a card that
-   * can still make smaller payments. Don't grey the card out on the strength of one refusal.
    */
   | {
       type: 'requireOnline';
@@ -377,7 +391,7 @@ export type WalletTapEvent =
       message: string;
     }
   /**
-   * A payment was refused because the amount is larger than this card can carry in one payment.
+   * The amount is larger than this card can carry in one payment.
    *
    * **Never tell the payer to go online here** — a refreshed key carries the same cap, so they
    * would connect, retry and fail identically. Tell them to pay a smaller amount or use another
@@ -394,8 +408,10 @@ export type WalletTapEvent =
       message: string;
     };
 
-/** Which rail a payment was refused on. `TAP` is Android only. */
-export type WalletPayRail = 'TAP' | 'CPM_QR' | 'MPM_QR';
+/** What `wallet.onPaymentRefusal` returns; call `remove()` to stop that card's handler. */
+export interface VeyraSubscription {
+  remove(): void;
+}
 
 export type ScanRejectionReason =
   | 'MALFORMED'

@@ -41,6 +41,11 @@ export const Events = {
    * reference the wallet never sees.
    */
   walletTransactionResolved: 'VeyraWalletTransactionResolvedEvent',
+  /**
+   * A payment refused before any proof was built. Its own channel rather than a `walletTap`
+   * phase: refusals are per-card and fire on the QR rails too, neither of which is a tap.
+   */
+  paymentRefusal: 'VeyraPaymentRefusalEvent',
   /** A card ran out of payment keys, or a refresh replenished them. */
   cardKeyState: 'VeyraCardKeyStateEvent',
   /** The merchant was deactivated, suspended or activated. */

@@ -23,6 +23,9 @@ class VeyraSdkReactNative: RCTEventEmitter {
     static let walletTap = "VeyraWalletTapEvent"
     static let merchantTap = "VeyraMerchantTapEvent"
     static let qrExpired = "VeyraQrExpiredEvent"
+    /// A payment refused before any proof was built. Its own channel rather than a `walletTap`
+    /// phase: refusals are per card and fire on the QR rails, neither of which is a tap.
+    static let paymentRefusal = "VeyraPaymentRefusalEvent"
     /// A payment the app was left waiting on has resolved. Same name and payload as Android's.
     static let transactionResolved = "VeyraTransactionResolvedEvent"
     /// An approved sale's funds were confirmed in the merchant's bank account (or the 30-day
@@ -54,6 +57,7 @@ class VeyraSdkReactNative: RCTEventEmitter {
       EventName.walletTap,
       EventName.merchantTap,
       EventName.qrExpired,
+      EventName.paymentRefusal,
       EventName.transactionResolved,
       EventName.creditConfirmation,
       EventName.tokenStatusChanged,
@@ -532,42 +536,62 @@ class VeyraSdkReactNative: RCTEventEmitter {
     Task {
       do {
         try await VeyraWallet.shared.tokenisation.setActiveToken(cardId)
-        // Android registers its refusal callbacks as part of setActiveToken, so JS gets the same
-        // `walletTap` phases from the same call on both platforms. iOS emits them from the QR
-        // rails only — there is no tap rail here — so `rail` is never "TAP".
-        self.observeWalletPaymentRefusals()
+        // Refusals are NOT armed here any more: they are per card and reach JS through
+        // `wallet.onPaymentRefusal`, which observes whichever card the app is listening to
+        // rather than only the active one.
         resolve(nil)
       }
       catch { self.reject(rejecter, error) }
     }
   }
 
-  /// Bridge payment refusals to the same `walletTap` phases the Android module emits.
-  /// Re-observing replaces the previous observer, so repeated `setActiveCard` calls do not stack.
-  private func observeWalletPaymentRefusals() {
-    try? VeyraWallet.shared.tokenisation.observePaymentRefusals(
-      onRequireOnline: { [weak self] tokenUniqueReference, amountMinorUnits, rail in
-        self?.sendEvent(withName: EventName.walletTap, body: [
-          "type": "requireOnline",
-          "tokenId": NSNull(),
-          "tokenUniqueReference": tokenUniqueReference ?? NSNull(),
-          "amountMinorUnits": amountMinorUnits,
-          "rail": rail,
-          "message": "ONLINE_REQUIRED: Connect to the internet — the wallet needs to refresh this card before it can pay",
-        ])
-      },
-      onAmountExceedsCardLimit: { [weak self] tokenUniqueReference, amountMinorUnits, cardLimitMinorUnits, rail in
-        self?.sendEvent(withName: EventName.walletTap, body: [
-          "type": "amountExceedCardLimit",
-          "tokenId": NSNull(),
-          "tokenUniqueReference": tokenUniqueReference ?? NSNull(),
-          "amountMinorUnits": amountMinorUnits,
-          "cardLimitMinorUnits": cardLimitMinorUnits ?? NSNull(),
-          "rail": rail,
-          "message": "AMOUNT_EXCEEDS_CARD_LIMIT: This amount is too large for this card — try a smaller amount, or another card",
-        ])
-      }
-    )
+  /// Arm refusal delivery for one card. JS keeps the listener map; this decides whether a
+  /// refusal for that card crosses the bridge at all.
+  @objc(walletObservePaymentRefusals:resolver:rejecter:)
+  func walletObservePaymentRefusals(_ tokenUniqueReference: String,
+                                    resolver resolve: @escaping RCTPromiseResolveBlock,
+                                    rejecter rejecter: @escaping RCTPromiseRejectBlock) {
+    do {
+      try VeyraWallet.shared.tokenisation.observePaymentRefusals(
+        forTokenUniqueReference: tokenUniqueReference,
+        onRequireOnline: { [weak self] tokenUniqueReference, amountMinorUnits, rail in
+          self?.sendEvent(withName: EventName.paymentRefusal, body: [
+            "type": "requireOnline",
+            // iOS has no local card id; the reference is the identifier on this platform.
+            "tokenId": NSNull(),
+            "tokenUniqueReference": tokenUniqueReference ?? NSNull(),
+            "amountMinorUnits": amountMinorUnits,
+            "rail": rail,
+            "message": "ONLINE_REQUIRED: Connect to the internet — the wallet needs to refresh this card before it can pay",
+          ])
+        },
+        onAmountExceedsCardLimit: { [weak self] tokenUniqueReference, amountMinorUnits, cardLimitMinorUnits, rail in
+          self?.sendEvent(withName: EventName.paymentRefusal, body: [
+            "type": "amountExceedCardLimit",
+            "tokenId": NSNull(),
+            "tokenUniqueReference": tokenUniqueReference ?? NSNull(),
+            "amountMinorUnits": amountMinorUnits,
+            "cardLimitMinorUnits": cardLimitMinorUnits ?? NSNull(),
+            "rail": rail,
+            "message": "AMOUNT_EXCEEDS_CARD_LIMIT: This amount is too large for this card — try a smaller amount, or another card",
+          ])
+        }
+      )
+      resolve(nil)
+    } catch { self.reject(rejecter, error) }
+  }
+
+  /// Release one card's refusal registration; other cards are unaffected.
+  @objc(walletStopObservingPaymentRefusals:resolver:rejecter:)
+  func walletStopObservingPaymentRefusals(_ tokenUniqueReference: String,
+                                          resolver resolve: @escaping RCTPromiseResolveBlock,
+                                          rejecter rejecter: @escaping RCTPromiseRejectBlock) {
+    do {
+      try VeyraWallet.shared.tokenisation.stopObservingPaymentRefusals(
+        forTokenUniqueReference: tokenUniqueReference
+      )
+      resolve(nil)
+    } catch { self.reject(rejecter, error) }
   }
 
   @objc(walletDeactivateToken:resolver:rejecter:)

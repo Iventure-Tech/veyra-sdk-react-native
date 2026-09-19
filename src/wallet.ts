@@ -23,9 +23,89 @@ import type {
   TransactionSummary,
   VerifyAccountParams,
   VerifyAccountResponse,
+  VeyraSubscription,
+  WalletPaymentRefusal,
   WalletTapEvent,
   WalletTransactionResolvedEvent,
 } from './types';
+
+/**
+ * Per-card refusal listeners.
+ *
+ * The native side registers per card, so a refusal only crosses the bridge for a card someone is
+ * listening to. This keeps the JS-side fan-out: one emitter subscription for the channel, opened
+ * when the first card is observed and closed when the last goes, dispatching by the refusal's own
+ * `tokenUniqueReference`. An unattributed refusal (`null`) goes to every listener, matching what
+ * the native SDKs do — the payer was refused either way.
+ */
+const refusalListeners = (() => {
+  const byToken = new Map<string, Set<(r: WalletPaymentRefusal) => void>>();
+  let channel: EmitterSubscription | null = null;
+
+  const openChannel = () => {
+    if (channel) return;
+    channel = veyraEmitter.addListener(
+      Events.paymentRefusal,
+      (refusal: WalletPaymentRefusal) => {
+        const targets =
+          refusal.tokenUniqueReference == null
+            ? Array.from(byToken.values())
+            : [byToken.get(refusal.tokenUniqueReference)];
+        for (const set of targets) {
+          // Copy before iterating: a listener may remove itself while being called.
+          if (set) for (const l of Array.from(set)) l(refusal);
+        }
+      }
+    );
+  };
+
+  const closeChannelIfIdle = () => {
+    if (byToken.size === 0 && channel) {
+      channel.remove();
+      channel = null;
+    }
+  };
+
+  return {
+    add(
+      tokenUniqueReference: string,
+      listener: (r: WalletPaymentRefusal) => void
+    ): VeyraSubscription {
+      openChannel();
+      let set = byToken.get(tokenUniqueReference);
+      if (!set) {
+        set = new Set();
+        byToken.set(tokenUniqueReference, set);
+        // First listener for this card — arm the native registration.
+        void nativeCall(() =>
+          VeyraNative.walletObservePaymentRefusals(tokenUniqueReference)
+        ).catch(() => {
+          // A failed arm must not throw from a listener registration; the listener simply
+          // never fires, exactly as it would for a card the SDK does not know.
+        });
+      }
+      set.add(listener);
+
+      let removed = false;
+      return {
+        remove() {
+          if (removed) return; // remove() is idempotent, as EmitterSubscription's is
+          removed = true;
+          const current = byToken.get(tokenUniqueReference);
+          if (!current) return;
+          current.delete(listener);
+          if (current.size === 0) {
+            byToken.delete(tokenUniqueReference);
+            void nativeCall(() =>
+              VeyraNative.walletStopObservingPaymentRefusals(tokenUniqueReference)
+            ).catch(() => {});
+            closeChannelIfIdle();
+          }
+        },
+      };
+    },
+  };
+})();
 
 /** Wallet (Pay) domain — add card, activation, card states, payments, history. */
 export const wallet = {
@@ -132,6 +212,31 @@ export const wallet = {
   /** Android-only tap-to-pay outcome stream (armed via {@link setActiveCard}). */
   onTapEvent(listener: (e: WalletTapEvent) => void): EmitterSubscription {
     return veyraEmitter.addListener(Events.walletTap, listener);
+  },
+
+  /**
+   * Observe payments refused **before anything is sent**, for one card.
+   *
+   * Handlers are per card: a listener registered for one `tokenUniqueReference` never hears about
+   * another's. That is the same ownership model the Android and iOS SDKs use, so an integration
+   * reads the same on all three.
+   *
+   * Two refusal shapes, and the difference matters — `requireOnline` means "connect and try
+   * again", which genuinely fixes it; `amountExceedCardLimit` means this card can never pay this
+   * much, so telling the payer to go online sends them round a loop that cannot succeed.
+   *
+   * Fires on whatever rails the platform has: `TAP`, `CPM_QR` and `MPM_QR` on Android; the two QR
+   * rails on iOS, which has no tap-to-pay. A refusal the SDK could not attribute to a card
+   * (`tokenUniqueReference: null`) reaches **every** registered handler rather than none.
+   *
+   * Call `remove()` on the returned subscription to stop that card's handler; the native
+   * registration is released once the last listener for that card has gone.
+   */
+  onPaymentRefusal(
+    tokenUniqueReference: string,
+    listener: (refusal: WalletPaymentRefusal) => void
+  ): VeyraSubscription {
+    return refusalListeners.add(tokenUniqueReference, listener);
   },
 
   // ── Scan-to-pay (MPM) ──────────────────────────────────────────────────────
