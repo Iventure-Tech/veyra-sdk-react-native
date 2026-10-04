@@ -178,6 +178,7 @@ internal object Mappers {
             activationMethods(t.activationMethods?.map { it.medium to it.contact })
         )
         putBoolean("requiresOnline", t.requiresOnline)
+        putBoolean("deviceNotBound", t.deviceNotBound)
     }
 
     fun scanInspection(result: MpmScanResult, handle: String?): WritableMap =
@@ -431,6 +432,7 @@ internal object Mappers {
     ): WritableMap = into.apply {
         putString("tokenUniqueReference", s.tokenUniqueReference)
         putBoolean("requiresOnline", s.requiresOnline)
+        putBoolean("deviceNotBound", s.deviceNotBound)
     }
 
     /**

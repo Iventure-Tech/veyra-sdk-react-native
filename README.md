@@ -153,7 +153,7 @@ const tapSub = wallet.onTapEvent((e) => {
 });
 
 // Merchant: accept a tap
-const { sessionId } = await merchant.tap.start({ amountMinorUnits: 105000 });
+const { sessionId } = await merchant.tap.start({ amountMinorUnits: 105000, merchantOrderId: 'ORDER-1042' });
 const sub = merchant.tap.onEvent((e) => {
   if (e.type === 'unsupportedCard') showHint('Card not supported — try another');
   if (e.type === 'result') showOutcome(e.result);   // '00' approved, '05' declined…

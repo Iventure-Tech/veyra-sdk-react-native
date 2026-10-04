@@ -2,7 +2,7 @@ import { nativeCall } from './errors';
 import { VeyraNative } from './native';
 import { merchant } from './merchant';
 import { sessions, useGetPaidSession, usePaySession } from './sessions';
-import { wallet } from './wallet';
+import { rearmPaymentRefusalListeners, wallet } from './wallet';
 import type { VeyraConfig, VeyraMode } from './types';
 
 export * from './types';
@@ -12,11 +12,26 @@ export { wallet, merchant };
 
 export const Veyra = {
   /**
-   * Initialises both SDKs. Call once at app start (idempotent; safe to call again
-   * after the native Activity is recreated — the SDK re-attaches itself).
+   * Initialises both SDKs for `config.customerId`. Call at every app start, with the customer
+   * your app has signed in (idempotent for the same customer; safe to call again after the
+   * native Activity is recreated). A different customer stops the previous customer's work and
+   * opens the new customer's data.
    */
   initialize(config: VeyraConfig): Promise<void> {
-    return nativeCall(() => VeyraNative.initialize(config));
+    return nativeCall(() => VeyraNative.initialize(config)).then(() => {
+      // A sign-out or a customer switch dropped the native per-card refusal registrations;
+      // cards JS still listens to are armed again (app-wide events are re-armed natively).
+      rearmPaymentRefusalListeners();
+    });
+  },
+
+  /**
+   * The customer has logged out: both SDKs stop everything they run for them. Their cards,
+   * merchant and history stay on the device for when they sign in again. Every other call
+   * rejects with `NOT_SIGNED_IN` until the next `initialize`.
+   */
+  signOut(): Promise<void> {
+    return nativeCall(() => VeyraNative.signOut());
   },
 
   /**

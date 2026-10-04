@@ -60,6 +60,9 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
     private val cpmQrs = HandleRegistry<ScannedCpmQr>()
 
     @Volatile private var initialized = false
+    /** False after [signOut] until the next [initialize]: every data call is refused. */
+    @Volatile private var signedIn = false
+    @Volatile private var customerId: String? = null
     @Volatile private var softposConfig: VeyraSoftPosSdkConfig? = null
     @Volatile private var contextClient: ContextPaymentClient? = null
     @Volatile private var currentTapSessionId: String? = null
@@ -70,7 +73,18 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
         // no fabricated wire code. Safe to opt in bridge-wide: the JS mapper nulls an empty
         // responseCode and carries sdkErrorCode, and the RN guide documents that shape.
         co.veyra.softpos.payment.sdk.CardPaymentService.typedPreDispatchErrors = true
-        // registered once at module construction rather than per payment — the case
+        // The SDK observers are registered after every initialise — see registerObservers.
+    }
+
+    /**
+     * Bridge every SDK observer to its JS event. Called after **every** successful initialise:
+     * signing a customer out, or initialising a different one, drops all observer registrations
+     * so nothing of the previous customer's is announced — the bridge registers
+     * again for whoever is signed in now. Each observer holds one listener, so re-registering
+     * replaces rather than duplicates.
+     */
+    private fun registerObservers() {
+        // registered per signed-in customer rather than per payment — the case
         // that most needs it is a tap that resolves after the app was backgrounded. The SDK fires on its
         // poller's thread; hop to the JS thread the way every other event here does.
         co.veyra.softpos.payment.sdk.merchant.TransactionResolvedObserver.onTransactionResolved { r ->
@@ -78,7 +92,7 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
                 emit(EventNames.TRANSACTION_RESOLVED, Mappers.transactionResolved(r))
             }
         }
-        // same registered-once shape for the credit-receipt confirmation — funds can be
+        // same app-scoped shape for the credit-receipt confirmation — funds can be
         // confirmed days after the sale, long after any per-payment JS callback is gone. A later change
         // gave RN iOS the same channel off the Swift facade's forwarder, so this event now fires
         // identically on both platforms with the same name and the same payload.
@@ -87,7 +101,7 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
                 emit(EventNames.CREDIT_CONFIRMATION, Mappers.creditConfirmation(c))
             }
         }
-        // The four "stored truth changed" channels. Registered at module construction for the same
+        // The four "stored truth changed" channels. Registered here, not per screen, for the same
         // reason as the two above — the changes that matter most (a card suspended, a merchant
         // deactivated, a payment settling) happen while no screen is watching, so a per-screen
         // subscription would miss exactly the cases these exist for.
@@ -130,6 +144,13 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
             VeyraPromises.reject(promise, "NOT_CONFIGURED", "Call Veyra.initialize first")
             return
         }
+        if (!signedIn) {
+            VeyraPromises.reject(
+                promise, "NOT_SIGNED_IN",
+                "No customer is signed in — call Veyra.initialize with the customerId first",
+            )
+            return
+        }
         try {
             body()
         } catch (t: Throwable) {
@@ -146,6 +167,8 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
                 ?: return VeyraPromises.reject(
                     promise, "NOT_CONFIGURED", "No Activity attached yet — call after the app is on screen"
                 )
+            val customer = config.opt("customerId")?.takeIf { it.isNotBlank() }
+                ?: throw IllegalArgumentException("customerId is required")
             val softposMap = config.getMap("softpos")
                 ?: throw IllegalArgumentException("softpos config is required")
             val walletMap = config.getMap("wallet")
@@ -180,9 +203,10 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
             // Umbrella first: installs the exclusive arbiter + InertBackstop and resets
             // to inert. Then the member SDKs — WITHOUT lifecycle binding (single-Activity
             // host: the focus session drives the mode, never the Activity observers).
-            VeyraSdk.initialize(activity, VeyraSdkConfig(softpos, wallet))
-            VeyraWalletSdk.initialize(reactContext.applicationContext, wallet, activity = null)
-            VeyraSoftPOSSdk.initializeHosted(activity, softpos)
+            VeyraSdk.initialize(activity, customer, VeyraSdkConfig(softpos, wallet))
+            VeyraWalletSdk.initialize(reactContext.applicationContext, customer, wallet, activity = null)
+            VeyraSoftPOSSdk.initializeHosted(activity, customer, softpos)
+            registerObservers()
 
             softposConfig = softpos
             contextClient = ContextPaymentClient(
@@ -191,7 +215,9 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
                 softpos.clientId,
                 softpos.clientSecret,
             )
+            customerId = customer
             initialized = true
+            signedIn = true
             promise.resolve(null)
         } catch (t: Throwable) {
             VeyraPromises.reject(promise, t)
@@ -492,6 +518,16 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
                     putString("message", event.message)
                 })
             },
+            onDeviceNotBound = { event ->
+                emit(EventNames.PAYMENT_REFUSAL, Arguments.createMap().apply {
+                    putString("type", "deviceNotBound")
+                    putString("tokenId", event.tokenId)
+                    putString("tokenUniqueReference", event.tokenUniqueReference)
+                    putDouble("amountMinorUnits", event.amountMinorUnits.toDouble())
+                    putString("rail", event.rail)
+                    putString("message", event.message)
+                })
+            },
         )
         promise.resolve(null)
     }
@@ -699,11 +735,6 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
-    fun merchantClearStored(promise: Promise) = withInit(promise) {
-        softpos().merchantService.clearStoredMerchant(); promise.resolve(null)
-    }
-
-    @ReactMethod
     fun merchantRefreshStatus(promise: Promise) = withInit(promise) {
         // Android's refresh is fire-and-forget; resolve the last-known stored status
         // (the refresh continues in the background and updates the stored profile).
@@ -756,15 +787,12 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
         val sessionId = UUID.randomUUID().toString()
         val amount = request.getDouble("amountMinorUnits").toLong()
         val currency = request.opt("currency") ?: "0566"
-        // the app's own order id, NOT a transaction reference — the SDK mints that
-        // (the gateway makes (merchantId, reference) unique and only the SDK can promise it) and
-        // returns it on the result. `merchantTransactionReference` is still read for callers that
-        // have not migrated their JS yet, but it is treated as an order id rather than silently
-        // ignored: passing it as a reference is what this SDK stopped supporting, and dropping it entirely
-        // would lose an identifier the app clearly meant to attach to the sale.
-        val merchantOrderId = request.opt("merchantOrderId")
-            ?: request.opt("merchantTransactionReference")
-            ?: "${System.currentTimeMillis()}_${(1000..9999).random()}"
+        // the app's own order id, NOT a transaction reference — the SDK mints that and returns it
+        // on the result. Required: untyped JS that omits it is passed through blank so
+        // the SDK's rule refuses it with INVALID_REQUEST. This bridge used to invent one
+        // ("<millis>_<random>") and accept a legacy `merchantTransactionReference` in its place,
+        // which hid every missing order id behind a value no POS had ever issued.
+        val merchantOrderId = request.opt("merchantOrderId").orEmpty()
         val txType = TransactionRequest.TxType.valueOf(request.opt("txType") ?: "PURCHASE")
 
         fun tapEvent(type: String): WritableMap = Arguments.createMap().apply {
@@ -774,9 +802,7 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
 
         currentTapSessionId = sessionId
         softpos().cardPaymentService.makeCardPayment(
-            TransactionRequest.Builder(amount, currency, txType)
-                .merchantOrderId(merchantOrderId)
-                .build(),
+            TransactionRequest.Builder(amount, currency, merchantOrderId, txType).build(),
             callback = { response ->
                 if (currentTapSessionId == sessionId) currentTapSessionId = null
                 emit(EventNames.MERCHANT_TAP, tapEvent("result").apply {
@@ -808,7 +834,8 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
     fun merchantCreatePaymentContext(
         amountMinorUnits: Double,
         currency: String,
-        // the merchant's own order id, so the MPM rail carries it like tap and CPM do.
+        // the merchant's own order id, so the MPM rail carries it like tap and CPM do. Required
+        // for every merchant payment; null from untyped JS reaches the SDK blank and is refused there.
         merchantOrderId: String?,
         promise: Promise,
     ) =
@@ -823,7 +850,7 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
                         merchantId,
                         amountMinorUnits.toLong(),
                         currency,
-                        merchantOrderId = merchantOrderId,
+                        merchantOrderId = merchantOrderId.orEmpty(),
                     ) {
                         emit(EventNames.QR_EXPIRED, Arguments.createMap().apply {
                             putString("scope", "merchant")
@@ -883,7 +910,7 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
             scope.launch {
                 try {
                     val response = softpos().cpmCustomerQrService
-                        .charge(scanned, merchantOrderId = merchantOrderId)
+                        .charge(scanned, merchantOrderId = merchantOrderId.orEmpty())
                     promise.resolve(Arguments.createMap().apply {
                         putBoolean("approved", response.responseCode == "00")
                         putString("responseCode", response.responseCode)
@@ -983,6 +1010,23 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
 
     // ── Event-emitter plumbing (required by NativeEventEmitter) ─────────────────
 
+    /**
+     * The customer has logged out: both SDKs stop everything they run for them and drop every
+     * observer; their data stays on the device. Every data call is refused until the next
+     * [initialize].
+     */
+    @ReactMethod
+    fun signOut(promise: Promise) {
+        try {
+            VeyraSdk.signOut()
+            signedIn = false
+            customerId = null
+            promise.resolve(null)
+        } catch (t: Throwable) {
+            VeyraPromises.reject(promise, t)
+        }
+    }
+
     @ReactMethod
     fun addListener(@Suppress("UNUSED_PARAMETER") eventName: String) = Unit
 
@@ -996,7 +1040,8 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
         val activity = hostActivity() ?: return
         // Process singletons must re-bind to the recreated Activity (reader service);
         // lifecycle observers stay unbound — the focus session drives the mode.
-        softposConfig?.let { VeyraSoftPOSSdk.initializeHosted(activity, it) }
+        val customer = customerId ?: return // signed out: nothing to re-attach for
+        softposConfig?.let { VeyraSoftPOSSdk.initializeHosted(activity, customer, it) }
     }
 
     override fun onHostPause() = Unit

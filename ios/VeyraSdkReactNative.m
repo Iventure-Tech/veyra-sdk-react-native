@@ -7,6 +7,8 @@
 RCT_EXTERN_METHOD(initialize : (NSDictionary *)config
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(signOut : (RCTPromiseResolveBlock)resolve
+                  rejecter : (RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(currentMode : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
 
@@ -115,8 +117,6 @@ RCT_EXTERN_METHOD(merchantGetSettlementBanks : (RCTPromiseResolveBlock)resolve
 RCT_EXTERN_METHOD(merchantIsRegistered : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(merchantGetStored : (RCTPromiseResolveBlock)resolve
-                  rejecter : (RCTPromiseRejectBlock)reject)
-RCT_EXTERN_METHOD(merchantClearStored : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(merchantRefreshStatus : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)

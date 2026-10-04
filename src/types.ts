@@ -50,6 +50,12 @@ export interface VeyraWalletConfig {
 }
 
 export interface VeyraConfig {
+  /**
+   * The customer your app has signed in. Required on every launch: the SDKs keep cards,
+   * merchant and history per customer and never remember who is signed in. Never leaves the
+   * device.
+   */
+  customerId: string;
   softpos: VeyraSoftposConfig;
   wallet: VeyraWalletConfig;
 }
@@ -332,6 +338,13 @@ export interface Card {
    * out and disable pay affordances; the SDK self-heals, there is nothing to call.
    */
   requiresOnline: boolean;
+  /**
+   * True when the card was added on another device (or before this app was reinstalled) and the
+   * Veyra backend will not issue it new payment keys here. It cannot pay on this phone again:
+   * prompt the user to remove it and add it again. Going online does not help, so such a card
+   * always reads `requiresOnline: false`; payments with it are refused with `DEVICE_NOT_BOUND`.
+   */
+  deviceNotBound: boolean;
 }
 
 // ── Wallet: payments ──────────────────────────────────────────────────────────
@@ -363,8 +376,8 @@ export type WalletPayRail = 'TAP' | 'CPM_QR' | 'MPM_QR';
  * A payment refused **before any proof was built**, delivered to the handler registered for that
  * card with `wallet.onPaymentRefusal`.
  *
- * Two shapes, not one, because the advice differs and a host that cannot tell them apart will
- * misdirect the payer. These describe **this payment**, not the card: `Card.requiresOnline`
+ * Separate shapes, not one, because the advice differs and a host that cannot tell them apart will
+ * misdirect the payer. The first two describe **this payment**, not the card: `Card.requiresOnline`
  * answers the different question "can this card pay anything offline at all?" and stays `false`
  * for a card that can still make smaller payments — so don't grey a card out on the strength of
  * one refusal.
@@ -405,6 +418,21 @@ export type WalletPaymentRefusal =
       cardLimitMinorUnits: number | null;
       rail: WalletPayRail;
       /** Machine-matchable, prefixed `AMOUNT_EXCEEDS_CARD_LIMIT`. */
+      message: string;
+    }
+  /**
+   * The card was added on another device (or before this app was reinstalled), and the Veyra
+   * backend will not issue it payment keys on this one. Neither going online nor a smaller amount
+   * helps — ask the payer to remove the card and add it again on this phone. Unlike the other two
+   * this *is* a card state: the card reads `deviceNotBound: true` too.
+   */
+  | {
+      type: 'deviceNotBound';
+      tokenId: string | null;
+      tokenUniqueReference: string | null;
+      amountMinorUnits: number;
+      rail: WalletPayRail;
+      /** Machine-matchable, prefixed `DEVICE_NOT_BOUND`. */
       message: string;
     };
 
@@ -598,6 +626,12 @@ export type CardKeyStateEvent = {
   tokenUniqueReference: string;
   /** True when the card cannot pay until the SDK refreshes its keys. */
   requiresOnline: boolean;
+  /**
+   * True when the backend has refused this device payment keys for the card — it was added on
+   * another device, or before this app was reinstalled. Going online cannot fix it, so
+   * `requiresOnline` is `false` alongside it; prompt the user to add the card again.
+   */
+  deviceNotBound: boolean;
 };
 
 /**
@@ -784,7 +818,8 @@ export interface TapRequest {
   /** ISO 4217 numeric, e.g. '566'. Default '566'. */
   currency?: string;
   /**
-   * Your own order / basket / invoice id for this sale. Optional.
+   * Your own order / basket / invoice id for this sale. **Required** and non-blank — a blank one
+   * rejects `tap.start` with `INVALID_REQUEST` before the reader arms.
    *
    * Echoed back on the result and shown on the transaction detail and receipt. It is never
    * validated for uniqueness and never used as a lookup key, so the same value may appear on
@@ -795,7 +830,7 @@ export interface TapRequest {
    * it comes back as `merchantTransactionReference` on the result. Key receipts, status refreshes
    * and credit confirmation off that.
    */
-  merchantOrderId?: string;
+  merchantOrderId: string;
   /** Android only. Default 'PURCHASE'. */
   txType?:
     | 'PURCHASE'
@@ -831,7 +866,12 @@ export type MerchantTapEvent =
   | { type: 'result'; sessionId: string; result: MerchantTapResult };
 
 export interface MerchantTapResult {
-  /** Normalised across platforms: '00' approved, '05' declined, '06' failed pre-issuer, '99' pending, '91' issuer unavailable, '96' ambiguous, … */
+  /**
+   * The response code as reported for this tap. Branch on `status`, never on this: a `'06'`, `'68'`
+   * or `'96'` with `status: 'PENDING'` means the outcome is unknown and the sale must not be
+   * re-charged — it is not a failure. `'99'` is retired and never sent.
+   * Currently populated on Android only; the iOS bridge always sends `null`.
+   */
   responseCode: string | null;
   status: 'APPROVED' | 'DECLINED' | 'PENDING' | 'FAILED' | null;
   message: string | null;

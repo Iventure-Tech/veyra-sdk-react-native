@@ -67,6 +67,20 @@ const refusalListeners = (() => {
   };
 
   return {
+    /**
+     * Arm the native registration again for every card that still has a JS listener. Called
+     * after each `Veyra.initialize`: signing a customer out or switching customer drops every
+     * native registration, while JS listeners (a screen that stayed mounted) survive — without
+     * this they would never hear another refusal, because only a card's *first* listener arms.
+     */
+    rearm(): void {
+      for (const tokenUniqueReference of byToken.keys()) {
+        void nativeCall(() =>
+          VeyraNative.walletObservePaymentRefusals(tokenUniqueReference)
+        ).catch(() => {});
+      }
+    },
+
     add(
       tokenUniqueReference: string,
       listener: (r: WalletPaymentRefusal) => void
@@ -221,9 +235,11 @@ export const wallet = {
    * another's. That is the same ownership model the Android and iOS SDKs use, so an integration
    * reads the same on all three.
    *
-   * Two refusal shapes, and the difference matters — `requireOnline` means "connect and try
+   * Three refusal shapes, and the difference matters — `requireOnline` means "connect and try
    * again", which genuinely fixes it; `amountExceedCardLimit` means this card can never pay this
-   * much, so telling the payer to go online sends them round a loop that cannot succeed.
+   * much, so telling the payer to go online sends them round a loop that cannot succeed; and
+   * `deviceNotBound` means the card was added on another device (or before a reinstall) and must
+   * be added again on this phone.
    *
    * Fires on whatever rails the platform has: `TAP`, `CPM_QR` and `MPM_QR` on Android; the two QR
    * rails on iOS, which has no tap-to-pay. A refusal the SDK could not attribute to a card
@@ -404,3 +420,6 @@ export const wallet = {
     return nativeCall(() => VeyraNative.walletGetReceiptForTransaction(transactionHash));
   },
 };
+
+/** Module-internal (not exported from the package): re-arm per-card refusals after initialise. */
+export const rearmPaymentRefusalListeners = (): void => refusalListeners.rearm();

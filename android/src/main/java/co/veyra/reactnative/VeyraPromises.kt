@@ -39,6 +39,9 @@ internal object VeyraPromises {
                 "NO_NETWORK_CONNECTION" to t.errorCodeString
             t is co.veyra.common.net.VeyraNetworkException && message.contains("NO_NETWORK_CONNECTION") ->
                 "NO_NETWORK_CONNECTION" to null
+            // Refused before anything was sent (e.g. a blank merchantOrderId).
+            t is VeyraSdkException && t.errorCode == SdkErrorCode.INVALID_REQUEST ->
+                "INVALID_REQUEST" to t.errorCodeString
             t is VeyraSdkException ->
                 if (t.errorCode == SdkErrorCode.MISSING_MANDATORY_CONFIG) {
                     "MISSING_MANDATORY_CONFIG" to t.errorCodeString
@@ -50,6 +53,7 @@ internal object VeyraPromises {
             t is WalletRefusalException.AmountExceedsCardLimit -> "AMOUNT_EXCEEDS_CARD_LIMIT" to null
             t is WalletRefusalException.OnlineRequired -> "ONLINE_REQUIRED" to null
             t is WalletRefusalException.TokenNotActive -> "TOKEN_NOT_ACTIVE" to null
+            t is WalletRefusalException.DeviceNotBound -> "DEVICE_NOT_BOUND" to null
             // The CDCVM sheet the SDK raises itself. `CDCVM_REQUIRED` used to sit
             // here, meaning "the app forgot to authenticate" — it no longer exists, because the
             // SDK asks rather than refusing. These three are what a customer's answer produces,

@@ -43,7 +43,10 @@ class VeyraSdkReactNative: RCTEventEmitter {
     static let merchantStatus = "VeyraMerchantStatusEvent"
   }
 
+  /// Ready for calls: configured, with a customer signed in. False after `signOut`.
   private var initialized = false
+  /// Whether `initialize` ever succeeded — picks `NOT_SIGNED_IN` over `NOT_CONFIGURED`.
+  private var configuredOnce = false
   private var openSessionKind: String?
   private var tapSessions: [String: TapPaymentSession] = [:]
   private var mpmContexts: [String: VerifiedPayment] = [:]
@@ -78,6 +81,8 @@ class VeyraSdkReactNative: RCTEventEmitter {
     switch error {
     case VeyraWalletError.notConfigured, VeyraSoftPOSError.notConfigured, VeyraSDKError.notConfigured:
       return ("NOT_CONFIGURED", "Call Veyra.initialize first")
+    case VeyraWalletError.notSignedIn, VeyraSoftPOSError.notSignedIn:
+      return ("NOT_SIGNED_IN", "No customer is signed in — call Veyra.initialize with the customerId first")
     // both SDKs report the same condition under the same code, so JS branches on one
     // value whichever half of the SDK the call came from.
     case let VeyraWalletError.noNetworkConnection(message):
@@ -90,6 +95,8 @@ class VeyraSdkReactNative: RCTEventEmitter {
       return ("AMOUNT_EXCEEDS_CARD_LIMIT", message)
     case let VeyraWalletError.tokenNotActive(message):
       return ("TOKEN_NOT_ACTIVE", message)
+    case let VeyraWalletError.deviceNotBound(message):
+      return ("DEVICE_NOT_BOUND", message)
     case let VeyraWalletError.authenticationFailed(message):
       return (message.lowercased().contains("cancel") ? "AUTH_CANCELLED" : "AUTH_FAILED", message)
     case let VeyraWalletError.requestFailed(message):
@@ -98,6 +105,8 @@ class VeyraSdkReactNative: RCTEventEmitter {
       return ("REQUEST_FAILED", message)
     case let VeyraSoftPOSError.tapRefused(message):
       return ("MODE_REFUSED", message)
+    case let VeyraSoftPOSError.invalidRequest(message):
+      return ("INVALID_REQUEST", message)
     case let VeyraSoftPOSError.requestFailed(message):
       return ("REQUEST_FAILED", message)
     default:
@@ -106,7 +115,11 @@ class VeyraSdkReactNative: RCTEventEmitter {
   }
 
   private func rejectNotInitialized(_ rejecter: RCTPromiseRejectBlock) {
-    rejecter("NOT_CONFIGURED", "Call Veyra.initialize first", nil)
+    if configuredOnce {
+      rejecter("NOT_SIGNED_IN", "No customer is signed in — call Veyra.initialize with the customerId first", nil)
+    } else {
+      rejecter("NOT_CONFIGURED", "Call Veyra.initialize first", nil)
+    }
   }
 
   private func rejectValidation(_ rejecter: RCTPromiseRejectBlock, _ message: String) {
@@ -118,6 +131,9 @@ class VeyraSdkReactNative: RCTEventEmitter {
   @objc(initialize:resolver:rejecter:)
   func initialize(_ config: NSDictionary, resolver resolve: @escaping RCTPromiseResolveBlock,
                   rejecter reject: @escaping RCTPromiseRejectBlock) {
+    guard let customerID = config["customerId"] as? String,
+          !customerID.trimmingCharacters(in: .whitespaces).isEmpty
+    else { return rejectValidation(reject, "customerId is required") }
     guard let softposMap = config["softpos"] as? NSDictionary,
           let walletMap = config["wallet"] as? NSDictionary
     else { return rejectValidation(reject, "softpos and wallet configs are required") }
@@ -147,9 +163,27 @@ class VeyraSdkReactNative: RCTEventEmitter {
       allowedMerchantIDs: walletMap["allowedMerchantIds"] as? [String] ?? []
     )
 
-    VeyraSDK.configure(softpos: softpos, wallet: wallet)
+    VeyraSDK.configure(customerID: customerID, softpos: softpos, wallet: wallet)
     initialized = true
+    configuredOnce = true
+    // After every initialise: a switch of customer drops every observer registration.
     observeDeferredAnswers()
+    resolve(nil)
+  }
+
+  /// The customer has logged out: both SDKs stop everything they run for them and drop every
+  /// observer; their data stays on the device. Open tap sessions are cancelled and the payment
+  /// handles this bridge holds are dropped. Every data call rejects with `NOT_SIGNED_IN` until
+  /// the next `initialize`.
+  @objc(signOut:rejecter:)
+  func signOut(_ resolve: @escaping RCTPromiseResolveBlock,
+               rejecter rejecter: @escaping RCTPromiseRejectBlock) {
+    VeyraSDK.signOut()
+    tapSessions.values.forEach { $0.cancel() }
+    tapSessions.removeAll()
+    mpmContexts.removeAll()
+    cpmQrs.removeAll()
+    initialized = false
     resolve(nil)
   }
 
@@ -215,12 +249,23 @@ class VeyraSdkReactNative: RCTEventEmitter {
         "merchantName": resolution.merchantName,
       ])
     }
-    try? VeyraWallet.shared.tokenisation.observeCardKeyState { [weak self] tokenUniqueReference, requiresOnline in
-      self?.sendEvent(withName: EventName.cardKeyState, body: [
-        "tokenUniqueReference": tokenUniqueReference,
-        "requiresOnline": requiresOnline,
-      ])
-    }
+    try? VeyraWallet.shared.tokenisation.observeCardKeyState(
+      onKeyStateChanged: { [weak self] tokenUniqueReference, requiresOnline in
+        self?.sendEvent(withName: EventName.cardKeyState, body: [
+          "tokenUniqueReference": tokenUniqueReference,
+          "requiresOnline": requiresOnline,
+          "deviceNotBound": false,
+        ])
+      },
+      onDeviceNotBound: { [weak self] tokenUniqueReference in
+        // the backend will not re-key this card on this device: never "requires online".
+        self?.sendEvent(withName: EventName.cardKeyState, body: [
+          "tokenUniqueReference": tokenUniqueReference,
+          "requiresOnline": false,
+          "deviceNotBound": true,
+        ])
+      }
+    )
     try? VeyraSoftPOS.shared.merchant.onMerchantStatusChanged { [weak self] change in
       self?.sendEvent(withName: EventName.merchantStatus, body: [
         "merchantId": change.merchantID,
@@ -501,6 +546,7 @@ class VeyraSdkReactNative: RCTEventEmitter {
       "requiresActivation": card.requiresActivation,
       "activationMethods": NSNull(),
       "requiresOnline": card.requiresOnline,
+      "deviceNotBound": card.deviceNotBound,
     ]
   }
 
@@ -574,6 +620,16 @@ class VeyraSdkReactNative: RCTEventEmitter {
             "cardLimitMinorUnits": cardLimitMinorUnits ?? NSNull(),
             "rail": rail,
             "message": "AMOUNT_EXCEEDS_CARD_LIMIT: This amount is too large for this card — try a smaller amount, or another card",
+          ])
+        },
+        onDeviceNotBound: { [weak self] tokenUniqueReference, amountMinorUnits, rail in
+          self?.sendEvent(withName: EventName.paymentRefusal, body: [
+            "type": "deviceNotBound",
+            "tokenId": NSNull(),
+            "tokenUniqueReference": tokenUniqueReference ?? NSNull(),
+            "amountMinorUnits": amountMinorUnits,
+            "rail": rail,
+            "message": "DEVICE_NOT_BOUND: This card was added on another device — add it again on this phone to pay with it",
           ])
         }
       )
@@ -938,14 +994,6 @@ class VeyraSdkReactNative: RCTEventEmitter {
     resolve(VeyraSoftPOS.shared.merchant.stored.map(storedMerchantDict))
   }
 
-  @objc(merchantClearStored:rejecter:)
-  func merchantClearStored(_ resolve: @escaping RCTPromiseResolveBlock,
-                           rejecter rejecter: @escaping RCTPromiseRejectBlock) {
-    guard initialized else { return rejectNotInitialized(rejecter) }
-    VeyraSoftPOS.shared.merchant.clearStored()
-    resolve(nil)
-  }
-
   private func requireMerchantID(_ rejecter: RCTPromiseRejectBlock) -> String? {
     guard let merchantID = VeyraSoftPOS.shared.merchant.stored?.merchantID else {
       rejectValidation(rejecter, "No registered merchant — register first")
@@ -1037,7 +1085,10 @@ class VeyraSdkReactNative: RCTEventEmitter {
 
     let session = VeyraSoftPOS.shared.tap.session(
       amountMinorUnits: Int64(amount),
-      currencyCode: currencyCode
+      currencyCode: currencyCode,
+      // Required. Missing from untyped JS → blank → start() refuses it with
+      // INVALID_REQUEST. Until now this bridge never passed one, so no RN iOS tap carried it.
+      merchantOrderID: (request["merchantOrderId"] as? String) ?? ""
     ) { [weak self] event in
       guard let self else { return }
       var body: [String: Any] = ["sessionId": sessionId]
@@ -1118,7 +1169,7 @@ class VeyraSdkReactNative: RCTEventEmitter {
           onExpired: { [weak self] in
             self?.sendEvent(withName: EventName.qrExpired, body: ["scope": "merchant", "handle": NSNull()])
           },
-          merchantOrderID: merchantOrderId
+          merchantOrderID: merchantOrderId ?? ""
         )
         resolve(["txRef": context.txRef, "mpmPayload": context.mpmPayload, "expiry": context.expiry as Any])
       } catch { self.reject(rejecter, error) }
@@ -1182,7 +1233,7 @@ class VeyraSdkReactNative: RCTEventEmitter {
     Task {
       do {
         let outcome = try await VeyraSoftPOS.shared.payments
-          .chargeCustomerQr(scanned, merchantOrderID: merchantOrderId)
+          .chargeCustomerQr(scanned, merchantOrderID: merchantOrderId ?? "")
         resolve([
           "approved": outcome.approved,
           "responseCode": outcome.responseCode as Any,

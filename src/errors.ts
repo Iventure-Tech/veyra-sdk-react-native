@@ -6,6 +6,8 @@
 export type VeyraErrorCode =
   /** SDK not initialised — call Veyra.initialize first. */
   | 'NOT_CONFIGURED'
+  /** No customer is signed in (after Veyra.signOut) — call Veyra.initialize with the customerId. */
+  | 'NOT_SIGNED_IN'
   /** Method not available on this platform (e.g. wallet tap-to-pay on iOS). */
   | 'UNSUPPORTED_ON_PLATFORM'
   /**
@@ -23,6 +25,12 @@ export type VeyraErrorCode =
    */
   | 'AMOUNT_EXCEEDS_CARD_LIMIT'
   | 'TOKEN_NOT_ACTIVE'
+  /**
+   * The card was added on another device (or before this app was reinstalled) and cannot be
+   * issued payment keys here. Neither going online nor a smaller amount helps — ask the user to
+   * add the card again on this phone.
+   */
+  | 'DEVICE_NOT_BOUND'
   /**
    * The customer dismissed the device authentication sheet the SDK raised. Nothing was sent —
    * offer the payment again.
@@ -51,6 +59,11 @@ export type VeyraErrorCode =
    * itself in seconds; this one does not resolve until the user restores their connection.
    */
   | 'NO_NETWORK_CONNECTION'
+  /**
+   * Refused before anything was sent because an argument is invalid, e.g. a blank
+   * `merchantOrderId` (required on every merchant payment). Fix the call; there is no payment.
+   */
+  | 'INVALID_REQUEST'
   /** Network/backend failure. */
   | 'REQUEST_FAILED'
   /** Anything not otherwise classified; see message + nativeErrorCode. */
@@ -79,12 +92,14 @@ export class VeyraError extends Error {
 
 const KNOWN_CODES: ReadonlySet<string> = new Set<VeyraErrorCode>([
   'NOT_CONFIGURED',
+  'NOT_SIGNED_IN',
   'UNSUPPORTED_ON_PLATFORM',
   'SESSION_REQUIRED',
   'MODE_REFUSED',
   'ONLINE_REQUIRED',
   'AMOUNT_EXCEEDS_CARD_LIMIT',
   'TOKEN_NOT_ACTIVE',
+  'DEVICE_NOT_BOUND',
   'AUTH_CANCELLED',
   'AUTH_FAILED',
   'AUTH_UNAVAILABLE',
@@ -93,6 +108,7 @@ const KNOWN_CODES: ReadonlySet<string> = new Set<VeyraErrorCode>([
   'MISSING_MANDATORY_CONFIG',
   'VALIDATION',
   'NO_NETWORK_CONNECTION',
+  'INVALID_REQUEST',
   'REQUEST_FAILED',
   'UNKNOWN',
 ]);

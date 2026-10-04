@@ -45,7 +45,7 @@ public enum VeyraSDKError: Error, Sendable {
 /// the mode follows your payment activity by itself. `currentMode` is observe-only.
 ///
 /// ```swift
-/// VeyraSDK.configure(softpos: softposConfig, wallet: walletConfig)
+/// VeyraSDK.configure(customerID: signedInCustomer, softpos: softposConfig, wallet: walletConfig)
 /// ```
 public final class VeyraSDK: @unchecked Sendable {
 
@@ -56,19 +56,31 @@ public final class VeyraSDK: @unchecked Sendable {
 
     private init() {}
 
-    /// Configure the combined SDK: both member SDKs plus the exclusive-mode arbiter.
-    /// The process starts **inert** (`.none`); safe to call again (reconfigures, stays inert).
+    /// Configure the combined SDK for the customer your app has signed in: both member SDKs
+    /// plus the exclusive-mode arbiter. Call at every launch — the SDKs never remember who is
+    /// signed in. The process starts **inert** (`.none`); safe to call again (reconfigures,
+    /// stays inert). A different customer stops the previous customer's work in both SDKs.
+    ///
+    /// - Parameter customerID: The customer your app has authenticated. Never leaves the device.
     public static func configure(
+        customerID: String,
         softpos: VeyraSoftPOSConfiguration,
         wallet: VeyraWalletConfiguration
     ) {
         shared.lock.lock()
         defer { shared.lock.unlock() }
-        VeyraSoftPOS.configure(softpos)
-        VeyraWallet.configure(wallet)
+        VeyraSoftPOS.configure(softpos, customerID: customerID)
+        VeyraWallet.configure(wallet, customerID: customerID)
         VeyraSdkKmp.shared.configure()
         shared.installBackgroundInertGuard()
         shared.configured = true
+    }
+
+    /// The customer has logged out: both member SDKs stop everything they run for them and drop
+    /// every observer registration. Their cards, merchant and history stay on the device for when
+    /// they sign in again.
+    public static func signOut() {
+        CustomerSession.shared.signOut()
     }
 
     private var backgroundObserver: NSObjectProtocol?

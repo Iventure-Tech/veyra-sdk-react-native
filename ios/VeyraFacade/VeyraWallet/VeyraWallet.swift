@@ -182,6 +182,12 @@ public struct StoredCard: Sendable, Hashable, Identifiable {
     /// render the card greyed out / not tappable and prompt the user to connect.
     /// Derived fresh on every read; it clears on its own once a refresh succeeds.
     public let requiresOnline: Bool
+    /// True when this card was added on **another device** (or before this app was reinstalled)
+    /// and the Veyra backend will not issue it new payment keys here. It cannot pay on this phone
+    /// again: prompt the user to remove it and add it again. Going online does not help, so a card
+    /// in this state always reads `requiresOnline == false`; payments with it throw
+    /// `VeyraWalletError.deviceNotBound`.
+    public internal(set) var deviceNotBound: Bool = false
 
     public var id: String { tokenUniqueReference }
 }
@@ -656,8 +662,11 @@ public struct TransactionReceipt: Sendable, Hashable {
 
 /// Errors thrown by the Veyra wallet SDK.
 public enum VeyraWalletError: Error, Sendable {
-    /// `VeyraWallet.configure(_:)` has not been called.
+    /// `VeyraWallet.configure(_:customerID:)` has not been called.
     case notConfigured
+    /// No customer is signed in — `VeyraWallet.signOut()` was called. Call
+    /// `VeyraWallet.configure(_:customerID:)` with the customer to use the wallet again.
+    case notSignedIn
     /// A backend call failed; `message` carries the underlying description.
     case requestFailed(message: String)
     /// The device has **no working internet connection**, so the call never left it — ask the user
@@ -689,6 +698,11 @@ public enum VeyraWalletError: Error, Sendable {
     /// this does **not** resolve by going online — offer a smaller amount or another card;
     /// no payment was attempted.
     case amountExceedsCardLimit(message: String)
+    /// The card was added on another device (or before this app was reinstalled), and the Veyra
+    /// backend will not issue it payment keys on this one. Neither going online nor a smaller
+    /// amount helps — ask the user to remove the card and add it again on this phone; no payment
+    /// was attempted. The card reads `StoredCard.deviceNotBound == true`.
+    case deviceNotBound(message: String)
     /// Digitisation answered with a response code this SDK version does not recognise, so the
     /// token was **discarded**: nothing was provisioned and no card was added — even if the
     /// response carried complete token data. A token whose terms the SDK cannot interpret is
@@ -705,7 +719,9 @@ extension VeyraWalletError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .notConfigured:
-            return "VeyraWallet is not configured — call VeyraWallet.configure(_:) at launch."
+            return "VeyraWallet is not configured — call VeyraWallet.configure(_:customerID:) at launch."
+        case .notSignedIn:
+            return "No customer is signed in — call VeyraWallet.configure(_:customerID:) with the customer."
         case .requestFailed(let message):
             return message
         case .noNetworkConnection(let message):
@@ -722,17 +738,28 @@ extension VeyraWalletError: LocalizedError {
             return message
         case .amountExceedsCardLimit(let message):
             return message
+        case .deviceNotBound(let message):
+            return message
         case .unrecognisedResponseCode(let message):
             return message
         }
     }
 }
 
+/// The wallet's per-customer work, stopped and started by the shared customer session when a
+/// customer signs out or another signs in.
+private final class WalletCustomerWork: NSObject, CustomerSessionParticipant {
+    private unowned let owner: VeyraWallet
+    init(owner: VeyraWallet) { self.owner = owner }
+    func startCustomerWork() { owner.startCustomerWork() }
+    func stopCustomerWork() { owner.stopCustomerWork() }
+}
+
 /// Entry point of the Veyra wallet SDK on iOS.
 ///
 /// Configure once at launch, then use the service accessors:
 /// ```swift
-/// VeyraWallet.configure(.init(environment: .test, apiBaseURL: url, …))
+/// VeyraWallet.configure(.init(environment: .test, apiBaseURL: url, …), customerID: signedInCustomer)
 /// let banks = try await VeyraWallet.shared.tokenisation.banks()
 /// ```
 public final class VeyraWallet: @unchecked Sendable {
@@ -741,14 +768,64 @@ public final class VeyraWallet: @unchecked Sendable {
 
     private let lock = NSLock()
     private var kmp: WalletKmp?
+    // Kept so a sign-in can build the instance for whoever is signed in.
+    private var configuration: VeyraWalletConfiguration?
+    private lazy var customerWork = WalletCustomerWork(owner: self)
 
     private init() {}
 
-    /// Configure the SDK. Call once, before any service use (subsequent calls reconfigure).
-    public static func configure(_ configuration: VeyraWalletConfiguration) {
+    /// Configure the SDK for the customer your app has signed in. Call at every launch, before
+    /// any service use (subsequent calls reconfigure).
+    ///
+    /// Cards, keys, history and receipts are kept **per customer**, and the SDK never remembers
+    /// who is signed in, so `customerID` is required every time. The same customer again changes
+    /// nothing and downloads nothing; a different customer stops the previous customer's work and
+    /// opens the new customer's cards. Observer registrations are dropped on a switch — register
+    /// them again after this call. Call `signOut()` when a customer logs out.
+    ///
+    /// - Parameter customerID: The customer your app has authenticated. Never leaves the device.
+    public static func configure(_ configuration: VeyraWalletConfiguration, customerID: String) {
+        precondition(!customerID.trimmingCharacters(in: .whitespaces).isEmpty, "customerID must not be blank")
+        // Stop and drop the current instance (a reconfigure, or another customer), keep the
+        // configuration so a sign-in can build for whoever is signed in, then sign in: the
+        // session starts the work — this facade's [startCustomerWork] builds the instance.
         shared.lock.lock()
-        defer { shared.lock.unlock() }
-        shared.kmp = WalletKmp(
+        let previous = shared.kmp
+        shared.kmp = nil
+        shared.configuration = configuration
+        shared.lock.unlock()
+        previous?.stopCustomerWork()
+        CustomerSession.shared.register(participant: shared.customerWork)
+        CustomerSession.shared.signIn(customerId: customerID)
+    }
+
+    /// The customer has logged out: stop everything the wallet runs for them and drop every
+    /// observer registration. Their cards, keys, history and receipts stay on the device for when
+    /// they sign in again (nothing is downloaded then). Until the next `configure` every call
+    /// throws `VeyraWalletError.notSignedIn`.
+    public static func signOut() {
+        CustomerSession.shared.signOut()
+    }
+
+    /// Build the instance for the customer now signed in, if there is none.
+    fileprivate func startCustomerWork() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard kmp == nil, let configuration, CustomerScope.shared.isSignedIn else { return }
+        kmp = VeyraWallet.makeKmp(configuration)
+    }
+
+    /// Stop the instance's work and drop it: it is bound to the customer it was built for.
+    fileprivate func stopCustomerWork() {
+        lock.lock()
+        let current = kmp
+        kmp = nil
+        lock.unlock()
+        current?.stopCustomerWork()
+    }
+
+    private static func makeKmp(_ configuration: VeyraWalletConfiguration) -> WalletKmp {
+        WalletKmp(
             config: WalletKmpConfig(
                 environmentName: configuration.environment.rawValue,
                 clientId: configuration.clientID,
@@ -793,7 +870,9 @@ public final class VeyraWallet: @unchecked Sendable {
     fileprivate func requireKmp() throws -> WalletKmp {
         lock.lock()
         defer { lock.unlock() }
-        guard let kmp else { throw VeyraWalletError.notConfigured }
+        guard let kmp else {
+            throw configuration == nil ? VeyraWalletError.notConfigured : VeyraWalletError.notSignedIn
+        }
         return kmp
     }
 
@@ -904,7 +983,8 @@ public final class VeyraWallet: @unchecked Sendable {
                         status: $0.status,
                         requiresActivation: $0.requiresActivation,
                         isActive: $0.isActive,
-                        requiresOnline: $0.requiresOnline
+                        requiresOnline: $0.requiresOnline,
+                        deviceNotBound: $0.deviceNotBound
                     )
                 }
             }
@@ -921,13 +1001,6 @@ public final class VeyraWallet: @unchecked Sendable {
         public func setActiveToken(_ tokenUniqueReference: String) async throws {
             try await call { kmp in
                 try await kmp.setActiveToken(tokenUniqueReference: tokenUniqueReference)
-            }
-        }
-
-        /// Wipe every token and all SDK-held data from this device (local only).
-        public func wipeAll() async throws {
-            try await call { kmp in
-                try await kmp.wipeAll()
             }
         }
 
@@ -1049,7 +1122,12 @@ public final class VeyraWallet: @unchecked Sendable {
         ///   when it is known, and `nil` when it could not be read — omit the figure rather than
         ///   show a guess.
         ///
-        /// Both report **this payment**, not the card's state: `requiresOnline` on a card answers
+        /// - `onDeviceNotBound` (optional) — the card was added on another device (or before this
+        ///   app was reinstalled) and cannot be issued payment keys here. Neither going online nor
+        ///   a smaller amount helps: tell the payer to add the card again on this phone. Unlike the
+        ///   other two this *is* a card state — `StoredCard.deviceNotBound` reads `true` too.
+        ///
+        /// The first two report **this payment**, not the card's state: `requiresOnline` on a card answers
         /// the different question "can this card pay *anything* offline?" and stays `false` for a
         /// card that can still make smaller payments. Show a message about the payment that just
         /// failed; don't grey the card out on the strength of one refused amount.
@@ -1068,7 +1146,8 @@ public final class VeyraWallet: @unchecked Sendable {
         public func observePaymentRefusals(
             forTokenUniqueReference tokenUniqueReference: String,
             onRequireOnline: @escaping (_ tokenUniqueReference: String?, _ amountMinorUnits: Int64, _ rail: String) -> Void,
-            onAmountExceedsCardLimit: @escaping (_ tokenUniqueReference: String?, _ amountMinorUnits: Int64, _ cardLimitMinorUnits: Int64?, _ rail: String) -> Void
+            onAmountExceedsCardLimit: @escaping (_ tokenUniqueReference: String?, _ amountMinorUnits: Int64, _ cardLimitMinorUnits: Int64?, _ rail: String) -> Void,
+            onDeviceNotBound: ((_ tokenUniqueReference: String?, _ amountMinorUnits: Int64, _ rail: String) -> Void)? = nil
         ) throws {
             let kmp = try owner.requireKmp()
             kmp.observePaymentRefusals(
@@ -1083,6 +1162,9 @@ public final class VeyraWallet: @unchecked Sendable {
                         cardLimitMinorUnits?.int64Value,
                         rail
                     )
+                },
+                onDeviceNotBound: { tokenUniqueReference, amountMinorUnits, rail in
+                    onDeviceNotBound?(tokenUniqueReference, amountMinorUnits.int64Value, rail)
                 }
             )
         }
@@ -1204,14 +1286,27 @@ public final class VeyraWallet: @unchecked Sendable {
         /// Observation only: there is deliberately no API to trigger a key refresh. The SDK owns
         /// when keys are replenished.
         ///
+        /// **A card that can never be re-keyed here.** When the backend refuses this device payment
+        /// keys for a card — it was added on another device, or before this app was reinstalled —
+        /// the card stops being `requiresOnline` (going online cannot help) and becomes
+        /// `StoredCard.deviceNotBound`. When you pass `onDeviceNotBound`, it fires **instead of**
+        /// `onKeyStateChanged` for that change, with the card's reference: prompt the user to add
+        /// the card again. Without it, `onKeyStateChanged` reports `requiresOnline == false` — read
+        /// `deviceNotBound` from the card list before treating the card as payable.
+        ///
         /// Callbacks arrive on the main thread. Observing again replaces the previous observer;
         /// `stopObservingCardKeyState()` clears it.
         public func observeCardKeyState(
-            onKeyStateChanged: @escaping (_ tokenUniqueReference: String, _ requiresOnline: Bool) -> Void
+            onKeyStateChanged: @escaping (_ tokenUniqueReference: String, _ requiresOnline: Bool) -> Void,
+            onDeviceNotBound: ((_ tokenUniqueReference: String) -> Void)? = nil
         ) throws {
             let kmp = try owner.requireKmp()
-            kmp.observeCardKeyState { tokenUniqueReference, requiresOnline in
-                onKeyStateChanged(tokenUniqueReference, requiresOnline.boolValue)
+            kmp.observeCardKeyState { tokenUniqueReference, requiresOnline, deviceNotBound in
+                if deviceNotBound.boolValue, let onDeviceNotBound {
+                    onDeviceNotBound(tokenUniqueReference)
+                } else {
+                    onKeyStateChanged(tokenUniqueReference, requiresOnline.boolValue)
+                }
             }
         }
 
@@ -1543,6 +1638,12 @@ public final class VeyraWallet: @unchecked Sendable {
                 if message.contains("AMOUNT_EXCEEDS_CARD_LIMIT") {
                     throw VeyraWalletError.amountExceedsCardLimit(
                         message: "This amount is too large for this card — try a smaller amount, or another card")
+                }
+                // a card the backend will not re-key on this device: only adding it again helps,
+                // so it is distinct from both onlineRequired and amountExceedsCardLimit.
+                if message.contains("DEVICE_NOT_BOUND") {
+                    throw VeyraWalletError.deviceNotBound(
+                        message: "This card was added on another device — add it again on this phone to pay with it")
                 }
                 if message.contains("ONLINE_REQUIRED") {
                     throw VeyraWalletError.onlineRequired(

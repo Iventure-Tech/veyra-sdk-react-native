@@ -42,11 +42,6 @@ export const merchant = {
     return nativeCall(() => VeyraNative.merchantGetStored());
   },
 
-  /** Clears the locally stored merchant (does not deactivate server-side). */
-  clearStored(): Promise<void> {
-    return nativeCall(() => VeyraNative.merchantClearStored());
-  },
-
   /** Fetches the current status from the backend and updates the stored profile. */
   refreshStatus(): Promise<MerchantStatus | null> {
     return nativeCall(() => VeyraNative.merchantRefreshStatus());
@@ -94,18 +89,19 @@ export const merchant = {
    * qr-expired channel ({@link onQrExpired}).
    */
   /**
-   * @param merchantOrderId your own order/basket/invoice id for this sale (optional).
-   *   Stored by the gateway against the context and carried onto the transaction when the wallet's
+   * @param merchantOrderId your own order/basket/invoice id for this sale. **Required** and
+   *   non-blank — a blank one rejects with `INVALID_REQUEST` before anything is sent. Pass
+   *   `undefined` for `currency` to keep the default. Stored by the gateway against the context and carried onto the transaction when the wallet's
    *   push settles. Never validated for uniqueness and never a lookup key — the transaction
    *   reference is minted by the SDK and comes back on the settled row.
    */
   createPaymentContext(
     amountMinorUnits: number,
-    currency = '566',
-    merchantOrderId: string | null = null
+    currency: string | undefined = '566',
+    merchantOrderId: string
   ): Promise<PaymentContextQr> {
     return nativeCall(() =>
-      VeyraNative.merchantCreatePaymentContext(amountMinorUnits, currency, merchantOrderId)
+      VeyraNative.merchantCreatePaymentContext(amountMinorUnits, currency ?? '566', merchantOrderId)
     );
   },
 
@@ -133,7 +129,8 @@ export const merchant = {
   /**
    * Charges an inspected customer QR.
    *
-   * @param merchantOrderId your own order/basket/invoice id for this sale (optional). The SDK
+   * @param merchantOrderId your own order/basket/invoice id for this sale. **Required** and
+   *   non-blank — a blank one rejects with `INVALID_REQUEST` before anything is sent. The SDK
    *   mints the transaction reference itself — the gateway makes `(merchantId, reference)` unique
    *   and only the SDK can promise that — and returns it on the outcome. This is the field for
    *   *your* identifier: it is never used as a key, so you may reuse it across the attempts of one
@@ -141,7 +138,7 @@ export const merchant = {
    */
   chargeCustomerQr(
     handle: string,
-    merchantOrderId: string | null = null
+    merchantOrderId: string
   ): Promise<CustomerQrChargeOutcome> {
     return nativeCall(() =>
       VeyraNative.merchantChargeCustomerQr(handle, merchantOrderId)

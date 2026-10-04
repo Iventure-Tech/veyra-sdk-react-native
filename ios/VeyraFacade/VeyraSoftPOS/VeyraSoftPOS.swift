@@ -553,8 +553,11 @@ public struct MerchantReceipt: Sendable, Hashable {
 
 /// Errors thrown by the Veyra SoftPOS SDK.
 public enum VeyraSoftPOSError: Error, Sendable {
-    /// `VeyraSoftPOS.configure(_:)` has not been called.
+    /// `VeyraSoftPOS.configure(_:customerID:)` has not been called.
     case notConfigured
+    /// No customer is signed in — `VeyraSoftPOS.signOut()` was called. Call
+    /// `VeyraSoftPOS.configure(_:customerID:)` with the customer to accept payments again.
+    case notSignedIn
     /// A backend call failed; `message` carries the underlying description.
     case requestFailed(message: String)
     /// Arming the tap reader was refused — the wallet's payment is mid-flight, or the
@@ -569,6 +572,11 @@ public enum VeyraSoftPOSError: Error, Sendable {
     /// (`ISSUER_SWITCH_NOT_AVAILABLE`) means the SDK *did* reach the network and was refused — a
     /// different situation with different advice, and the two must stay distinguishable.
     case noNetworkConnection(message: String)
+    /// The call was refused before anything was sent because an argument is invalid — for
+    /// example a blank `merchantOrderID`, which every payment requires. Fix the call; there is
+    /// no payment, response code or transaction to look up. The Android SDK reports the same
+    /// condition as `SdkErrorCode.INVALID_REQUEST`.
+    case invalidRequest(message: String)
 }
 
 // Without `LocalizedError`, `error.localizedDescription` renders the useless "The operation
@@ -579,12 +587,16 @@ extension VeyraSoftPOSError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .notConfigured:
-            return "VeyraSoftPOS is not configured — call VeyraSoftPOS.configure(_:) at launch."
+            return "VeyraSoftPOS is not configured — call VeyraSoftPOS.configure(_:customerID:) at launch."
+        case .notSignedIn:
+            return "No customer is signed in — call VeyraSoftPOS.configure(_:customerID:) with the customer."
         case .requestFailed(let message):
             return message
         case .tapRefused(let message):
             return message
         case .noNetworkConnection(let message):
+            return message
+        case .invalidRequest(let message):
             return message
         }
     }
@@ -594,49 +606,112 @@ extension VeyraSoftPOSError: LocalizedError {
 ///
 /// Configure once at launch, then use the service accessors:
 /// ```swift
-/// VeyraSoftPOS.configure(.init(environment: .test, apiBaseURL: url, …))
+/// VeyraSoftPOS.configure(.init(environment: .test, apiBaseURL: url, …), customerID: signedInCustomer)
 /// let status = try await VeyraSoftPOS.shared.merchant.status(merchantID: id)
 /// ```
+/// The SoftPOS SDK's per-customer work, stopped and started by the shared customer session when
+/// a customer signs out or another signs in.
+private final class SoftposCustomerWork: NSObject, CustomerSessionParticipant {
+    private unowned let owner: VeyraSoftPOS
+    init(owner: VeyraSoftPOS) { self.owner = owner }
+    func startCustomerWork() { owner.startCustomerWork() }
+    func stopCustomerWork() { owner.stopCustomerWork() }
+}
+
 public final class VeyraSoftPOS: @unchecked Sendable {
 
     public static let shared = VeyraSoftPOS()
 
     private let lock = NSLock()
     private var kmp: SoftposKmp?
-    private var merchantStorage: MerchantStorage = FileMerchantStorage()
+    // The current customer's merchant store, rebuilt at every configure (one store per
+    // customer); none until a customer is signed in.
+    private var merchantStorage: MerchantStorage = NoCustomerMerchantStorage()
     // The provider credential from the configuration — sent on merchant
     // register/update so the gateway can resolve the acquirer id and MCC.
     fileprivate var paymentAppProviderID: String = ""
+    // Kept so a sign-in can build the instance for whoever is signed in.
+    private var configuration: VeyraSoftPOSConfiguration?
+    private lazy var customerWork = SoftposCustomerWork(owner: self)
 
     private init() {}
 
-    /// Configure the SDK. Call once, before any service use (subsequent calls reconfigure).
-    public static func configure(_ configuration: VeyraSoftPOSConfiguration) {
-        // Scoped rather than `defer`-ed: the merchant-status watch below must be armed *outside*
-        // the lock, because it reads stored-merchant state through `withMerchantStorage`, which
-        // takes this same non-reentrant lock. A `defer` that unlocks at function exit would
-        // deadlock the first configure on a device with a registered merchant.
-        do {
-            shared.lock.lock()
-            defer { shared.lock.unlock() }
-            shared.paymentAppProviderID = configuration.paymentAppProviderID
-            shared.kmp = SoftposKmp(
-                config: SoftposKmpConfig(
-                    environmentName: configuration.environment.rawValue,
-                    clientId: configuration.clientID,
-                    clientSecret: configuration.clientSecret,
-                    // Internal plumbing, not developer API: nil selects the SDK's
-                    // environment-resolved defaults. ObjC-exported initializers carry no
-                    // default arguments, so these parameters must be passed explicitly.
-                    localBaseUrlOverride: nil,
-                    remoteLogsUrlOverride: nil
-                )
-            )
+    /// Configure the SDK for the customer your app has signed in. Call at every launch, before
+    /// any service use (subsequent calls reconfigure).
+    ///
+    /// The merchant and its transactions are kept **per customer**, and the SDK never remembers
+    /// who is signed in, so `customerID` is required every time. The same customer again changes
+    /// nothing; a different customer stops the previous customer's watches and opens the new
+    /// customer's merchant. Observer registrations are dropped on a switch — register them again
+    /// after this call. Call `signOut()` when a customer logs out.
+    ///
+    /// - Parameter customerID: The customer your app has authenticated. Never leaves the device.
+    public static func configure(_ configuration: VeyraSoftPOSConfiguration, customerID: String) {
+        precondition(!customerID.trimmingCharacters(in: .whitespaces).isEmpty, "customerID must not be blank")
+        // Stores from before customers were partitioned belong to nobody: erased, never inherited.
+        FileMerchantStorage.eraseUnpartitionedStores()
+        // Stop and drop the current instance (a reconfigure, or another customer), keep the
+        // configuration, then sign in: the session's start builds the instance and the merchant
+        // store for whoever is signed in, and arms the merchant's watches ([startCustomerWork]).
+        shared.lock.lock()
+        let previous = shared.kmp
+        shared.kmp = nil
+        shared.merchantStorage = NoCustomerMerchantStorage()
+        shared.configuration = configuration
+        shared.paymentAppProviderID = configuration.paymentAppProviderID
+        shared.lock.unlock()
+        previous?.stopCustomerWork()
+        CustomerSession.shared.register(participant: shared.customerWork)
+        CustomerSession.shared.signIn(customerId: customerID)
+    }
+
+    /// The customer has logged out: stop every merchant watch and drop every observer
+    /// registration. Their merchant and transactions stay on the device for when they sign in
+    /// again. Until the next `configure` every call throws `VeyraSoftPOSError.notSignedIn`.
+    public static func signOut() {
+        CustomerSession.shared.signOut()
+    }
+
+    /// Build the instance and merchant store for the customer now signed in, if there are none,
+    /// and arm the merchant's watches (app-scoped, §16: the case that matters most is a merchant
+    /// deactivated while the app was shut). Outside the lock: the watches read the stored
+    /// merchant through `withMerchantStorage`, which takes this same non-reentrant lock.
+    fileprivate func startCustomerWork() {
+        lock.lock()
+        guard kmp == nil, let configuration, let partition = CustomerScope.shared.currentPartition else {
+            lock.unlock()
+            return
         }
-        // Arm the merchant-status watch at configure. Unconditional and app-scoped — there is no
-        // event that "starts" interest in the merchant's status, only a merchant that already has
-        // one, and the case that matters most is a merchant deactivated while the app was shut.
-        shared.startMerchantStatusWatchIfRegistered()
+        merchantStorage = FileMerchantStorage(partition: partition)
+        kmp = VeyraSoftPOS.makeKmp(configuration)
+        lock.unlock()
+        startMerchantWatchesIfRegistered()
+    }
+
+    /// Stop the instance's work and drop it with the merchant store: both are bound to the
+    /// customer they were built for.
+    fileprivate func stopCustomerWork() {
+        lock.lock()
+        let current = kmp
+        kmp = nil
+        merchantStorage = NoCustomerMerchantStorage()
+        lock.unlock()
+        current?.stopCustomerWork()
+    }
+
+    private static func makeKmp(_ configuration: VeyraSoftPOSConfiguration) -> SoftposKmp {
+        SoftposKmp(
+            config: SoftposKmpConfig(
+                environmentName: configuration.environment.rawValue,
+                clientId: configuration.clientID,
+                clientSecret: configuration.clientSecret,
+                // Internal plumbing, not developer API: nil selects the SDK's
+                // environment-resolved defaults. ObjC-exported initializers carry no
+                // default arguments, so these parameters must be passed explicitly.
+                localBaseUrlOverride: nil,
+                remoteLogsUrlOverride: nil
+            )
+        )
     }
 
     /// Merchant lifecycle — registration, status, activate/deactivate, profile update, banks.
@@ -657,7 +732,9 @@ public final class VeyraSoftPOS: @unchecked Sendable {
     fileprivate func requireKmp() throws -> SoftposKmp {
         lock.lock()
         defer { lock.unlock() }
-        guard let kmp else { throw VeyraSoftPOSError.notConfigured }
+        guard let kmp else {
+            throw configuration == nil ? VeyraSoftPOSError.notConfigured : VeyraSoftPOSError.notSignedIn
+        }
         return kmp
     }
 
@@ -676,11 +753,15 @@ public final class VeyraSoftPOS: @unchecked Sendable {
                 throw VeyraSoftPOSError.noNetworkConnection(
                     message: "No internet connection — connect to the internet and try again")
             }
+            // The shared validation rule prefixes its message with the code; nothing was sent.
+            if message.hasPrefix("INVALID_REQUEST") {
+                throw VeyraSoftPOSError.invalidRequest(message: message)
+            }
             throw VeyraSoftPOSError.requestFailed(message: message)
         }
     }
 
-    // Stored-merchant plumbing — SDK-owned Keychain persistence, the iOS twin of
+    // Stored-merchant plumbing — SDK-owned file persistence (`FileMerchantStorage`), the iOS twin of
     // Android's MerchantDataStore. Internal (not fileprivate) so tests can drive it directly.
 
     private func withMerchantStorage<T>(_ body: (MerchantStorage) -> T) -> T {
@@ -718,10 +799,6 @@ public final class VeyraSoftPOS: @unchecked Sendable {
         withMerchantStorage { $0.save(merchant) }
     }
 
-    internal func clearStoredMerchant() {
-        withMerchantStorage { $0.clear() }
-    }
-
     /// Refresh the stored status; a response for a different merchant leaves storage untouched.
     ///
     /// This is iOS's **single fire site** for the merchant-status observer — the twin of Android's
@@ -731,33 +808,49 @@ public final class VeyraSoftPOS: @unchecked Sendable {
     /// Kotlin rule decides whether anything actually changed, so the two platforms cannot disagree
     /// about what counts as a change.
     internal func updateStoredMerchantStatus(merchantID: String, status: String?) {
-        let previous: String? = withMerchantStorage { storage in
+        // Outer nil: nothing was written. Inner: the status the stored merchant had before.
+        let written: String?? = withMerchantStorage { storage in
             guard let stored = storage.load(), stored.merchantID == merchantID else { return nil }
             let was = stored.merchantStatus
             storage.save(stored.updatingStatus(status))
-            return was
+            return .some(was)
         }
         // No stored merchant, or a response for a different one — nothing was written, so there is
-        // nothing to announce. `status` nil means "not stated", which is not a change to report.
-        guard let status, let kmp = try? requireKmp() else { return }
+        // nothing to announce. This guard once tested only `status`, so an answer for a
+        // logged-out merchant reached the observer as `nil → ACTIVE` — a "change" — on every poll.
+        // `status` nil means "not stated", which is not a change to report either.
+        guard case .some(let previous) = written, let status, let kmp = try? requireKmp() else { return }
         kmp.notifyMerchantStatusChanged(merchantId: merchantID, previousStatus: previous, newStatus: status)
     }
 
-    /// Start the SDK-owned merchant-status watch for the stored merchant, if there is one.
+    /// Start the SDK-owned merchant watches for the stored merchant, if there is one: the status
+    /// poll, the pending-outcome and credit sweeps, and the MPM settle watches.
     ///
     /// §16: the SDK owns the waiting and the app process is its scope. Called at `configure` and
-    /// after a successful registration — never by a screen, and never stopped by one. Before this,
-    /// iOS had no merchant-status polling at all: a merchant deactivated mid-session stayed
-    /// "active" on the device until a host happened to ask.
-    internal func startMerchantStatusWatchIfRegistered() {
+    /// after a successful registration — never by a screen, and never stopped by one; `signOut`
+    /// (or another customer signing in) stops them. They never run while no merchant is stored.
+    internal func startMerchantWatchesIfRegistered() {
         guard let merchant = loadStoredMerchant(), let kmp = try? requireKmp() else { return }
-        kmp.startMerchantStatusWatch(
+        kmp.startMerchantWatches(
             merchantId: merchant.merchantID,
             intervalSeconds: Int64(Self.merchantStatusWatchIntervalSeconds)
         ) { [weak self] status in
-            // Land it in the Keychain, which is what fires the observer (above).
+            // Land it in the stored merchant, which is what fires the observer (above).
             self?.updateStoredMerchantStatus(merchantID: merchant.merchantID, status: status)
         }
+    }
+
+    /// Names of the merchant watches running — test support.
+    internal func activeMerchantWatches() -> [String] {
+        (try? requireKmp())?.activeMerchantWatches() ?? []
+    }
+
+    /// Test hook: the current instance, so a test can check the instance that *was* running
+    /// after a sign-out drops it.
+    internal var currentKmpForTesting: SoftposKmp? {
+        lock.lock()
+        defer { lock.unlock() }
+        return kmp
     }
 
     /// How often the merchant-status watch asks, in seconds. Matches the Android scheduler's
@@ -782,7 +875,7 @@ public final class VeyraSoftPOS: @unchecked Sendable {
         }
     }
 
-    /// Test hook: swap the Keychain for an in-memory store.
+    /// Test hook: swap the file store for an in-memory store.
     internal func replaceMerchantStorage(_ storage: MerchantStorage) {
         lock.lock()
         defer { lock.unlock() }
@@ -794,8 +887,8 @@ public final class VeyraSoftPOS: @unchecked Sendable {
         fileprivate let owner: VeyraSoftPOS
 
         /// The merchant persisted on this device by the last successful `register(_:)`, if any.
-        /// SDK-owned storage (Keychain) — survives app restarts. Mirrors Android's
-        /// `merchantService.getStoredMerchantData()`.
+        /// SDK-owned storage (protected sandbox file) — survives app restarts, cleared on
+        /// uninstall. Mirrors Android's `merchantService.getStoredMerchantData()`.
         public var stored: StoredMerchant? { owner.loadStoredMerchant() }
 
         /// True when a merchant is registered on this device with every transaction-required
@@ -803,9 +896,6 @@ public final class VeyraSoftPOS: @unchecked Sendable {
         /// registration UI on this — mirrors Android's `merchantService.isRegistered()`.
         public var isRegistered: Bool { owner.loadStoredMerchant()?.isTransactionReady ?? false }
 
-        /// Clear the stored merchant (e.g. logout or re-registration). Mirrors Android's
-        /// `merchantService.clearStoredMerchant()`.
-        public func clearStored() { owner.clearStoredMerchant() }
 
         /// Fetch the NUBAN settlement banks.
         public func banks() async throws -> [SettlementBank] {
@@ -861,7 +951,7 @@ public final class VeyraSoftPOS: @unchecked Sendable {
                     // activation moment — a merchant registered as PENDING and activated minutes
                     // later is exactly the transition the app is waiting on, and before this the
                     // only way to see it was to keep asking.
-                    owner.startMerchantStatusWatchIfRegistered()
+                    owner.startMerchantWatchesIfRegistered()
                 }
                 return MerchantRegistrationResult(
                     success: r.success,
@@ -1230,7 +1320,7 @@ public final class VeyraSoftPOS: @unchecked Sendable {
 
         /// Build the receipt for one transaction: display fields plus a
         /// `qrPayload` JSON scannable by the wallet's receipt scanner. The registered merchant's
-        /// name/address (Keychain-stored) are folded in. Nil when the reference is unknown.
+        /// name/address (SDK-stored) are folded in. Nil when the reference is unknown.
         public func receipt(forReference reference: String) async throws -> MerchantReceipt? {
             let merchant = owner.loadStoredMerchant()
             let name = merchant?.merchantName ?? ""
@@ -1271,15 +1361,16 @@ public final class VeyraSoftPOS: @unchecked Sendable {
         /// once lapsed. The SDK owns the timer: a new `createContext` supersedes it, and
         /// `cancelQrExpiry()` stops it (call on teardown). Omit to keep the old behaviour.
         /// - Parameter merchantOrderID: your own order/basket/invoice id for the sale this QR
-        ///   represents (optional). The gateway stores it on the context and copies it onto the
-        ///   settled payment, reading it from its own stored context rather than from the payload
-        ///   the paying wallet echoes back.
+        ///   represents. **Required** and non-blank — a blank one throws
+        ///   `VeyraSoftPOSError.invalidRequest` before anything is sent. The gateway stores it on
+        ///   the context and copies it onto the settled payment, reading it from its own stored
+        ///   context rather than from the payload the paying wallet echoes back.
         public func createContext(
             merchantID: String,
             amountMinorUnits: Int64,
             currency: String,
             onExpired: (() -> Void)? = nil,
-            merchantOrderID: String? = nil
+            merchantOrderID: String
         ) async throws -> PaymentContextQR {
             try await owner.call { kmp in
                 let created = try await kmp.createContextPayment(
@@ -1338,13 +1429,14 @@ public final class VeyraSoftPOS: @unchecked Sendable {
         /// Charge a merchant-confirmed scanned customer QR over the standard payment rail,
         /// synchronously. The amount charged is the QR's own (cryptogram-bound) amount — a
         /// tampered payload or a different amount declines at the token provider.
-        /// - Parameter merchantOrderID: your own order/basket/invoice id for this sale (optional).
-        ///   The SDK mints the transaction reference itself; this is the field for *your*
-        ///   identifier, and unlike the reference it is never used as a key, so you may reuse it
-        ///   across the attempts of one sale.
+        /// - Parameter merchantOrderID: your own order/basket/invoice id for this sale.
+        ///   **Required** and non-blank — a blank one throws `VeyraSoftPOSError.invalidRequest`
+        ///   before anything is sent. The SDK mints the transaction reference itself; this is the
+        ///   field for *your* identifier, and unlike the reference it is never used as a key, so
+        ///   you may reuse it across the attempts of one sale.
         public func chargeCustomerQr(
             _ scanned: ScannedCustomerQr,
-            merchantOrderID: String? = nil
+            merchantOrderID: String
         ) async throws -> CustomerQrChargeOutcome {
             return try await owner.call { kmp in
                 // Apply the registered merchant so the /payment request carries
@@ -1379,9 +1471,15 @@ public final class VeyraSoftPOS: @unchecked Sendable {
         /// Create a tap session for one sale (arm with `start()`, tear down with `cancel()`).
         /// Events are delivered on the main queue. `currencyCode` is ISO 4217 numeric
         /// (defaults to 566, NGN); `amountMinorUnits` is kobo for NGN.
+        /// - Parameter merchantOrderID: your own order/basket/invoice id for this sale.
+        ///   **Required** and non-blank — `start()` throws `VeyraSoftPOSError.invalidRequest` for a
+        ///   blank one before the reader arms. Sent with the payment, stored on the transaction,
+        ///   and shown on both sides' history. Never a lookup key, and it may repeat across
+        ///   attempts of one sale.
         public func session(
             amountMinorUnits: Int64,
             currencyCode: Int32 = 566,
+            merchantOrderID: String,
             onEvent: @escaping @Sendable (TapPaymentEvent) -> Void
         ) -> TapPaymentSession {
             // Enrich the tap with the registered merchant so 9F4E/9F15/DF0E/DF0F carry real
@@ -1391,6 +1489,7 @@ public final class VeyraSoftPOS: @unchecked Sendable {
                 amountMinorUnits: amountMinorUnits,
                 currencyCode: currencyCode,
                 merchant: merchant,
+                merchantOrderID: merchantOrderID,
                 kmp: try? owner.requireKmp(),
                 onEvent: onEvent
             )
@@ -1496,6 +1595,7 @@ public final class TapPaymentSession: @unchecked Sendable {
         amountMinorUnits: Int64,
         currencyCode: Int32,
         merchant: TapMerchant?,
+        merchantOrderID: String,
         kmp: SoftposKmp?,
         onEvent: @escaping @Sendable (TapPaymentEvent) -> Void
     ) {
@@ -1517,17 +1617,23 @@ public final class TapPaymentSession: @unchecked Sendable {
             events: bridge,
             aidHex: IosTapAcceptance.companion.VEYRA_AID_HEX,
             merchant: merchant,
-            paymentProcessing: paymentProcessing
+            paymentProcessing: paymentProcessing,
+            merchantOrderId: merchantOrderID
         )
     }
 
     /// Arm the reader (claims SOFTPOS at the point of use, like Android's `makeCardPayment`).
-    /// - Throws: `VeyraSoftPOSError.tapRefused` when the exclusive-mode claim is refused.
+    /// - Throws: `VeyraSoftPOSError.invalidRequest` when `merchantOrderID` is blank (nothing is
+    ///   armed); `VeyraSoftPOSError.tapRefused` when the exclusive-mode claim is refused.
     public func start() throws {
         do {
             try kotlin.start()
         } catch {
-            throw VeyraSoftPOSError.tapRefused(message: error.localizedDescription)
+            let message = error.localizedDescription
+            if message.hasPrefix("INVALID_REQUEST") {
+                throw VeyraSoftPOSError.invalidRequest(message: message)
+            }
+            throw VeyraSoftPOSError.tapRefused(message: message)
         }
     }
 

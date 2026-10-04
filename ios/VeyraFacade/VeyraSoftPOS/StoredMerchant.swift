@@ -5,8 +5,10 @@
 // file (moved off the Keychain so it is cleared on uninstall, not carried over) so
 // it survives app restarts, and apps gate on merchant.isRegistered instead of re-registering.
 // Status/activate/deactivate/update responses keep the stored copy current.
+import CryptoKit
 import Foundation
 import Security
+import VeyraKMP
 
 /// The merchant registered from this device, as persisted by the SDK after a successful
 /// `VeyraSoftPOS.Merchant.register(_:)` (mirrors Android `StoredMerchantData`).
@@ -184,7 +186,7 @@ extension StoredMerchant {
     }
 }
 
-/// Persistence seam for the stored merchant (Keychain in production; in-memory in tests).
+/// Persistence seam for the stored merchant (protected sandbox file in production; in-memory in tests).
 protocol MerchantStorage {
     func load() -> StoredMerchant?
     func save(_ merchant: StoredMerchant)
@@ -192,47 +194,153 @@ protocol MerchantStorage {
 }
 
 /// File-backed storage in the app's Application Support directory — the replacement for
-/// the legacy `KeychainMerchantStorage`.
+/// the legacy Keychain store (`LegacyKeychainMerchantStorage`).
 ///
 /// The merchant registration is **profile data, not an auth secret**, so the Keychain was the
 /// wrong medium: Keychain items survive app deletion, so an uninstalled merchant silently came
-/// back on reinstall. A protected file in the app sandbox is removed on uninstall —
-/// the SDK guaranteeing "uninstall = clean state" without any app-developer action. The payload
-/// still includes the BVN, so the file is written with Data Protection
-/// (`completeUntilFirstUnlock`, matching the old Keychain accessibility and the softpos
-/// `FilePersistentStore`); it never goes to UserDefaults.
+/// back on reinstall. A file in the app sandbox is removed on uninstall — the SDK guaranteeing
+/// "uninstall = clean state" without any app-developer action. It never goes to UserDefaults.
 ///
-/// On first use it deletes the legacy Keychain item once (clean-slate migration — the old
-/// registration is wiped, not carried over).
+/// The payload carries the BVN, so the file is:
+/// - **encrypted** with AES-GCM under a 256-bit key held in the Keychain
+///   ([KeychainMerchantKeyStore], `AfterFirstUnlockThisDeviceOnly`). Only the key lives in the
+///   Keychain: one that outlives an uninstall decrypts nothing, because the file is gone.
+/// - **excluded from backup**, so it never reaches iCloud or a (possibly unencrypted) Finder
+///   backup — the same never-leaves-the-device posture the old `ThisDeviceOnly` item had.
+/// - written with Data Protection (`completeUntilFirstUserAuthentication`) as well.
+///
+/// Fail-closed: without a key the merchant is not written at all — never in clear.
+///
+/// One file per customer: `stored-merchant__c_<partition>.enc`, the partition coming from the
+/// shared customer scope, so customer B never reads customer A's merchant. With nobody signed
+/// in the SDK holds a [NoCustomerMerchantStorage] instead: no merchant, and writes are dropped.
+/// The Keychain key is install-level and shared — it encrypts each customer's file.
+///
+/// [eraseUnpartitionedStores] deletes what earlier SDK versions left — the legacy Keychain item
+/// and the unpartitioned `stored-merchant.json` / `stored-merchant.enc` — so no customer
+/// inherits a merchant registered before customers were partitioned.
 final class FileMerchantStorage: MerchantStorage {
-    private let fileURL: URL
+    static let defaultDirectoryName = "co.veyra.softpos"
+    private static let baseName = "stored-merchant"
 
-    init() {
-        let base = (try? FileManager.default.url(
-            for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true))
-            ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        let dir = base.appendingPathComponent("co.veyra.softpos", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        fileURL = dir.appendingPathComponent("stored-merchant.json")
-        // one-time wipe of the legacy Keychain merchant (which would otherwise survive
-        // uninstall). Clean slate — the old value is discarded, not migrated.
-        LegacyKeychainMerchantStorage().clear()
+    private let fileURL: URL
+    private let keyStore: MerchantKeyStore
+
+    init(partition: String,
+         keyStore: MerchantKeyStore = KeychainMerchantKeyStore(),
+         directoryName: String = FileMerchantStorage.defaultDirectoryName) {
+        self.keyStore = keyStore
+        let dir = FileMerchantStorage.directory(directoryName)
+        let name = CustomerScope.shared.scopedName(baseName: FileMerchantStorage.baseName, partition: partition)
+        fileURL = dir.appendingPathComponent("\(name).enc")
     }
 
     func load() -> StoredMerchant? {
-        guard let data = try? Data(contentsOf: fileURL) else { return nil }
+        guard let sealed = try? Data(contentsOf: fileURL),
+              let key = keyStore.existingKey(),
+              let box = try? AES.GCM.SealedBox(combined: sealed),
+              let data = try? AES.GCM.open(box, using: key) else { return nil }
         return try? JSONDecoder().decode(StoredMerchant.self, from: data)
     }
 
     func save(_ merchant: StoredMerchant) {
-        guard let data = try? JSONEncoder().encode(merchant) else { return }
+        guard let data = try? JSONEncoder().encode(merchant),
+              let key = keyStore.key(),
+              let sealed = try? AES.GCM.seal(data, using: key).combined else { return }
         // completeUntilFirstUserAuthentication = the file equivalent of the old Keychain's
         // kSecAttrAccessibleAfterFirstUnlock (readable after the first unlock post-boot).
-        try? data.write(to: fileURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        guard (try? sealed.write(to: fileURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])) != nil
+        else { return }
+        // An atomic write replaces the file, dropping resource values — re-mark it every time.
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        var url = fileURL
+        try? url.setResourceValues(values)
     }
 
     func clear() {
         try? FileManager.default.removeItem(at: fileURL)
+    }
+
+    /// Delete every merchant store that belongs to no customer: the legacy Keychain item (which
+    /// would otherwise survive uninstall) and the unpartitioned files earlier SDK versions wrote.
+    /// Erased, never migrated. Idempotent, so it is safe on every configure.
+    static func eraseUnpartitionedStores(directoryName: String = defaultDirectoryName) {
+        LegacyKeychainMerchantStorage().clear()
+        let dir = directory(directoryName)
+        for name in ["\(baseName).json", "\(baseName).enc"] {
+            try? FileManager.default.removeItem(at: dir.appendingPathComponent(name))
+        }
+    }
+
+    private static func directory(_ name: String) -> URL {
+        let base = (try? FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true))
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        let dir = base.appendingPathComponent(name, isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+}
+
+/// The merchant store with nobody signed in: holds nothing and keeps nothing, so a write
+/// never lands where the next customer would see it.
+final class NoCustomerMerchantStorage: MerchantStorage {
+    func load() -> StoredMerchant? { nil }
+    func save(_ merchant: StoredMerchant) {}
+    func clear() {}
+}
+
+/// Source of the stored-merchant encryption key (Keychain in production; in-memory in tests,
+/// where the hostless xctest runner has no Keychain entitlement).
+protocol MerchantKeyStore {
+    /// The key if one exists — never creates one (a read must not mint a key it can't use).
+    func existingKey() -> SymmetricKey?
+    /// The existing key, or a newly generated and persisted one; nil if it can't be persisted.
+    func key() -> SymmetricKey?
+}
+
+/// The stored-merchant AES-256 key as a Keychain generic password,
+/// `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`: readable whenever the protected file
+/// is, never synced or restored to another device.
+final class KeychainMerchantKeyStore: MerchantKeyStore {
+    private let service = "co.veyra.softpos"
+    private let account = "stored-merchant-key"
+
+    private var baseQuery: [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+    }
+
+    func existingKey() -> SymmetricKey? {
+        var query = baseQuery
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data, data.count == 32 else { return nil }
+        return SymmetricKey(data: data)
+    }
+
+    func key() -> SymmetricKey? {
+        if let key = existingKey() { return key }
+        let key = SymmetricKey(size: .bits256)
+        var add = baseQuery
+        add[kSecValueData as String] = key.withUnsafeBytes { Data($0) }
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        switch SecItemAdd(add as CFDictionary, nil) {
+        case errSecSuccess: return key
+        // Lost a race with another writer: use whichever key landed.
+        case errSecDuplicateItem: return existingKey()
+        default: return nil
+        }
+    }
+
+    func delete() {
+        SecItemDelete(baseQuery as CFDictionary)
     }
 }
 
