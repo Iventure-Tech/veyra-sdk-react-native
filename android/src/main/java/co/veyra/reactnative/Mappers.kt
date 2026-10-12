@@ -1,17 +1,29 @@
+@file:OptIn(co.veyra.common.VeyraInternalApi::class)
+
 package co.veyra.reactnative
 
 import co.veyra.softpos.payment.sdk.TransactionInfo
 import co.veyra.softpos.payment.sdk.TransactionResponse as SoftposTransactionResponse
+import co.veyra.common.cancel.CancelResult
+import co.veyra.common.outcome.OutcomeReason
+import co.veyra.common.outcome.OutcomeStatus
+import co.veyra.softpos.payment.sdk.TransactionRefreshResult
 import co.veyra.softpos.payment.sdk.context.CreatedPaymentContext
+import co.veyra.softpos.payment.sdk.payment.OriginalPayment
 import co.veyra.softpos.payment.sdk.context.PaymentContextStatus
+import co.veyra.softpos.payment.sdk.cpm.CpmInspection
 import co.veyra.softpos.payment.sdk.merchant.MerchantRegistrationData
 import co.veyra.softpos.payment.sdk.merchant.MerchantRegistrationResponse
-import co.veyra.softpos.payment.sdk.merchant.NubanBank
+import co.veyra.softpos.payment.sdk.merchant.NubanBankListResponse
 import co.veyra.softpos.payment.sdk.merchant.StoredMerchantData
 import co.veyra.softpos.payment.sdk.merchant.TransactionReceiptResult
+import co.veyra.softpos.payment.sdk.payment.PaymentResponse
 import co.veyra.wallet.sdk.AccountNumberSource
-import co.veyra.wallet.sdk.Bank
+import co.veyra.wallet.sdk.ActivateResponse
+import co.veyra.wallet.sdk.ActivationCodeResponse
+import co.veyra.wallet.sdk.BankList
 import co.veyra.wallet.sdk.CpmPaymentQr
+import co.veyra.wallet.sdk.TokenStatusResult
 import co.veyra.wallet.sdk.TokenStatusUpdateResponse
 import co.veyra.wallet.sdk.Token
 import co.veyra.wallet.sdk.TokenisationResponse
@@ -19,9 +31,11 @@ import co.veyra.wallet.sdk.TokenizationRecommendation
 import co.veyra.wallet.sdk.TokenizationRecommendationReason
 import co.veyra.wallet.sdk.TokenizationRequestParams
 import co.veyra.wallet.sdk.TransactionReceipt
+import co.veyra.wallet.sdk.TransactionRefresh
 import co.veyra.wallet.sdk.TransactionSummary
 import co.veyra.wallet.sdk.TrustScore
 import co.veyra.wallet.sdk.VerifyAccountParams
+import co.veyra.wallet.sdk.VerifyAccountResponse
 import co.veyra.wallet.sdk.api.mpm.MpmPushOutcome
 import co.veyra.wallet.sdk.api.mpm.MpmScanResult
 import co.veyra.wallet.sdk.api.mpm.VerifiedPaymentContext
@@ -31,8 +45,108 @@ import com.facebook.react.bridge.ReadableMap
 import com.facebook.react.bridge.WritableArray
 import com.facebook.react.bridge.WritableMap
 
-/** JS-map ↔ SDK-DTO mapping. Field names match the TypeScript types verbatim. */
+/**
+ * JS-map ↔ SDK-DTO mapping. Field names match the TypeScript types verbatim.
+ *
+ * Every operation's map carries `responseStatus` / `responseStatusReason` (and `responseCode` on
+ * payments), copied from the SDK's outcome — never derived here. The `…NotSent` shapes are the
+ * bridge's own refusals of a bad call argument (an unknown handle, an unknown enum value, a missing
+ * field): `NOT_SENT` / `INVALID_REQUEST`, every other key of the type present and empty, so JS reads
+ * the same shape whichever way the call ended. The iOS module builds the same keys.
+ *
+ * `into` parameters exist for tests: `Arguments.createMap()` needs the native bridge, `JavaOnlyMap`
+ * doesn't.
+ */
+private typealias Ops = co.veyra.common.logging.failure.SdkOperation
+
 internal object Mappers {
+
+    /** The reason the bridge gives a call it refuses for a bad argument. */
+    const val INVALID_REQUEST = OutcomeReason.INVALID_REQUEST
+
+    private fun WritableMap.putOutcome(status: String?, reason: String?, message: String?) {
+        putString("responseStatus", status)
+        putString("responseStatusReason", reason)
+        putString("message", message)
+    }
+
+    /**
+     * A `NOT_SENT` outcome the bridge itself gives — nothing reached the SDK, so nothing was sent.
+     * [falseKeys] / [nullKeys] are the type's other keys, present and empty.
+     */
+    fun notSent(
+        reason: String,
+        message: String,
+        falseKeys: List<String> = emptyList(),
+        nullKeys: List<String> = emptyList(),
+        into: WritableMap = Arguments.createMap(),
+        status: String = OutcomeStatus.NOT_SENT,
+        /** The SDK never sees a call the bridge refuses itself, so the bridge logs its failure line. */
+        operation: String? = null,
+    ): WritableMap = into.apply {
+        if (operation != null) {
+            @OptIn(co.veyra.common.VeyraInternalApi::class)
+            co.veyra.common.logging.failure.OperationFailureLog.reportBridgeRefusal(operation, status, reason)
+        }
+        putOutcome(status, reason, message)
+        falseKeys.forEach { putBoolean(it, false) }
+        nullKeys.forEach { putNull(it) }
+    }
+
+    /**
+     * The same refusal on a call that is not a payment or digitisation: `FAILED` with the reason
+     * (`devices/CLAUDE.md` §15.2 — only payment processing and digitisation answer `NOT_SENT`).
+     */
+    fun refused(
+        reason: String,
+        message: String,
+        falseKeys: List<String> = emptyList(),
+        nullKeys: List<String> = emptyList(),
+        into: WritableMap = Arguments.createMap(),
+        operation: String? = null,
+    ): WritableMap = notSent(reason, message, falseKeys, nullKeys, into, OutcomeStatus.FAILED, operation)
+
+    /** `PaymentOutcome` (wallet scan-to-pay) refused before anything was sent. */
+    fun paymentOutcomeNotSent(reason: String, message: String, into: WritableMap = Arguments.createMap()) =
+        notSent(reason, message, listOf("approved"), listOf("responseCode", "merchantName", "merchantLocation"), into,
+            operation = Ops.SCAN_TO_PAY)
+
+    /** `CustomerQrChargeOutcome` refused before anything was sent. */
+    fun customerQrChargeNotSent(reason: String, message: String, into: WritableMap = Arguments.createMap()) =
+        notSent(
+            reason, message, listOf("approved"),
+            listOf(
+                "responseCode", "transactionId", "merchantTransactionReference", "merchantOrderId",
+                "creditTransactionId", "isCreditConfirmationSupported", "originalPayment",
+            ),
+            into,
+            operation = Ops.CPM_CHARGE,
+        )
+
+    /** `MerchantRegistrationResult` refused before anything was sent: `FAILED`. */
+    fun merchantRegistrationRefused(reason: String, message: String, into: WritableMap = Arguments.createMap()) =
+        refused(reason, message, listOf("success"), listOf("merchantId", "terminalId", "merchantStatus"), into,
+            operation = Ops.MERCHANT_REGISTER)
+
+    /** `MerchantStatusResult` refused before anything was sent: `FAILED`. */
+    fun merchantStatusRefused(reason: String, message: String, into: WritableMap = Arguments.createMap()) =
+        refused(reason, message, nullKeys = listOf("merchantId", "merchantStatus"), into = into,
+            operation = Ops.MERCHANT_STATUS)
+
+    /** `VerifyAccountResponse` refused before anything was sent: `FAILED`. */
+    fun verifyAccountRefused(reason: String, message: String, into: WritableMap = Arguments.createMap()) =
+        refused(reason, message, listOf("isApproved"), listOf("responseCode"), into, operation = Ops.VERIFY_ACCOUNT)
+
+    /** `DigitiseResult` refused before anything was sent. */
+    fun digitiseNotSent(
+        reason: String,
+        message: String,
+        into: WritableMap = Arguments.createMap(),
+        methodsInto: WritableArray = Arguments.createArray(),
+    ) = notSent(
+        reason, message, listOf("isApproved", "requiresActivation"),
+        listOf("responseCode", "tokenUniqueReference", "tokenStored"), into, operation = Ops.DIGITISE,
+    ).apply { putArray("activationMethods", methodsInto) }
 
     // ── Readers ─────────────────────────────────────────────────────────────────
 
@@ -106,24 +220,62 @@ internal object Mappers {
 
     // ── Writers ─────────────────────────────────────────────────────────────────
 
-    fun banks(banks: List<Bank>): WritableArray = Arguments.createArray().apply {
-        banks.forEach { b ->
-            pushMap(Arguments.createMap().apply {
-                putString("slug", b.slug)
-                putString("name", b.name)
-                putString("institutionCode", b.institutionCode)
-            })
+    private fun bankArray(banks: List<Triple<String?, String?, String?>>): WritableArray =
+        Arguments.createArray().apply {
+            banks.forEach { (slug, name, institutionCode) ->
+                pushMap(Arguments.createMap().apply {
+                    putString("slug", slug)
+                    putString("name", name)
+                    putString("institutionCode", institutionCode)
+                })
+            }
         }
+
+    /** `BankList` — the wallet's bank lookup, a read: `banks` on `APPROVED`, else the reason. */
+    fun bankList(r: BankList): WritableMap = Arguments.createMap().apply {
+        putArray("banks", bankArray(r.banks.map { Triple(it.slug, it.name, it.institutionCode) }))
+        putOutcome(r.responseStatus, r.responseStatusReason, r.message)
     }
 
-    fun nubanBanks(banks: List<NubanBank>): WritableArray = Arguments.createArray().apply {
-        banks.forEach { b ->
-            pushMap(Arguments.createMap().apply {
-                putString("slug", b.slug)
-                putString("name", b.name)
-                putString("institutionCode", b.institutionCode)
-            })
-        }
+    /** `SettlementBankList` — the merchant's settlement banks, same rules as [bankList]. */
+    fun settlementBankList(r: NubanBankListResponse): WritableMap = Arguments.createMap().apply {
+        putArray("banks", bankArray(r.banks.map { Triple(it.slug, it.name, it.institutionCode) }))
+        putOutcome(r.responseStatus, r.responseStatusReason, r.message)
+    }
+
+    fun verifyAccount(r: VerifyAccountResponse, into: WritableMap = Arguments.createMap()): WritableMap = into.apply {
+        putString("responseCode", r.responseCode)
+        // What the call did, and why it decided that — carried verbatim.
+        putOutcome(r.responseStatus, r.responseStatusReason, r.message)
+        putBoolean("isApproved", r.responseCode == "APPROVED" || r.responseCode == "APPROVE_REQUIRE_AUTH")
+    }
+
+    fun activationCode(r: ActivationCodeResponse, into: WritableMap = Arguments.createMap()): WritableMap = into.apply {
+        putString("tokenUniqueReference", r.tokenUniqueReference)
+        putString("expirationDateTime", r.expirationDateTime)
+        putString("status", r.status)
+        // Raw wire value: JS carries codes verbatim (unknown codes included).
+        putString("failureCode", r.failureCodeRaw)
+        putOutcome(r.responseStatus, r.responseStatusReason, r.message)
+    }
+
+    fun activate(r: ActivateResponse, into: WritableMap = Arguments.createMap()): WritableMap = into.apply {
+        putString("tokenUniqueReference", r.tokenUniqueReference)
+        putString("status", r.status)
+        // Raw wire values: JS carries codes verbatim (unknown codes included).
+        putString("failureCode", r.failureCodeRaw)
+        r.attemptsRemaining?.let { putInt("attemptsRemaining", it) } ?: putNull("attemptsRemaining")
+        putString("recommendDelete", r.recommendDeleteRaw)
+        putOutcome(r.responseStatus, r.responseStatusReason, r.message)
+    }
+
+    /**
+     * `TokenStatusResult` — the server's status for a card, verbatim (a value this build does not know
+     * still reaches JS), or the reason the check could not be made.
+     */
+    fun tokenStatusResult(r: TokenStatusResult, into: WritableMap = Arguments.createMap()): WritableMap = into.apply {
+        putString("tokenStatus", r.tokenStatus)
+        putOutcome(r.responseStatus, r.responseStatusReason, r.message)
     }
 
     fun digitiseResult(r: TokenisationResponse): WritableMap = Arguments.createMap().apply {
@@ -131,26 +283,19 @@ internal object Mappers {
         // The cause is a field, not prose: `responseCode` is the issuer's decision,
         // `responseStatus` what the call did, and `responseStatusReason` why — carried verbatim so
         // a cause added after this build still reaches JS.
-        putString("responseStatus", r.responseStatus)
-        putString("responseStatusReason", r.responseStatusReason)
+        putOutcome(r.responseStatus, r.responseStatusReason, r.message)
         putString("tokenUniqueReference", r.tokenUniqueReference)
         putArray("activationMethods", activationMethods(r.activationMethods?.map { it.medium to it.contact }))
-        putString("message", r.message)
         putBoolean("isApproved", r.isSuccess)
         putBoolean("requiresActivation", !r.activationMethods.isNullOrEmpty())
         putNull("tokenStored")
-        val err = r.error
-        if (err != null) {
-            putMap("error", Arguments.createMap().apply {
-                putString("code", err.code)
-                putString("message", err.message)
-                putString("details", err.details)
-            })
-        } else putNull("error")
     }
 
-    private fun activationMethods(methods: List<Pair<String?, String?>>?): WritableArray =
-        Arguments.createArray().apply {
+    private fun activationMethods(
+        methods: List<Pair<String?, String?>>?,
+        into: WritableArray = Arguments.createArray(),
+    ): WritableArray =
+        into.apply {
             methods?.forEach { (medium, contact) ->
                 pushMap(Arguments.createMap().apply {
                     putString("medium", medium)
@@ -159,7 +304,11 @@ internal object Mappers {
             }
         }
 
-    fun card(t: Token): WritableMap = Arguments.createMap().apply {
+    fun card(
+        t: Token,
+        into: WritableMap = Arguments.createMap(),
+        methodsInto: WritableArray = Arguments.createArray(),
+    ): WritableMap = into.apply {
         putString("id", t.tokenId)
         putString("tokenUniqueReference", t.tokenUniqueReference)
         putString("tokenId", t.tokenId)
@@ -175,14 +324,20 @@ internal object Mappers {
         putBoolean("requiresActivation", !t.activationMethods.isNullOrEmpty())
         putArray(
             "activationMethods",
-            activationMethods(t.activationMethods?.map { it.medium to it.contact })
+            activationMethods(t.activationMethods?.map { it.medium to it.contact }, methodsInto)
         )
         putBoolean("requiresOnline", t.requiresOnline)
         putBoolean("deviceNotBound", t.deviceNotBound)
     }
 
-    fun scanInspection(result: MpmScanResult, handle: String?): WritableMap =
-        Arguments.createMap().apply {
+    /**
+     * A cancel's answer, as JS's `CancelResult`: the enum's name, verbatim — the five names are the
+     * contract on every platform, so nothing is translated here.
+     */
+    fun cancelResult(r: CancelResult): String = r.name
+
+    fun scanInspection(result: MpmScanResult, handle: String?, into: WritableMap = Arguments.createMap()): WritableMap =
+        into.apply {
             when (result) {
                 is MpmScanResult.Verified -> {
                     val c: VerifiedPaymentContext = result.context
@@ -194,6 +349,8 @@ internal object Mappers {
                     putDouble("amountMinorUnits", c.amountMinorUnits.toDouble())
                     putString("currencyNumeric", c.currencyNumeric)
                     putDouble("expiresAtEpochSeconds", c.expiryEpochSeconds.toDouble())
+                    // What wallet.cancelPayment takes; null on a QR that carries none.
+                    putString("merchantOrderId", c.merchantOrderId)
                 }
                 is MpmScanResult.Rejected -> {
                     putBoolean("verified", false)
@@ -203,26 +360,83 @@ internal object Mappers {
             }
         }
 
-    fun paymentOutcome(o: MpmPushOutcome): WritableMap = Arguments.createMap().apply {
+    fun paymentOutcome(o: MpmPushOutcome, into: WritableMap = Arguments.createMap()): WritableMap = into.apply {
+        // `approved` is the SDK's reading of the status, never of the code.
         putBoolean("approved", o.approved)
         putString("responseCode", o.responseCode)
         // the status is what the payment IS — `approved` alone cannot tell a decline
-        // from a push the gateway answered PENDING.
-        putString("responseStatus", o.responseStatus)
-        putString("responseStatusReason", o.responseStatusReason)
-        putString("message", o.message)
+        // from a push the gateway answered PENDING, or one that never left (NOT_SENT).
+        putOutcome(o.responseStatus, o.responseStatusReason, o.message)
         putString("merchantName", o.merchantName)
         putString("merchantLocation", o.merchantLocation)
     }
 
-    fun paymentQr(qr: CpmPaymentQr): WritableMap = Arguments.createMap().apply {
+    /** `PaymentQr` — a QR to render on `APPROVED`, or the reason none was made (no payload). */
+    fun paymentQr(qr: CpmPaymentQr, into: WritableMap = Arguments.createMap()): WritableMap = into.apply {
         putString("tokenUniqueReference", qr.tokenUniqueReference)
         putString("payload", qr.payload)
         putDouble("amountMinorUnits", qr.amountMinorUnits.toDouble())
         putString("currencyNumeric", qr.currencyNumeric)
         putDouble("expiresAtEpochMillis", qr.expiresAtEpochMillis.toDouble())
         putString("transactionHash", qr.transactionHash)
+        putOutcome(qr.responseStatus, qr.responseStatusReason, qr.message)
     }
+
+    /** A `VeyraLookup`: the value, or why the read could not be made. */
+    fun lookup(
+        value: WritableMap?,
+        failureReason: String?,
+        message: String?,
+        into: WritableMap = Arguments.createMap(),
+    ): WritableMap = into.apply {
+        if (value != null) putMap("value", value) else putNull("value")
+        putString("failureReason", failureReason)
+        putString("message", message)
+    }
+
+    /** `VeyraLookup<TransactionSummary>` — a wallet status or credit check. */
+    /** `VeyraLookup<OrderPaymentStatus>` — the lookup by merchant order id. [into]/[make] exist for tests. */
+    fun orderPaymentLookup(
+        r: co.veyra.softpos.payment.sdk.merchant.OrderPaymentLookup,
+        into: WritableMap = Arguments.createMap(),
+        make: () -> WritableMap = { Arguments.createMap() },
+        makeArray: () -> com.facebook.react.bridge.WritableArray = { Arguments.createArray() },
+    ): WritableMap = lookup(r.value?.let { orderPaymentStatus(it, make(), make, makeArray) }, r.failureReason, r.message, into)
+
+    fun orderPaymentStatus(
+        o: co.veyra.softpos.payment.sdk.merchant.OrderPaymentStatus,
+        into: WritableMap = Arguments.createMap(),
+        make: () -> WritableMap = { Arguments.createMap() },
+        makeArray: () -> com.facebook.react.bridge.WritableArray = { Arguments.createArray() },
+    ): WritableMap = into.apply {
+        putString("merchantOrderId", o.merchantOrderId)
+        putString("responseStatus", o.responseStatus)
+        putString("responseStatusReason", o.responseStatusReason)
+        putString("responseCode", o.responseCode)
+        putString("merchantTransactionReference", o.merchantTransactionReference)
+        putString("transactionId", o.transactionId)
+        o.amount?.let { putDouble("amountMinorUnits", it.toDouble()) } ?: putNull("amountMinorUnits")
+        putString("answeredBy", o.answeredBy)
+        putArray("attempts", makeArray().apply {
+            o.attempts.forEach { a ->
+                pushMap(make().apply {
+                    putString("merchantTransactionReference", a.merchantTransactionReference)
+                    putString("transactionId", a.transactionId)
+                    a.amount?.let { putDouble("amountMinorUnits", it.toDouble()) } ?: putNull("amountMinorUnits")
+                    putString("responseCode", a.responseCode)
+                    putString("responseStatus", a.responseStatus)
+                    putString("responseStatusReason", a.responseStatusReason)
+                })
+            }
+        })
+    }
+
+    fun transactionLookup(r: TransactionRefresh): WritableMap =
+        lookup(r.transaction?.let { transactionSummary(it) }, r.failureReason, r.message)
+
+    /** `VeyraLookup<MerchantTransaction>` — a merchant status or credit check. */
+    fun merchantTransactionLookup(r: TransactionRefreshResult): WritableMap =
+        lookup(r.transaction?.let { merchantTransaction(it) }, r.failureReason, r.message)
 
     fun transactionSummary(s: TransactionSummary): WritableMap = Arguments.createMap().apply {
         putString("merchantName", s.merchantName)
@@ -256,6 +470,29 @@ internal object Mappers {
         putString("merchantOrderId", s.merchantOrderId)
     }
 
+    /** `CardSelection` — `APPROVED`, or `FAILED` / `CARD_NOT_FOUND` · `CARD_DATA_MISSING`. */
+    fun cardSelection(r: co.veyra.wallet.sdk.CardSelection, into: WritableMap = Arguments.createMap()): WritableMap =
+        into.apply { putOutcome(r.responseStatus, r.responseStatusReason, r.message) }
+
+    /** `ReconcileResult` — `failureReason` only when the reconcile itself could not run. */
+    fun reconcileResult(r: co.veyra.wallet.sdk.ReconcileResult, into: WritableMap = Arguments.createMap()): WritableMap =
+        into.apply {
+            putBoolean("checked", r.checked)
+            putString("failureReason", r.failureReason)
+            putString("message", r.message)
+        }
+
+    /** `ReceiptScan` — `APPROVED` with `receipt`, or `FAILED` with the reason and no receipt. */
+    fun receiptScan(
+        r: co.veyra.wallet.sdk.ReceiptScanResult,
+        into: WritableMap = Arguments.createMap(),
+        receiptInto: (TransactionReceipt) -> WritableMap = ::receipt,
+    ): WritableMap = into.apply {
+        val stored = r.receipt
+        if (stored != null) putMap("receipt", receiptInto(stored)) else putNull("receipt")
+        putOutcome(r.responseStatus, r.responseStatusReason, r.message)
+    }
+
     fun receipt(r: TransactionReceipt): WritableMap = Arguments.createMap().apply {
         putString("merchantName", r.merchantName)
         putString("merchantId", r.merchantId)
@@ -274,14 +511,34 @@ internal object Mappers {
         putString("transactionHash", r.transactionHash)
     }
 
-    fun merchantRegistrationResult(r: MerchantRegistrationResponse): WritableMap =
-        Arguments.createMap().apply {
+    fun merchantRegistrationResult(r: MerchantRegistrationResponse, into: WritableMap = Arguments.createMap()): WritableMap =
+        into.apply {
             putBoolean("success", r.success)
             putString("merchantId", r.merchantId)
             putString("terminalId", r.terminalId)
             putString("merchantStatus", r.merchantStatus)
-            putString("message", r.message)
+            putOutcome(r.responseStatus, r.responseStatusReason, r.message)
         }
+
+    /** `MerchantStatusResult` — a status read, activate, deactivate or update, as the SDK answered it. */
+    fun merchantStatus(
+        merchantId: String?,
+        merchantStatus: String?,
+        responseStatus: String?,
+        responseStatusReason: String?,
+        message: String?,
+        into: WritableMap = Arguments.createMap(),
+    ): WritableMap = into.apply {
+        putString("merchantId", merchantId)
+        putString("merchantStatus", merchantStatus)
+        putOutcome(responseStatus, responseStatusReason, message)
+    }
+
+    fun merchantStatus(r: co.veyra.softpos.payment.sdk.merchant.MerchantStatusResponse): WritableMap =
+        merchantStatus(r.merchantId, r.merchantStatus, r.responseStatus, r.responseStatusReason, r.message)
+
+    fun merchantStatus(r: co.veyra.softpos.payment.sdk.merchant.MerchantUpdateResponse): WritableMap =
+        merchantStatus(r.merchantId, r.merchantStatus, r.responseStatus, r.responseStatusReason, r.message)
 
     fun storedMerchant(m: StoredMerchantData): WritableMap = Arguments.createMap().apply {
         putString("merchantId", m.merchantId)
@@ -303,19 +560,40 @@ internal object Mappers {
         putString("walletAccountId", m.walletAccountId)
     }
 
+    /**
+     * `OriginalPayment` — on a `DUPLICATE_MERCHANT_ORDER_ID` refusal, the payment already holding the
+     * order ID. Its `responseStatus` says whether the order is already paid or still being confirmed.
+     */
+    fun originalPayment(o: OriginalPayment, into: WritableMap = Arguments.createMap()): WritableMap = into.apply {
+        putString("responseCode", o.responseCode)
+        putString("responseStatus", o.responseStatus)
+        putString("responseStatusReason", o.responseStatusReason)
+        o.amount?.let { putDouble("amountMinorUnits", it.toDouble()) } ?: putNull("amountMinorUnits")
+        putString("merchantTransactionReference", o.merchantTransactionReference)
+        putString("transactionId", o.transactionId)
+    }
+
+    /** `originalPayment` on an outcome map: the nested map, or null. [into] exists for tests. */
+    private fun WritableMap.putOriginalPayment(o: OriginalPayment?, into: WritableMap?) {
+        if (o == null) putNull("originalPayment")
+        else putMap("originalPayment", originalPayment(o, into ?: Arguments.createMap()))
+    }
+
     // [into] exists for tests: Arguments.createMap() needs the native bridge, JavaOnlyMap doesn't.
-    fun tapResult(r: SoftposTransactionResponse, into: WritableMap = Arguments.createMap()): WritableMap = into.apply {
+    fun tapResult(
+        r: SoftposTransactionResponse,
+        into: WritableMap = Arguments.createMap(),
+        originalInto: WritableMap? = null,
+    ): WritableMap = into.apply {
         // carry the outcome the backend stated; never re-derive it from the code. This block
         // was a code->status mapping of its own — the seventh — and it read every code it did not
         // recognise as FAILED, so `09`/`68`/`96` (still settling) and `25` (no record) all surfaced to
         // React Native as failures. `"99"` is retired: pending is said by `status` now.
+        // A NOT_SENT tap never went on the wire, so it has no code.
         putString("responseCode", r.transactionCode.takeIf { it.isNotEmpty() })
+        putOutcome(r.responseStatus?.name, r.responseStatusReason, r.message)
+        // Deprecated alias of responseStatus, kept for one release.
         putString("status", r.responseStatus?.name)
-        putString("reason", r.responseStatusReason)
-        // Set only when the SDK could not attempt a payment (validation, arming refusal, card read) or
-        // failed inside itself: not a payment outcome, so there is no code and no status beside it.
-        putString("sdkErrorCode", r.sdkErrorCode?.name)
-        putString("message", r.message)
         putString("amountDisplay", r.amount)
         putString("cardScheme", r.cardScheme)
         putString("maskedTokenLast4", r.maskedTokenLast4)
@@ -329,7 +607,20 @@ internal object Mappers {
         putString("creditTransactionId", r.creditTransactionId)
         r.isCreditConfirmationSupported?.let { putBoolean("isCreditConfirmationSupported", it) }
             ?: putNull("isCreditConfirmationSupported")
+        putOriginalPayment(r.originalPayment, originalInto)
     }
+
+    /** A tap `result` the bridge ends itself for a bad argument: `NOT_SENT`, nothing armed or sent. */
+    fun tapResultNotSent(reason: String, message: String, into: WritableMap = Arguments.createMap()): WritableMap =
+        notSent(
+            reason, message,
+            nullKeys = listOf(
+                "responseCode", "amountDisplay", "cardScheme", "maskedTokenLast4", "merchantTransactionReference",
+                "transactionId", "merchantStatus", "creditTransactionId", "isCreditConfirmationSupported",
+                "originalPayment",
+            ),
+            into = into,
+        ).apply { putString("status", co.veyra.common.outcome.OutcomeStatus.NOT_SENT) }
 
     /**
      * The `VeyraTransactionResolvedEvent` payload. Extracted from the module's
@@ -349,7 +640,7 @@ internal object Mappers {
     ): WritableMap = into.apply {
         putString("tokenUniqueReference", r.tokenUniqueReference)
         putString("status", r.status)
-        putString("message", r.message)
+        putOutcome(r.responseStatus, r.responseStatusReason, r.message)
     }
 
     fun transactionResolved(
@@ -450,10 +741,70 @@ internal object Mappers {
         putString("previousStatus", c.previousStatus)
     }
 
-    fun paymentContextQr(c: CreatedPaymentContext): WritableMap = Arguments.createMap().apply {
+    /** `PaymentContextQr` — `txRef` / `mpmPayload` only on `APPROVED`; otherwise the reason. */
+    fun paymentContextQr(
+        c: CreatedPaymentContext,
+        into: WritableMap = Arguments.createMap(),
+        originalInto: WritableMap? = null,
+    ): WritableMap = into.apply {
         putString("txRef", c.txRef)
         putString("mpmPayload", c.mpmPayload)
         putString("expiry", c.expiry)
+        putOutcome(c.responseStatus, c.responseStatusReason, c.message)
+        putOriginalPayment(c.originalPayment, originalInto)
+    }
+
+    /** `PaymentContextQr` refused before anything was sent. */
+    fun paymentContextQrNotSent(reason: String, message: String, into: WritableMap = Arguments.createMap()) =
+        notSent(reason, message, nullKeys = listOf("txRef", "mpmPayload", "expiry", "originalPayment"), into = into,
+            operation = Ops.MPM_CONTEXT)
+
+    /**
+     * `CustomerQrInspection` — `qr` (display fields + the opaque [handle]) on `APPROVED`, else
+     * `NOT_SENT` / `INVALID_REQUEST` and no `qr`. The card data stays native behind the handle.
+     */
+    fun customerQrInspection(
+        i: CpmInspection,
+        handle: String?,
+        into: WritableMap = Arguments.createMap(),
+        qrInto: WritableMap = Arguments.createMap(),
+    ): WritableMap = into.apply {
+        val scanned = i.qr
+        if (scanned != null && handle != null) {
+            putMap("qr", qrInto.apply {
+                putString("handle", handle)
+                putString("maskedCard", "•••• " + scanned.dpan.takeLast(4))
+                putDouble("amountMinorUnits", scanned.amountMinorUnits.toDouble())
+                putString("currencyNumeric", scanned.currencyNumeric4)
+                putString("cardholderName", scanned.cardholderName)
+            })
+        } else putNull("qr")
+        putOutcome(i.responseStatus, i.responseStatusReason, i.message)
+    }
+
+    /**
+     * `CustomerQrChargeOutcome` — the triple verbatim. `approved` is read from the status, never
+     * worked out from the code: a `00` with any other status is not an approval.
+     */
+    fun customerQrCharge(
+        r: PaymentResponse,
+        into: WritableMap = Arguments.createMap(),
+        originalInto: WritableMap? = null,
+    ): WritableMap = into.apply {
+        putBoolean("approved", r.responseStatus?.name == OutcomeStatus.APPROVED)
+        putString("responseCode", r.responseCode)
+        putOutcome(r.responseStatus?.name, r.responseStatusReason, r.message)
+        putString("transactionId", r.transactionId)
+        // the MINTED reference, from the gateway's echo — not a value the caller supplied, so every
+        // receipt lookup and status poll built on it finds the stored payment.
+        putString("merchantTransactionReference", r.merchantTransactionReference)
+        putString("merchantOrderId", r.merchantOrderId)
+        // an approved answer carries the merchant-bank credit id + supported flag — the result
+        // screen's cue to wait for confirmation.
+        putString("creditTransactionId", r.creditTransactionId)
+        r.isCreditConfirmationSupported?.let { putBoolean("isCreditConfirmationSupported", it) }
+            ?: putNull("isCreditConfirmationSupported")
+        putOriginalPayment(r.originalPayment, originalInto)
     }
 
     fun paymentContextStatus(s: PaymentContextStatus): WritableMap = Arguments.createMap().apply {

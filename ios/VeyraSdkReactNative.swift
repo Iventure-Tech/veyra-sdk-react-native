@@ -1,5 +1,6 @@
 import Foundation
 import React
+import VeyraKMP
 
 // No `import VeyraSDK` / `VeyraSoftPOS` / `VeyraWallet`: the Swift facade is compiled into this
 // pod alongside the bridge, so its types are in the same module. (Swift Package Manager consumers
@@ -12,8 +13,14 @@ import React
  * Mode handling: on iOS the SDK claims a mode at the point of use (tap-session start,
  * wallet payment execution) and releases it at completion, with a background-inert
  * guard — so the focus session here only mirrors the cross-platform contract: it tracks
- * which experience is open and gates the tap APIs (SESSION_REQUIRED), keeping the JS
- * integration identical on both platforms. It never calls a mode verb.
+ * which experience is open and gates the calls Android gates (`merchantTapStart`,
+ * `walletSetActiveCard` — SESSION_REQUIRED), keeping the JS integration identical on both
+ * platforms. It never calls a mode verb.
+ *
+ * Outcomes: every operation resolves with the facade's outcome (`responseStatus` /
+ * `responseStatusReason`); a promise rejects only with one of the five setup errors. A bad call
+ * argument — an unknown handle or enum value, a missing field — resolves `NOT_SENT` /
+ * `INVALID_REQUEST` in the call's own shape, exactly as the Android module's `Mappers` builds it.
  */
 @objc(VeyraSdkReactNative)
 class VeyraSdkReactNative: RCTEventEmitter {
@@ -41,6 +48,29 @@ class VeyraSdkReactNative: RCTEventEmitter {
     static let cardKeyState = "VeyraCardKeyStateEvent"
     /// The merchant was deactivated, suspended or activated.
     static let merchantStatus = "VeyraMerchantStatusEvent"
+    /// Native asks JS to run a connection callback (an assertion, or a relay forward).
+    static let connectionRequest = VeyraConnectionBridge.event
+  }
+
+  /// The SDKs' assertion providers and relays, answered by the JS functions in the config.
+  private let connections = VeyraConnectionBridge()
+
+  override init() {
+    super.init()
+    // Failure lines from this process say they came through React Native.
+    OperationFailureLog.shared.surface = OperationFailureLog.shared.SURFACE_RN
+    connections.attach { [weak self] body in
+      self?.sendEvent(withName: EventName.connectionRequest, body: body)
+    }
+  }
+
+  override func startObserving() { connections.setListening(true) }
+  override func stopObserving() { connections.setListening(false) }
+
+  /// The JS runtime is torn down (reload, destroy): fail whatever it was still answering.
+  override func invalidate() {
+    connections.failAllPending()
+    super.invalidate()
   }
 
   /// Ready for calls: configured, with a customer signed in. False after `signOut`.
@@ -48,7 +78,9 @@ class VeyraSdkReactNative: RCTEventEmitter {
   /// Whether `initialize` ever succeeded — picks `NOT_SIGNED_IN` over `NOT_CONFIGURED`.
   private var configuredOnce = false
   private var openSessionKind: String?
-  private var tapSessions: [String: TapPaymentSession] = [:]
+  /// Open tap sessions by `sessionId`, with the order ID each was started with — a tap is
+  /// cancelled by its order ID (`cancelPayment(merchantOrderID:)`), so teardown needs it.
+  private var tapSessions: [String: (session: TapPaymentSession, merchantOrderID: String)] = [:]
   private var mpmContexts: [String: VerifiedPayment] = [:]
   private var cpmQrs: [String: ScannedCustomerQr] = [:]
 
@@ -67,48 +99,33 @@ class VeyraSdkReactNative: RCTEventEmitter {
       EventName.walletTransactionResolved,
       EventName.cardKeyState,
       EventName.merchantStatus,
+      EventName.connectionRequest,
     ]
   }
 
-  // ── Error normalisation ─────────────────────────────────────────────────────
+  // ── Setup errors: the only rejections ───────────────────────────────────────
 
   private func reject(_ rejecter: RCTPromiseRejectBlock, _ error: Error) {
     let (code, message) = classify(error)
     rejecter(code, message, error)
   }
 
+  /// The five setup errors, by case — the same codes the Android module maps from
+  /// `VeyraSetupException.code`. Anything else is an SDK defect, never an outcome: `UNKNOWN`.
   private func classify(_ error: Error) -> (String, String) {
     switch error {
     case VeyraWalletError.notConfigured, VeyraSoftPOSError.notConfigured, VeyraSDKError.notConfigured:
       return ("NOT_CONFIGURED", "Call Veyra.initialize first")
     case VeyraWalletError.notSignedIn, VeyraSoftPOSError.notSignedIn:
       return ("NOT_SIGNED_IN", "No customer is signed in — call Veyra.initialize with the customerId first")
-    // both SDKs report the same condition under the same code, so JS branches on one
-    // value whichever half of the SDK the call came from.
-    case let VeyraWalletError.noNetworkConnection(message):
-      return ("NO_NETWORK_CONNECTION", message)
-    case let VeyraSoftPOSError.noNetworkConnection(message):
-      return ("NO_NETWORK_CONNECTION", message)
-    case let VeyraWalletError.onlineRequired(message):
-      return ("ONLINE_REQUIRED", message)
-    case let VeyraWalletError.amountExceedsCardLimit(message):
-      return ("AMOUNT_EXCEEDS_CARD_LIMIT", message)
-    case let VeyraWalletError.tokenNotActive(message):
-      return ("TOKEN_NOT_ACTIVE", message)
-    case let VeyraWalletError.deviceNotBound(message):
-      return ("DEVICE_NOT_BOUND", message)
-    case let VeyraWalletError.authenticationFailed(message):
-      return (message.lowercased().contains("cancel") ? "AUTH_CANCELLED" : "AUTH_FAILED", message)
-    case let VeyraWalletError.requestFailed(message):
-      if message.hasPrefix("No active card") { return ("NO_ACTIVE_CARD", message) }
-      if message.contains("can't show a payment QR") { return ("CARD_CANNOT_SHOW_QR", message) }
-      return ("REQUEST_FAILED", message)
-    case let VeyraSoftPOSError.tapRefused(message):
-      return ("MODE_REFUSED", message)
-    case let VeyraSoftPOSError.invalidRequest(message):
-      return ("INVALID_REQUEST", message)
-    case let VeyraSoftPOSError.requestFailed(message):
-      return ("REQUEST_FAILED", message)
+    case let VeyraWalletError.invalidConfiguration(message):
+      return ("INVALID_CONFIGURATION", message)
+    case let VeyraSoftPOSError.invalidConfiguration(message):
+      return ("INVALID_CONFIGURATION", message)
+    case VeyraWalletError.sessionRequired, VeyraSoftPOSError.sessionRequired:
+      return ("SESSION_REQUIRED", error.localizedDescription)
+    case VeyraWalletError.unsupportedOnPlatform, VeyraSoftPOSError.unsupportedOnPlatform:
+      return ("UNSUPPORTED_ON_PLATFORM", error.localizedDescription)
     default:
       return ("UNKNOWN", error.localizedDescription)
     }
@@ -122,8 +139,107 @@ class VeyraSdkReactNative: RCTEventEmitter {
     }
   }
 
-  private func rejectValidation(_ rejecter: RCTPromiseRejectBlock, _ message: String) {
-    rejecter("VALIDATION", message, nil)
+  private func rejectInvalidConfiguration(_ rejecter: RCTPromiseRejectBlock, _ message: String) {
+    rejecter("INVALID_CONFIGURATION", message, nil)
+  }
+
+  // ── Outcome shapes (key-for-key the Android module's `Mappers`) ─────────────
+
+  private static let notSentStatus = "NOT_SENT"
+  private static let invalidRequest = "INVALID_REQUEST"
+  private static let missingMandatoryConfig = "MISSING_MANDATORY_CONFIG"
+
+  /// `nil` as JS `null`.
+  private func opt(_ value: Any?) -> Any { value ?? NSNull() }
+
+  /// A `NOT_SENT` outcome the bridge itself gives for a bad call argument — nothing reached the
+  /// SDK. `falseKeys` / `nullKeys` are the type's other keys, present and empty.
+  private func notSent(_ reason: String, _ message: String,
+                       falseKeys: [String] = [], nullKeys: [String] = [],
+                       status: String = notSentStatus, operation: String? = nil) -> [String: Any] {
+    // The SDK never sees a call the bridge refuses itself, so the bridge logs the failure line.
+    if let operation = operation {
+      OperationFailureLog.shared.reportBridgeRefusal(operation: operation, status: status, reason: reason)
+    }
+    var body: [String: Any] = [
+      "responseStatus": status,
+      "responseStatusReason": reason,
+      "message": message,
+    ]
+    falseKeys.forEach { body[$0] = false }
+    nullKeys.forEach { body[$0] = NSNull() }
+    return body
+  }
+
+  private func paymentOutcomeNotSent(_ message: String) -> [String: Any] {
+    notSent(Self.invalidRequest, message, falseKeys: ["approved"],
+            nullKeys: ["responseCode", "merchantName", "merchantLocation"],
+            operation: SdkOperation.shared.SCAN_TO_PAY)
+  }
+
+  private func customerQrChargeNotSent(_ message: String) -> [String: Any] {
+    notSent(Self.invalidRequest, message, falseKeys: ["approved"],
+            nullKeys: ["responseCode", "transactionId", "merchantTransactionReference", "merchantOrderId",
+                       "creditTransactionId", "isCreditConfirmationSupported", "originalPayment"],
+            operation: SdkOperation.shared.CPM_CHARGE)
+  }
+
+  /// Not a payment or digitisation, so a refusal is `FAILED`, never `NOT_SENT` (devices §15.2).
+  private static let failedStatus = "FAILED"
+
+  private func merchantRegistrationRefused(_ message: String) -> [String: Any] {
+    notSent(Self.invalidRequest, message, falseKeys: ["success"],
+            nullKeys: ["merchantId", "terminalId", "merchantStatus"], status: Self.failedStatus,
+            operation: SdkOperation.shared.MERCHANT_REGISTER)
+  }
+
+  private func merchantStatusRefused(_ reason: String, _ message: String) -> [String: Any] {
+    notSent(reason, message, nullKeys: ["merchantId", "merchantStatus"], status: Self.failedStatus,
+            operation: SdkOperation.shared.MERCHANT_STATUS)
+  }
+
+  private func paymentContextQrNotSent(_ reason: String, _ message: String) -> [String: Any] {
+    notSent(reason, message, nullKeys: ["txRef", "mpmPayload", "expiry", "originalPayment"],
+            operation: SdkOperation.shared.MPM_CONTEXT)
+  }
+
+  private func tapResultNotSent(_ message: String) -> [String: Any] {
+    var body = notSent(Self.invalidRequest, message,
+                       nullKeys: ["responseCode", "amountDisplay", "cardScheme", "maskedTokenLast4",
+                                  "merchantTransactionReference", "transactionId", "merchantStatus",
+                                  "creditTransactionId", "isCreditConfirmationSupported", "originalPayment"],
+                       operation: SdkOperation.shared.MERCHANT_TAP)
+    body["status"] = Self.notSentStatus
+    return body
+  }
+
+  /// `OriginalPayment`: on a `DUPLICATE_MERCHANT_ORDER_ID` refusal, the payment already holding the
+  /// order ID (its `responseStatus` says paid or still being confirmed); `null` otherwise.
+  private func originalPaymentDict(_ o: OriginalPayment?) -> Any {
+    guard let o else { return NSNull() }
+    return [
+      "responseCode": opt(o.responseCode),
+      "responseStatus": opt(o.responseStatus),
+      "responseStatusReason": opt(o.responseStatusReason),
+      "amountMinorUnits": o.amountMinorUnits.map { $0 as Any } ?? NSNull(),
+      "merchantTransactionReference": opt(o.reference),
+      "transactionId": opt(o.transactionID),
+    ] as [String: Any]
+  }
+
+  /// A `VeyraLookup`: the value, or why the read could not be made.
+  private func lookupDict(_ value: Any?, failureReason: String?, message: String?) -> [String: Any] {
+    ["value": opt(value), "failureReason": opt(failureReason), "message": opt(message)]
+  }
+
+  private func merchantStatusDict(_ s: MerchantStatus) -> [String: Any] {
+    [
+      "merchantId": opt(s.merchantID),
+      "merchantStatus": opt(s.status),
+      "responseStatus": s.responseStatus,
+      "responseStatusReason": opt(s.responseStatusReason),
+      "message": opt(s.message),
+    ]
   }
 
   // ── Init & mode ─────────────────────────────────────────────────────────────
@@ -131,30 +247,38 @@ class VeyraSdkReactNative: RCTEventEmitter {
   @objc(initialize:resolver:rejecter:)
   func initialize(_ config: NSDictionary, resolver resolve: @escaping RCTPromiseResolveBlock,
                   rejecter reject: @escaping RCTPromiseRejectBlock) {
+    // Every problem with the config is the app's configuration: INVALID_CONFIGURATION, naming it
+    // (the Android module maps the same reads the same way).
     guard let customerID = config["customerId"] as? String,
           !customerID.trimmingCharacters(in: .whitespaces).isEmpty
-    else { return rejectValidation(reject, "customerId is required") }
+    else { return rejectInvalidConfiguration(reject, "customerId is required") }
     guard let softposMap = config["softpos"] as? NSDictionary,
           let walletMap = config["wallet"] as? NSDictionary
-    else { return rejectValidation(reject, "softpos and wallet configs are required") }
+    else { return rejectInvalidConfiguration(reject, "softpos and wallet configs are required") }
     guard let softposEnv = VeyraSoftPOSConfiguration.Environment(rawValue: softposMap["environment"] as? String ?? ""),
           let walletEnv = VeyraWalletConfiguration.Environment(rawValue: walletMap["environment"] as? String ?? "")
-    else { return rejectValidation(reject, "environment must be TEST or LIVE") }
+    else { return rejectInvalidConfiguration(reject, "environment must be TEST or LIVE") }
     guard let appleTeamID = walletMap["appleTeamId"] as? String, !appleTeamID.isEmpty
-    else { return rejectValidation(reject, "wallet.appleTeamId is required on iOS") }
+    else { return rejectInvalidConfiguration(reject, "wallet.appleTeamId is required on iOS") }
 
     guard let softposProviderID = softposMap["paymentAppProviderId"] as? String, !softposProviderID.isEmpty
-    else { return rejectValidation(reject, "softpos.paymentAppProviderId is required") }
+    else { return rejectInvalidConfiguration(reject, "softpos.paymentAppProviderId is required") }
+    // One provider for both SDKs, answered by the app's one JS provider (JS registers it for
+    // both; the native requests are tagged "wallet").
+    let provider: any VeyraProvider
+    do {
+      provider = try connections.provider(sdk: "wallet", map: config["provider"] as? NSDictionary)
+    } catch let e as VeyraConnectionBridge.InvalidProvider {
+      return rejectInvalidConfiguration(reject, e.message)
+    } catch {
+      return rejectInvalidConfiguration(reject, error.localizedDescription)
+    }
     let softpos = VeyraSoftPOSConfiguration(
       environment: softposEnv,
-      paymentAppProviderID: softposProviderID,
-      clientID: softposMap["clientId"] as? String,
-      clientSecret: softposMap["clientSecret"] as? String
+      paymentAppProviderID: softposProviderID
     )
     let wallet = VeyraWalletConfiguration(
       environment: walletEnv,
-      clientID: walletMap["clientId"] as? String,
-      clientSecret: walletMap["clientSecret"] as? String,
       paymentAppProviderID: walletMap["paymentAppProviderId"] as? String,
       tokenRequestorID: walletMap["tokenRequestorId"] as? String,
       appVersion: walletMap["appVersion"] as? String ?? "1.0.0",
@@ -163,7 +287,12 @@ class VeyraSdkReactNative: RCTEventEmitter {
       allowedMerchantIDs: walletMap["allowedMerchantIds"] as? [String] ?? []
     )
 
-    VeyraSDK.configure(customerID: customerID, softpos: softpos, wallet: wallet)
+    do {
+      // Throws on an unusable provider or a change of kind within the process (no fallback).
+      try VeyraSDK.configure(customerID: customerID, provider: provider, softpos: softpos, wallet: wallet)
+    } catch {
+      return self.reject(reject, error)
+    }
     initialized = true
     configuredOnce = true
     // After every initialise: a switch of customer drops every observer registration.
@@ -178,9 +307,8 @@ class VeyraSdkReactNative: RCTEventEmitter {
   @objc(signOut:rejecter:)
   func signOut(_ resolve: @escaping RCTPromiseResolveBlock,
                rejecter rejecter: @escaping RCTPromiseRejectBlock) {
+    cancelOpenTaps()
     VeyraSDK.signOut()
-    tapSessions.values.forEach { $0.cancel() }
-    tapSessions.removeAll()
     mpmContexts.removeAll()
     cpmQrs.removeAll()
     initialized = false
@@ -276,11 +404,26 @@ class VeyraSdkReactNative: RCTEventEmitter {
     }
   }
 
+  // ── Connection callbacks (answers from JS) ──────────────────────────────────
+
+  /// JS answered a connection request; a nil value is a valid "no assertion" answer.
+  @objc(resolveConnectionRequest:value:)
+  func resolveConnectionRequest(_ id: String, value: String?) {
+    connections.resolve(id: id, value: value)
+  }
+
+  /// JS rejected a connection request. `httpStatus` -1 means none.
+  @objc(rejectConnectionRequest:kind:neverSent:httpStatus:message:)
+  func rejectConnectionRequest(_ id: String, kind: String, neverSent: Bool, httpStatus: Double, message: String?) {
+    connections.reject(id: id, kind: kind, neverSent: neverSent, httpStatus: Int(httpStatus), message: message)
+  }
+
   @objc(currentMode:rejecter:)
   func currentMode(_ resolve: @escaping RCTPromiseResolveBlock,
                    rejecter reject: @escaping RCTPromiseRejectBlock) {
     guard initialized else { return rejectNotInitialized(reject) }
-    resolve(VeyraSDK.shared.currentMode.rawValue)
+    do { resolve(try VeyraSDK.shared.currentMode.rawValue) }
+    catch { self.reject(reject, error) }
   }
 
   // ── Sessions (contract parity; iOS claims at point of use) ──────────────────
@@ -300,12 +443,27 @@ class VeyraSdkReactNative: RCTEventEmitter {
     if openSessionKind == kind {
       openSessionKind = nil
       if kind == "getPaid" {
-        // Leaving the get-paid screen cancels any armed (untapped) session.
-        tapSessions.values.forEach { $0.cancel() }
-        tapSessions.removeAll()
+        // Leaving the get-paid screen cancels any tap not yet sent; one already with the bank
+        // runs to its normal result.
+        cancelOpenTaps()
       }
     }
     resolve(nil)
+  }
+
+  /// Cancels every open tap by its order ID. A tap not yet sent ends `NOT_SENT` / `CANCELLED`
+  /// on its own `result` event; one already sent is refused by the SDK and runs to its normal
+  /// result — so its session stays held here until that `result` arrives, never dropped
+  /// mid-payment. (Each entry also leaves on its own `result` / `ended` event.)
+  private func cancelOpenTaps() {
+    for (sessionId, open) in tapSessions {
+      let answer = open.merchantOrderID.isEmpty
+        ? nil
+        : VeyraSoftPOS.shared.payments.cancelPayment(merchantOrderID: open.merchantOrderID).rawValue
+      if answer != "TOO_LATE_TO_CANCEL_REQUEST_ALREADY_SENT" {
+        tapSessions.removeValue(forKey: sessionId)
+      }
+    }
   }
 
   private func requireSession(_ kind: String, _ reject: RCTPromiseRejectBlock) -> Bool {
@@ -326,8 +484,13 @@ class VeyraSdkReactNative: RCTEventEmitter {
                       rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     Task {
       do {
-        let banks = try await VeyraWallet.shared.tokenisation.banks(accountNumber: accountNumber)
-        resolve(banks.map { ["slug": $0.slug, "name": $0.name, "institutionCode": $0.institutionCode] })
+        let list = try await VeyraWallet.shared.tokenisation.banks(accountNumber: accountNumber)
+        resolve([
+          "banks": list.banks.map { ["slug": $0.slug, "name": $0.name, "institutionCode": $0.institutionCode] },
+          "responseStatus": list.responseStatus,
+          "responseStatusReason": self.opt(list.responseStatusReason),
+          "message": self.opt(list.message),
+        ])
       } catch { self.reject(rejecter, error) }
     }
   }
@@ -338,7 +501,11 @@ class VeyraSdkReactNative: RCTEventEmitter {
     guard let accountNumber = params["accountNumber"] as? String,
           let institutionCode = params["institutionCode"] as? String,
           let walletAccountID = params["walletAccountId"] as? String
-    else { return rejectValidation(rejecter, "accountNumber, institutionCode and walletAccountId are required") }
+    else {
+      return resolve(notSent(Self.invalidRequest, "accountNumber, institutionCode and walletAccountId are required",
+                             falseKeys: ["isApproved"], nullKeys: ["responseCode"],
+                             status: Self.failedStatus, operation: SdkOperation.shared.VERIFY_ACCOUNT))
+    }
     Task {
       do {
         let response = try await VeyraWallet.shared.tokenisation.verifyAccount(
@@ -370,7 +537,14 @@ class VeyraSdkReactNative: RCTEventEmitter {
           let emailAddress = params["emailAddress"] as? String,
           let recommendationRaw = params["recommendation"] as? String,
           let recommendation = TokenizationRecommendation(rawValue: recommendationRaw)
-    else { return rejectValidation(rejecter, "required digitise fields missing") }
+    else {
+      var refused = notSent(Self.invalidRequest, "required digitise fields missing",
+                            falseKeys: ["isApproved", "requiresActivation"],
+                            nullKeys: ["responseCode", "tokenUniqueReference", "tokenStored"],
+                            operation: SdkOperation.shared.DIGITISE)
+      refused["activationMethods"] = [Any]()
+      return resolve(refused)
+    }
     Task {
       do {
         let result = try await VeyraWallet.shared.tokenisation.digitise(
@@ -389,7 +563,10 @@ class VeyraSdkReactNative: RCTEventEmitter {
           accountScore: (params["accountScore"] as? String).flatMap { TrustScore(rawValue: $0) },
           recommendationReasons: (params["recommendationReasons"] as? [String])?
             .compactMap { TokenizationRecommendationReason(rawValue: $0) } ?? [],
-          bankName: params["bankName"] as? String
+          bankName: params["bankName"] as? String,
+          // The app's own id, so `wallet.cancelDigitise` can name this add-card; absent → the
+          // SDK generates one and the add-card cannot be cancelled.
+          clientRequestID: (params["clientRequestId"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         )
         resolve([
           "responseCode": result.responseCode as Any,
@@ -404,7 +581,6 @@ class VeyraSdkReactNative: RCTEventEmitter {
           "isApproved": result.isApproved,
           "requiresActivation": result.requiresActivation,
           "tokenStored": result.tokenStored,
-          "error": NSNull(),
         ])
       } catch { self.reject(rejecter, error) }
     }
@@ -417,10 +593,13 @@ class VeyraSdkReactNative: RCTEventEmitter {
                                    resolver resolve: @escaping RCTPromiseResolveBlock,
                                    rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     guard let method = ActivationMethod(rawValue: medium) else {
-      return rejectValidation(
-        rejecter,
-        "On iOS the activation medium must be MASKED_EMAIL or MASKED_MOBILE_PHONE"
-      )
+      // A bad argument on this platform: refused before anything was sent. Not a payment or
+      // digitisation, so FAILED, never NOT_SENT (the Android bridge's verify-account refusal agrees).
+      return resolve(notSent(
+        Self.invalidRequest, "On iOS the activation medium must be MASKED_EMAIL or MASKED_MOBILE_PHONE",
+        nullKeys: ["tokenUniqueReference", "expirationDateTime", "status", "failureCode"],
+        status: Self.failedStatus, operation: SdkOperation.shared.ACTIVATION
+      ))
     }
     let activationReason = ActivationReason(rawValue: reason) ?? .other
     Task {
@@ -435,6 +614,8 @@ class VeyraSdkReactNative: RCTEventEmitter {
           "message": response.message as Any,
           // Raw wire value: JS carries codes verbatim (unknown codes included).
           "failureCode": response.failureCodeRaw as Any,
+          "responseStatus": response.responseStatus,
+          "responseStatusReason": response.responseStatusReason as Any,
         ])
       } catch { self.reject(rejecter, error) }
     }
@@ -456,18 +637,9 @@ class VeyraSdkReactNative: RCTEventEmitter {
           "failureCode": response.failureCodeRaw as Any,
           "attemptsRemaining": response.attemptsRemaining as Any,
           "recommendDelete": response.recommendDeleteRaw as Any,
+          "responseStatus": response.responseStatus,
+          "responseStatusReason": response.responseStatusReason as Any,
         ])
-      } catch { self.reject(rejecter, error) }
-    }
-  }
-
-  @objc(walletCheckTokenActive:resolver:rejecter:)
-  func walletCheckTokenActive(_ ref: String, resolver resolve: @escaping RCTPromiseResolveBlock,
-                              rejecter rejecter: @escaping RCTPromiseRejectBlock) {
-    Task {
-      do {
-        let status = try await VeyraWallet.shared.tokenisation.tokenStatus(tokenUniqueReference: ref)
-        resolve(status == "ACTIVE")
       } catch { self.reject(rejecter, error) }
     }
   }
@@ -478,8 +650,13 @@ class VeyraSdkReactNative: RCTEventEmitter {
     Task {
       do {
         // Verbatim server status — JS carries values it does not know unchanged.
-        let status = try await VeyraWallet.shared.tokenisation.tokenStatus(tokenUniqueReference: ref)
-        resolve(status as Any)
+        let result = try await VeyraWallet.shared.tokenisation.tokenStatus(tokenUniqueReference: ref)
+        resolve([
+          "tokenStatus": self.opt(result.tokenStatus),
+          "responseStatus": result.responseStatus,
+          "responseStatusReason": self.opt(result.responseStatusReason),
+          "message": self.opt(result.message),
+        ])
       } catch { self.reject(rejecter, error) }
     }
   }
@@ -578,14 +755,21 @@ class VeyraSdkReactNative: RCTEventEmitter {
   @objc(walletSetActiveCard:resolver:rejecter:)
   func walletSetActiveCard(_ cardId: String, resolver resolve: @escaping RCTPromiseResolveBlock,
                            rejecter rejecter: @escaping RCTPromiseRejectBlock) {
-    // iOS has no tap-to-pay: selecting the active card arms nothing, so no session gate.
+    // Gated like Android's, so one JS integration behaves the same on both: the pay screen's
+    // session must be open. (On iOS the selection arms no tap — it picks the card the QR rails use.)
+    guard initialized else { return rejectNotInitialized(rejecter) }
+    guard requireSession("pay", rejecter) else { return }
     Task {
       do {
-        try await VeyraWallet.shared.tokenisation.setActiveToken(cardId)
+        let selection = try await VeyraWallet.shared.tokenisation.setActiveToken(cardId)
         // Refusals are NOT armed here any more: they are per card and reach JS through
         // `wallet.onPaymentRefusal`, which observes whichever card the app is listening to
         // rather than only the active one.
-        resolve(nil)
+        resolve([
+          "responseStatus": selection.responseStatus,
+          "responseStatusReason": self.opt(selection.responseStatusReason),
+          "message": self.opt(selection.message),
+        ])
       }
       catch { self.reject(rejecter, error) }
     }
@@ -661,6 +845,8 @@ class VeyraSdkReactNative: RCTEventEmitter {
           "tokenUniqueReference": response.tokenUniqueReference as Any,
           "status": response.status as Any,
           "message": response.message as Any,
+          "responseStatus": response.responseStatus,
+          "responseStatusReason": response.responseStatusReason as Any,
         ])
       }
       catch { self.reject(rejecter, error) }
@@ -686,6 +872,8 @@ class VeyraSdkReactNative: RCTEventEmitter {
           "amountMinorUnits": payment.amountMinorUnits,
           "currencyNumeric": payment.currencyNumeric,
           "expiresAtEpochSeconds": payment.expiryEpochSeconds,
+          // What wallet.cancelPayment takes; null on a QR that carries none.
+          "merchantOrderId": payment.merchantOrderID as Any,
         ])
       case .rejected(let reason, let detail):
         resolve(["verified": false, "reason": reason.rawValue, "detail": detail as Any])
@@ -700,7 +888,7 @@ class VeyraSdkReactNative: RCTEventEmitter {
   func walletPayScannedContext(_ handle: String, resolver resolve: @escaping RCTPromiseResolveBlock,
                                rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     guard let payment = mpmContexts.removeValue(forKey: handle) else {
-      return rejectValidation(rejecter, "Unknown or already-used payment handle — re-inspect the QR")
+      return resolve(paymentOutcomeNotSent("Unknown or already-used payment handle — re-inspect the QR"))
     }
     Task {
       do {
@@ -733,16 +921,38 @@ class VeyraSdkReactNative: RCTEventEmitter {
             self?.sendEvent(withName: EventName.qrExpired, body: ["scope": "wallet", "handle": NSNull()])
           }
         )
+        // A QR to render on APPROVED; otherwise the reason none was made, and no payload.
         resolve([
-          "tokenUniqueReference": qr.tokenUniqueReference,
-          "payload": qr.payload,
+          "tokenUniqueReference": self.opt(qr.tokenUniqueReference),
+          "payload": self.opt(qr.payload),
           "amountMinorUnits": qr.amountMinorUnits,
-          "currencyNumeric": qr.currencyNumeric,
+          "currencyNumeric": self.opt(qr.currencyNumeric),
           "expiresAtEpochMillis": qr.expiresAtEpochMillis,
-          "transactionHash": qr.transactionHash,
+          "transactionHash": self.opt(qr.transactionHash),
+          "responseStatus": qr.responseStatus,
+          "responseStatusReason": self.opt(qr.responseStatusReason),
+          "message": self.opt(qr.message),
         ])
       } catch { self.reject(rejecter, error) }
     }
+  }
+
+  /// Cancels the scan-to-pay of the QR carrying `merchantOrderId`; resolves with the
+  /// `CancelResult` name. `walletPayScannedContext` still resolves with its own outcome.
+  @objc(walletCancelPayment:resolver:rejecter:)
+  func walletCancelPayment(_ merchantOrderId: String, resolver resolve: @escaping RCTPromiseResolveBlock,
+                           rejecter rejecter: @escaping RCTPromiseRejectBlock) {
+    guard initialized else { return rejectNotInitialized(rejecter) }
+    resolve(VeyraWallet.shared.tokenisation.cancelPayment(merchantOrderID: merchantOrderId).rawValue)
+  }
+
+  /// Cancels the digitise started with `clientRequestId`; resolves with the `CancelResult` name.
+  /// `walletDigitise` still resolves with its own outcome.
+  @objc(walletCancelDigitise:resolver:rejecter:)
+  func walletCancelDigitise(_ clientRequestId: String, resolver resolve: @escaping RCTPromiseResolveBlock,
+                            rejecter rejecter: @escaping RCTPromiseRejectBlock) {
+    guard initialized else { return rejectNotInitialized(rejecter) }
+    resolve(VeyraWallet.shared.tokenisation.cancelDigitise(clientRequestID: clientRequestId).rawValue)
   }
 
   @objc(walletCancelQrExpiry:rejecter:)
@@ -826,42 +1036,47 @@ class VeyraSdkReactNative: RCTEventEmitter {
   func walletReconcilePendingTransactions(_ resolve: @escaping RCTPromiseResolveBlock,
                                           rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     Task {
-      do { try await VeyraWallet.shared.tokenisation.reconcilePendingTransactions(); resolve(nil) }
+      do {
+        let r = try await VeyraWallet.shared.tokenisation.reconcilePendingTransactions()
+        resolve(["checked": r.checked, "failureReason": self.opt(r.failureReason), "message": self.opt(r.message)])
+      }
       catch { self.reject(rejecter, error) }
     }
   }
 
   /// The per-transaction counterpart to the reconcile above — one row, keyed by hash,
-  /// resolving with the updated stored row rather than nothing. A transport failure rejects with the
-  /// typed code (`NO_NETWORK_CONNECTION` when offline) and leaves the row untouched.
+  /// resolving with the updated stored row rather than nothing. A check that could not be made
+  /// resolves with its `failureReason` (`NO_NETWORK_CONNECTION` when offline), the row untouched.
   @objc(walletRefreshTransactionStatus:resolver:rejecter:)
   func walletRefreshTransactionStatus(_ transactionHash: String,
                                       resolver resolve: @escaping RCTPromiseResolveBlock,
                                       rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     Task {
       do {
-        let row = try await VeyraWallet.shared.tokenisation.refreshTransactionStatus(
+        let lookup = try await VeyraWallet.shared.tokenisation.refreshTransactionStatus(
           transactionHash: transactionHash
         )
-        resolve(row.map(self.summaryDict))
+        resolve(self.lookupDict(lookup.value.map(self.summaryDict),
+                                failureReason: lookup.failureReason, message: lookup.message))
       } catch { self.reject(rejecter, error) }
     }
   }
 
   /// "Check merchant credit now" for one wallet payment. Settlement only — it can never
-  /// change the row's outcome triple. A transport failure rejects with the typed code
-  /// (`NO_NETWORK_CONNECTION` when offline) and leaves the row untouched; an ineligible row makes no
-  /// call at all and resolves unchanged.
+  /// change the row's outcome triple. A check that could not be made resolves with its
+  /// `failureReason` (`NO_NETWORK_CONNECTION` when offline), the row untouched; an ineligible row
+  /// makes no call at all and resolves unchanged.
   @objc(walletRefreshCreditConfirmation:resolver:rejecter:)
   func walletRefreshCreditConfirmation(_ transactionHash: String,
                                        resolver resolve: @escaping RCTPromiseResolveBlock,
                                        rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     Task {
       do {
-        let row = try await VeyraWallet.shared.tokenisation.refreshCreditConfirmation(
+        let lookup = try await VeyraWallet.shared.tokenisation.refreshCreditConfirmation(
           transactionHash: transactionHash
         )
-        resolve(row.map(self.summaryDict))
+        resolve(self.lookupDict(lookup.value.map(self.summaryDict),
+                                failureReason: lookup.failureReason, message: lookup.message))
       } catch { self.reject(rejecter, error) }
     }
   }
@@ -872,10 +1087,15 @@ class VeyraSdkReactNative: RCTEventEmitter {
                             rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     Task {
       do {
-        let receipt = try await VeyraWallet.shared.tokenisation.processReceipt(
+        let scan = try await VeyraWallet.shared.tokenisation.processReceipt(
           payload, expectedTransactionHash: expectedHash
         )
-        resolve(self.receiptDict(receipt))
+        resolve([
+          "receipt": scan.receipt.map(self.receiptDict) as Any? ?? NSNull(),
+          "responseStatus": scan.responseStatus,
+          "responseStatusReason": self.opt(scan.responseStatusReason),
+          "message": self.opt(scan.message),
+        ])
       } catch { self.reject(rejecter, error) }
     }
   }
@@ -906,7 +1126,9 @@ class VeyraSdkReactNative: RCTEventEmitter {
   func merchantRegister(_ registration: NSDictionary, resolver resolve: @escaping RCTPromiseResolveBlock,
                         rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     guard let typeRaw = registration["merchantType"] as? String,
-          let merchantType = MerchantRegistration.MerchantType(rawValue: typeRaw),
+          let merchantType = MerchantRegistration.MerchantType(rawValue: typeRaw)
+    else { return resolve(merchantRegistrationRefused("merchantType must be PERSONAL or BUSINESS")) }
+    guard
           let merchantName = registration["merchantName"] as? String,
           let emailAddress = registration["emailAddress"] as? String,
           let phoneNumber = registration["phoneNumber"] as? String,
@@ -916,7 +1138,7 @@ class VeyraSdkReactNative: RCTEventEmitter {
           let countryCode = registration["countryCode"] as? String,
           let accountNumber = registration["accountNumber"] as? String,
           let institutionCode = registration["institutionCode"] as? String
-    else { return rejectValidation(rejecter, "required merchant registration fields missing") }
+    else { return resolve(merchantRegistrationRefused("required merchant registration fields missing")) }
     let reg = MerchantRegistration(
       merchantType: merchantType,
       merchantName: merchantName,
@@ -942,6 +1164,8 @@ class VeyraSdkReactNative: RCTEventEmitter {
           "terminalId": result.terminalID as Any,
           "merchantStatus": result.merchantStatus as Any,
           "message": result.message as Any,
+          "responseStatus": result.responseStatus,
+          "responseStatusReason": result.responseStatusReason as Any,
         ])
       } catch { self.reject(rejecter, error) }
     }
@@ -952,8 +1176,13 @@ class VeyraSdkReactNative: RCTEventEmitter {
                                   rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     Task {
       do {
-        let banks = try await VeyraSoftPOS.shared.merchant.banks()
-        resolve(banks.map { ["slug": $0.slug, "name": $0.name, "institutionCode": $0.institutionCode] })
+        let list = try await VeyraSoftPOS.shared.merchant.banks()
+        resolve([
+          "banks": list.banks.map { ["slug": $0.slug, "name": $0.name, "institutionCode": $0.institutionCode] },
+          "responseStatus": list.responseStatus,
+          "responseStatusReason": self.opt(list.responseStatusReason),
+          "message": self.opt(list.message),
+        ])
       } catch { self.reject(rejecter, error) }
     }
   }
@@ -994,21 +1223,23 @@ class VeyraSdkReactNative: RCTEventEmitter {
     resolve(VeyraSoftPOS.shared.merchant.stored.map(storedMerchantDict))
   }
 
-  private func requireMerchantID(_ rejecter: RCTPromiseRejectBlock) -> String? {
-    guard let merchantID = VeyraSoftPOS.shared.merchant.stored?.merchantID else {
-      rejectValidation(rejecter, "No registered merchant — register first")
-      return nil
-    }
-    return merchantID
+  /// The stored merchant's ID, or nil when none is registered — which each caller answers as its
+  /// own `NOT_SENT` / `MISSING_MANDATORY_CONFIG` outcome (nothing sent), as Android's SDK does.
+  private var storedMerchantID: String? {
+    VeyraSoftPOS.shared.merchant.stored?.merchantID.trimmingCharacters(in: .whitespaces).nilIfEmpty
   }
+
+  private static let noMerchantMessage = "No merchant is registered on this device"
 
   @objc(merchantRefreshStatus:rejecter:)
   func merchantRefreshStatus(_ resolve: @escaping RCTPromiseResolveBlock,
                              rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     guard initialized else { return rejectNotInitialized(rejecter) }
-    guard let merchantID = requireMerchantID(rejecter) else { return }
+    guard let merchantID = storedMerchantID else {
+      return resolve(merchantStatusRefused(Self.missingMandatoryConfig, Self.noMerchantMessage))
+    }
     Task {
-      do { resolve(try await VeyraSoftPOS.shared.merchant.status(merchantID: merchantID).status) }
+      do { resolve(self.merchantStatusDict(try await VeyraSoftPOS.shared.merchant.status(merchantID: merchantID))) }
       catch { self.reject(rejecter, error) }
     }
   }
@@ -1017,9 +1248,11 @@ class VeyraSdkReactNative: RCTEventEmitter {
   func merchantActivate(_ resolve: @escaping RCTPromiseResolveBlock,
                         rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     guard initialized else { return rejectNotInitialized(rejecter) }
-    guard let merchantID = requireMerchantID(rejecter) else { return }
+    guard let merchantID = storedMerchantID else {
+      return resolve(merchantStatusRefused(Self.missingMandatoryConfig, Self.noMerchantMessage))
+    }
     Task {
-      do { resolve(try await VeyraSoftPOS.shared.merchant.activate(merchantID: merchantID).status) }
+      do { resolve(self.merchantStatusDict(try await VeyraSoftPOS.shared.merchant.activate(merchantID: merchantID))) }
       catch { self.reject(rejecter, error) }
     }
   }
@@ -1028,9 +1261,11 @@ class VeyraSdkReactNative: RCTEventEmitter {
   func merchantDeactivate(_ resolve: @escaping RCTPromiseResolveBlock,
                           rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     guard initialized else { return rejectNotInitialized(rejecter) }
-    guard let merchantID = requireMerchantID(rejecter) else { return }
+    guard let merchantID = storedMerchantID else {
+      return resolve(merchantStatusRefused(Self.missingMandatoryConfig, Self.noMerchantMessage))
+    }
     Task {
-      do { resolve(try await VeyraSoftPOS.shared.merchant.deactivate(merchantID: merchantID).status) }
+      do { resolve(self.merchantStatusDict(try await VeyraSoftPOS.shared.merchant.deactivate(merchantID: merchantID))) }
       catch { self.reject(rejecter, error) }
     }
   }
@@ -1039,7 +1274,9 @@ class VeyraSdkReactNative: RCTEventEmitter {
   func merchantUpdate(_ update: NSDictionary, resolver resolve: @escaping RCTPromiseResolveBlock,
                       rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     guard initialized else { return rejectNotInitialized(rejecter) }
-    guard let merchantID = requireMerchantID(rejecter) else { return }
+    guard let merchantID = storedMerchantID else {
+      return resolve(merchantStatusRefused(Self.missingMandatoryConfig, Self.noMerchantMessage))
+    }
     guard let merchantName = update["merchantName"] as? String,
           let emailAddress = update["emailAddress"] as? String,
           let phoneNumber = update["phoneNumber"] as? String,
@@ -1049,7 +1286,7 @@ class VeyraSdkReactNative: RCTEventEmitter {
           let countryCode = update["countryCode"] as? String,
           let accountNumber = update["accountNumber"] as? String,
           let institutionCode = update["institutionCode"] as? String
-    else { return rejectValidation(rejecter, "required merchant update fields missing") }
+    else { return resolve(merchantStatusRefused(Self.invalidRequest, "required merchant update fields missing")) }
     let merchantUpdate = MerchantUpdate(
       merchantName: merchantName,
       emailAddress: emailAddress,
@@ -1065,7 +1302,7 @@ class VeyraSdkReactNative: RCTEventEmitter {
       bvn: update["bvn"] as? String
     )
     Task {
-      do { resolve(try await VeyraSoftPOS.shared.merchant.update(merchantID: merchantID, merchantUpdate).status) }
+      do { resolve(self.merchantStatusDict(try await VeyraSoftPOS.shared.merchant.update(merchantID: merchantID, merchantUpdate))) }
       catch { self.reject(rejecter, error) }
     }
   }
@@ -1077,18 +1314,26 @@ class VeyraSdkReactNative: RCTEventEmitter {
                         rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     guard initialized else { return rejectNotInitialized(rejecter) }
     guard requireSession("getPaid", rejecter) else { return }
+    let sessionId = UUID().uuidString
     guard let amount = request["amountMinorUnits"] as? Double else {
-      return rejectValidation(rejecter, "amountMinorUnits is required")
+      // A bad argument ends the tap the way the SDK ends a blank order id: a NOT_SENT result on
+      // the event stream, with nothing armed (the Android module does the same).
+      resolve(["sessionId": sessionId])
+      sendEvent(withName: EventName.merchantTap, body: [
+        "sessionId": sessionId,
+        "type": "result",
+        "result": tapResultNotSent("amountMinorUnits is required"),
+      ])
+      return
     }
     let currencyCode = Int32((request["currency"] as? String).flatMap(Int.init) ?? 566)
-    let sessionId = UUID().uuidString
+    // Required. Missing from untyped JS → blank → start() refuses it with INVALID_REQUEST.
+    let merchantOrderID = (request["merchantOrderId"] as? String) ?? ""
 
     let session = VeyraSoftPOS.shared.tap.session(
       amountMinorUnits: Int64(amount),
       currencyCode: currencyCode,
-      // Required. Missing from untyped JS → blank → start() refuses it with
-      // INVALID_REQUEST. Until now this bridge never passed one, so no RN iOS tap carried it.
-      merchantOrderID: (request["merchantOrderId"] as? String) ?? ""
+      merchantOrderID: merchantOrderID
     ) { [weak self] event in
       guard let self else { return }
       var body: [String: Any] = ["sessionId": sessionId]
@@ -1111,9 +1356,15 @@ class VeyraSdkReactNative: RCTEventEmitter {
         self.tapSessions.removeValue(forKey: sessionId)
       case .result(let result):
         body["type"] = "result"
+        // The outcome as the SDK stated it — a refusal before sending (blank order id, the
+        // other mode's payment in flight, cancelled) is NOT_SENT with its reason and no code.
+        let status = result.responseStatus ?? result.status
         body["result"] = [
-          "responseCode": NSNull(),
-          "status": result.status,
+          "responseCode": self.opt(result.responseCode),
+          "responseStatus": status,
+          "responseStatusReason": self.opt(result.responseStatusReason),
+          // Deprecated alias of responseStatus, kept for one release.
+          "status": status,
           "message": result.errorMessage as Any,
           "amountDisplay": NSNull(),
           "cardScheme": NSNull(),
@@ -1126,6 +1377,7 @@ class VeyraSdkReactNative: RCTEventEmitter {
           // credit-confirmation event (and on the stored row).
           "creditTransactionId": result.creditTransactionID.map { $0 as Any } ?? NSNull(),
           "isCreditConfirmationSupported": result.isCreditConfirmationSupported.map { $0 as Any } ?? NSNull(),
+          "originalPayment": self.originalPaymentDict(result.originalPayment),
         ]
         self.tapSessions.removeValue(forKey: sessionId)
       @unknown default:
@@ -1135,7 +1387,7 @@ class VeyraSdkReactNative: RCTEventEmitter {
     }
 
     do {
-      tapSessions[sessionId] = session
+      tapSessions[sessionId] = (session, merchantOrderID)
       try session.start()
       resolve(["sessionId": sessionId])
     } catch {
@@ -1144,11 +1396,14 @@ class VeyraSdkReactNative: RCTEventEmitter {
     }
   }
 
-  @objc(merchantTapCancel:resolver:rejecter:)
-  func merchantTapCancel(_ sessionId: String, resolver resolve: @escaping RCTPromiseResolveBlock,
-                         rejecter rejecter: @escaping RCTPromiseRejectBlock) {
-    tapSessions.removeValue(forKey: sessionId)?.cancel()
-    resolve(nil)
+  /// Cancels the SoftPOS payment started with `merchantOrderId` — tap, customer-QR charge or
+  /// payment-QR create alike. Resolves with the `CancelResult` name; the payment itself still
+  /// ends with its own outcome (a tap's on its `result` event). Needs no session.
+  @objc(merchantCancelPayment:resolver:rejecter:)
+  func merchantCancelPayment(_ merchantOrderId: String, resolver resolve: @escaping RCTPromiseResolveBlock,
+                             rejecter rejecter: @escaping RCTPromiseRejectBlock) {
+    guard initialized else { return rejectNotInitialized(rejecter) }
+    resolve(VeyraSoftPOS.shared.payments.cancelPayment(merchantOrderID: merchantOrderId).rawValue)
   }
 
   // ── Merchant: get-paid QR (MPM) ─────────────────────────────────────────────
@@ -1159,7 +1414,9 @@ class VeyraSdkReactNative: RCTEventEmitter {
                                     resolver resolve: @escaping RCTPromiseResolveBlock,
                                     rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     guard initialized else { return rejectNotInitialized(rejecter) }
-    guard let merchantID = requireMerchantID(rejecter) else { return }
+    guard let merchantID = storedMerchantID else {
+      return resolve(paymentContextQrNotSent(Self.missingMandatoryConfig, Self.noMerchantMessage))
+    }
     Task {
       do {
         let context = try await VeyraSoftPOS.shared.payments.createContext(
@@ -1171,7 +1428,16 @@ class VeyraSdkReactNative: RCTEventEmitter {
           },
           merchantOrderID: merchantOrderId ?? ""
         )
-        resolve(["txRef": context.txRef, "mpmPayload": context.mpmPayload, "expiry": context.expiry as Any])
+        // txRef / mpmPayload only on APPROVED; otherwise the reason there is no QR.
+        resolve([
+          "txRef": self.opt(context.txRef),
+          "mpmPayload": self.opt(context.mpmPayload),
+          "expiry": self.opt(context.expiry),
+          "responseStatus": context.responseStatus,
+          "responseStatusReason": self.opt(context.responseStatusReason),
+          "message": self.opt(context.message),
+          "originalPayment": self.originalPaymentDict(context.originalPayment),
+        ])
       } catch { self.reject(rejecter, error) }
     }
   }
@@ -1189,15 +1455,19 @@ class VeyraSdkReactNative: RCTEventEmitter {
                              rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     Task {
       do {
-        let state = try await VeyraSoftPOS.shared.payments.contextStatus(txRef: txRef)
-        resolve([
-          "txRef": state.txRef,
-          "state": state.state,
-          "responseCode": state.responseCode as Any,
-          "transactionHash": NSNull(),
-          "isSettled": state.isSettled,
-          "isApproved": state.isApproved,
-        ])
+        // A poll's own failure is never the payment's state: a lookup, with the reason.
+        let lookup = try await VeyraSoftPOS.shared.payments.contextStatus(txRef: txRef)
+        let value: [String: Any]? = lookup.value.map { state in
+          [
+            "txRef": state.txRef,
+            "state": state.state,
+            "responseCode": state.responseCode as Any,
+            "transactionHash": NSNull(),
+            "isSettled": state.isSettled,
+            "isApproved": state.isApproved,
+          ]
+        }
+        resolve(self.lookupDict(value, failureReason: lookup.failureReason, message: lookup.message))
       } catch { self.reject(rejecter, error) }
     }
   }
@@ -1209,15 +1479,26 @@ class VeyraSdkReactNative: RCTEventEmitter {
                                  rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     Task {
       do {
-        let scanned = try await VeyraSoftPOS.shared.payments.inspectCustomerQr(payload)
-        let handle = UUID().uuidString
-        self.cpmQrs[handle] = scanned
+        let inspection = try await VeyraSoftPOS.shared.payments.inspectCustomerQr(payload)
+        // A handle is issued only for a QR that can be charged; the card data stays native.
+        var qr: [String: Any]?
+        if let scanned = inspection.qr {
+          let handle = UUID().uuidString
+          self.cpmQrs[handle] = scanned
+          qr = [
+            "handle": handle,
+            // Same display form as the Android module: bullets + the last four.
+            "maskedCard": "•••• " + scanned.maskedCard,
+            "amountMinorUnits": scanned.amountMinorUnits,
+            "currencyNumeric": scanned.currencyNumeric,
+            "cardholderName": scanned.cardholderName as Any,
+          ]
+        }
         resolve([
-          "handle": handle,
-          "maskedCard": scanned.maskedCard,
-          "amountMinorUnits": scanned.amountMinorUnits,
-          "currencyNumeric": scanned.currencyNumeric,
-          "cardholderName": scanned.cardholderName as Any,
+          "qr": self.opt(qr),
+          "responseStatus": inspection.responseStatus,
+          "responseStatusReason": self.opt(inspection.responseStatusReason),
+          "message": self.opt(inspection.message),
         ])
       } catch { self.reject(rejecter, error) }
     }
@@ -1228,22 +1509,29 @@ class VeyraSdkReactNative: RCTEventEmitter {
                                 resolver resolve: @escaping RCTPromiseResolveBlock,
                                 rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     guard let scanned = cpmQrs.removeValue(forKey: handle) else {
-      return rejectValidation(rejecter, "Unknown or already-used QR handle — re-scan")
+      return resolve(customerQrChargeNotSent("Unknown or already-used QR handle — re-scan"))
     }
     Task {
       do {
         let outcome = try await VeyraSoftPOS.shared.payments
           .chargeCustomerQr(scanned, merchantOrderID: merchantOrderId ?? "")
         resolve([
+          // `approved` is the facade's reading of the status, never of the code.
           "approved": outcome.approved,
           "responseCode": outcome.responseCode as Any,
+          "responseStatus": outcome.responseStatus as Any,
+          "responseStatusReason": outcome.responseStatusReason as Any,
+          "message": NSNull(),
           "transactionId": outcome.transactionID as Any,
           "merchantTransactionReference": outcome.reference,
+          // The app's own order id, echoed as it was passed (the iOS outcome carries no echo).
+          "merchantOrderId": self.opt(merchantOrderId),
           // An approved answer carries the merchant-bank credit id + supported flag — the
           // result screen's cue to wait for confirmation (on iOS the app polls the manual
           // fetch itself; there is no background poller).
           "creditTransactionId": outcome.creditTransactionID as Any,
           "isCreditConfirmationSupported": outcome.isCreditConfirmationSupported as Any,
+          "originalPayment": self.originalPaymentDict(outcome.originalPayment),
         ])
       } catch { self.reject(rejecter, error) }
     }
@@ -1300,33 +1588,73 @@ class VeyraSdkReactNative: RCTEventEmitter {
   }
 
   /// The on-demand "check status now" for one merchant transaction. Unlike
-  /// `merchantGetTransaction` above — a local read over `history` — this goes to the gateway, so a
-  /// transport failure is a real rejection carrying the typed code (`NO_NETWORK_CONNECTION`).
+  /// `merchantGetTransaction` above — a local read over `history` — this goes to the gateway; a
+  /// check that could not be made resolves with its `failureReason` (`NO_NETWORK_CONNECTION`).
+  /// Lookup by the app's own order id — a read: resolves a `VeyraLookup<OrderPaymentStatus>`.
+  @objc(merchantPaymentStatus:resolver:rejecter:)
+  func merchantPaymentStatus(_ merchantOrderId: String,
+                             resolver resolve: @escaping RCTPromiseResolveBlock,
+                             rejecter rejecter: @escaping RCTPromiseRejectBlock) {
+    guard initialized else { return rejectNotInitialized(rejecter) }
+    Task {
+      do {
+        let lookup = try await VeyraSoftPOS.shared.transactions.paymentStatus(merchantOrderID: merchantOrderId)
+        resolve(self.lookupDict(lookup.value.map(self.orderPaymentStatusDict),
+                                failureReason: lookup.failureReason, message: lookup.message))
+      } catch { self.reject(rejecter, error) }
+    }
+  }
+
+  private func orderPaymentStatusDict(_ o: OrderPaymentStatus) -> [String: Any] {
+    [
+      "merchantOrderId": o.merchantOrderID,
+      "responseStatus": o.responseStatus,
+      "responseStatusReason": opt(o.responseStatusReason),
+      "responseCode": opt(o.responseCode),
+      "merchantTransactionReference": opt(o.reference),
+      "transactionId": opt(o.transactionID),
+      "amountMinorUnits": o.amountMinorUnits.map { $0 as Any } ?? NSNull(),
+      "answeredBy": o.answeredBy,
+      "attempts": o.attempts.map { a -> [String: Any] in
+        [
+          "merchantTransactionReference": opt(a.reference),
+          "transactionId": opt(a.transactionID),
+          "amountMinorUnits": a.amountMinorUnits.map { $0 as Any } ?? NSNull(),
+          "responseCode": opt(a.responseCode),
+          "responseStatus": opt(a.responseStatus),
+          "responseStatusReason": opt(a.responseStatusReason),
+        ]
+      },
+    ]
+  }
+
   @objc(merchantRefreshTransactionStatus:resolver:rejecter:)
   func merchantRefreshTransactionStatus(_ reference: String,
                                         resolver resolve: @escaping RCTPromiseResolveBlock,
                                         rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     Task {
       do {
-        let row = try await VeyraSoftPOS.shared.transactions.refreshStatus(reference: reference)
-        resolve(row.map(self.merchantTransactionDict))
+        let lookup = try await VeyraSoftPOS.shared.transactions.refreshStatus(reference: reference)
+        resolve(self.lookupDict(lookup.value.map(self.merchantTransactionDict),
+                                failureReason: lookup.failureReason, message: lookup.message))
       } catch { self.reject(rejecter, error) }
     }
   }
 
   /// "Check merchant credit now" for one sale. Unlike `merchantGetTransaction` — a local
-  /// read — this goes to the gateway, so a transport failure is a real rejection carrying the typed
-  /// code (`NO_NETWORK_CONNECTION`). An ineligible row makes no call and resolves unchanged.
+  /// read — this goes to the gateway; a check that could not be made resolves with its
+  /// `failureReason` (`NO_NETWORK_CONNECTION`). An ineligible row makes no call and resolves unchanged.
   @objc(merchantRefreshCreditConfirmation:resolver:rejecter:)
   func merchantRefreshCreditConfirmation(_ reference: String,
                                          resolver resolve: @escaping RCTPromiseResolveBlock,
                                          rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     Task {
       do {
-        let row = try await VeyraSoftPOS.shared.transactions.refreshCreditConfirmation(
+        let lookup = try await VeyraSoftPOS.shared.transactions.refreshCreditConfirmation(
           reference: reference
         )
-        resolve(row.map(self.merchantTransactionDict))
+        resolve(self.lookupDict(lookup.value.map(self.merchantTransactionDict),
+                                failureReason: lookup.failureReason, message: lookup.message))
       } catch { self.reject(rejecter, error) }
     }
   }
@@ -1355,4 +1683,9 @@ class VeyraSdkReactNative: RCTEventEmitter {
       } catch { self.reject(rejecter, error) }
     }
   }
+}
+
+private extension String {
+  /// nil for an empty string.
+  var nilIfEmpty: String? { isEmpty ? nil : self }
 }

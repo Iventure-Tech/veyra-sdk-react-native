@@ -325,6 +325,24 @@ final class KeychainMerchantKeyStore: MerchantKeyStore {
         return SymmetricKey(data: data)
     }
 
+    /// The App ID prefix (normally the Apple Team ID) this app's Keychain items are filed under:
+    /// the leading component of the stored-merchant key's access group. App Attest binds to
+    /// `prefix.bundleID`, so this is what the device attestation needs — detected, not configured.
+    /// Nil when there is no Keychain (hostless tests) or the group cannot be read.
+    func appIDPrefix() -> String? {
+        guard key() != nil else { return nil }
+        var query = baseQuery
+        query[kSecReturnAttributes as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let attributes = item as? [String: Any],
+              let group = attributes[kSecAttrAccessGroup as String] as? String,
+              let prefix = group.split(separator: ".").first, !prefix.isEmpty
+        else { return nil }
+        return String(prefix)
+    }
+
     func key() -> SymmetricKey? {
         if let key = existingKey() { return key }
         let key = SymmetricKey(size: .bits256)

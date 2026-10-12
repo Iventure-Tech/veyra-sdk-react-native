@@ -61,16 +61,23 @@ public final class VeyraSDK: @unchecked Sendable {
     /// signed in. The process starts **inert** (`.none`); safe to call again (reconfigures,
     /// stays inert). A different customer stops the previous customer's work in both SDKs.
     ///
-    /// - Parameter customerID: The customer your app has authenticated. Never leaves the device.
+    /// - Parameters:
+    ///   - customerID: The customer your app has authenticated. The wallet sends it to Veyra on
+    ///     its card requests (add card, eligibility, activation) so support can find them;
+    ///     SoftPOS never sends it. Device logs only ever show it masked.
+    ///   - provider: How both SDKs reach Veyra — one provider shared by wallet and SoftPOS: your
+    ///     `VeyraAssertionProvider` or `VeyraProxyProvider`.
+    /// - Throws: the member SDK's `invalidConfiguration` when the provider cannot be used.
     public static func configure(
         customerID: String,
+        provider: any VeyraProvider,
         softpos: VeyraSoftPOSConfiguration,
         wallet: VeyraWalletConfiguration
-    ) {
+    ) throws {
         shared.lock.lock()
         defer { shared.lock.unlock() }
-        VeyraSoftPOS.configure(softpos, customerID: customerID)
-        VeyraWallet.configure(wallet, customerID: customerID)
+        try VeyraSoftPOS.configure(softpos, customerID: customerID, provider: provider)
+        try VeyraWallet.configure(wallet, customerID: customerID, provider: provider)
         VeyraSdkKmp.shared.configure()
         shared.installBackgroundInertGuard()
         shared.configured = true
@@ -111,11 +118,12 @@ public final class VeyraSDK: @unchecked Sendable {
     }
 
     /// The app's current exclusive mode.
+    /// - Throws: `VeyraSDKError.notConfigured` before `configure(customerID:provider:softpos:wallet:)`.
     public var currentMode: VeyraMode {
-        lock.lock()
-        defer { lock.unlock() }
-        guard configured else { return .none }
-        return VeyraMode(rawValue: VeyraSdkKmp.shared.currentMode()) ?? .none
+        get throws {
+            try requireConfigured()
+            return VeyraMode(rawValue: VeyraSdkKmp.shared.currentMode()) ?? .none
+        }
     }
 
 }

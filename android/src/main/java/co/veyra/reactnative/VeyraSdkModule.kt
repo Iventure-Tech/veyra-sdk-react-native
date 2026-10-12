@@ -3,6 +3,8 @@ package co.veyra.reactnative
 import androidx.appcompat.app.AppCompatActivity
 import androidx.fragment.app.FragmentActivity
 import co.veyra.common.Environment
+import co.veyra.common.VeyraSetupCode
+import co.veyra.common.VeyraSetupException
 import co.veyra.core.NfcMode
 import co.veyra.reactnative.Mappers.opt
 import co.veyra.reactnative.Mappers.optStringList
@@ -14,6 +16,7 @@ import co.veyra.softpos.payment.sdk.TransactionRequest
 import co.veyra.softpos.payment.sdk.VeyraSoftPOSSdk
 import co.veyra.softpos.payment.sdk.VeyraSoftPosSdkConfig
 import co.veyra.softpos.payment.sdk.context.ContextPaymentClient
+import co.veyra.softpos.payment.sdk.merchant.MerchantStatusClient
 import co.veyra.softpos.payment.sdk.cpm.ScannedCpmQr
 import co.veyra.wallet.sdk.VeyraWalletSdk
 import co.veyra.wallet.sdk.VeyraWalletSdkConfig
@@ -41,9 +44,14 @@ import java.util.UUID
  * Mode handling (the single-Activity contract): the SDKs are initialised WITHOUT their
  * Activity-lifecycle observers (`VeyraWalletSdk.initialize(activity = null)`,
  * `VeyraSoftPOSSdk.initializeHosted`) and the exclusive NFC mode is driven solely by the
- * focus-bridged [SingleActivityModeSession] — JS screen focus opens/closes it. Tap APIs
- * are gated on the session (SESSION_REQUIRED), so a screen that forgot to mount its
- * session fails loud at development time instead of leaving the device armed.
+ * focus-bridged [SingleActivityModeSession] — JS screen focus opens/closes it. The calls
+ * that arm NFC (`merchantTapStart`, `walletSetActiveCard`) are gated on the session
+ * (SESSION_REQUIRED, the same two on iOS), so a screen that forgot to mount its session fails
+ * loud at development time instead of leaving the device armed.
+ *
+ * Outcomes: every operation resolves with the SDK's outcome map (see [Mappers]); a promise
+ * rejects only with a setup error ([VeyraPromises]). A bad call argument — an unknown handle or
+ * enum value, a missing field — is not a setup error: it resolves `NOT_SENT` / `INVALID_REQUEST`.
  */
 class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext), LifecycleEventListener {
@@ -58,21 +66,23 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
     private val session = SingleActivityModeSession()
     private val mpmContexts = HandleRegistry<VerifiedPaymentContext>()
     private val cpmQrs = HandleRegistry<ScannedCpmQr>()
+    private val connections = ConnectionBridge(reactContext)
 
     @Volatile private var initialized = false
     /** False after [signOut] until the next [initialize]: every data call is refused. */
     @Volatile private var signedIn = false
     @Volatile private var customerId: String? = null
     @Volatile private var softposConfig: VeyraSoftPosSdkConfig? = null
+    @Volatile private var softposProvider: co.veyra.common.providers.VeyraProvider? = null
     @Volatile private var contextClient: ContextPaymentClient? = null
-    @Volatile private var currentTapSessionId: String? = null
 
     init {
+        // Failure lines from this process say they came through React Native, so support can tell
+        // an RN integration from a native one on the same device.
+        @OptIn(co.veyra.common.VeyraInternalApi::class)
+        co.veyra.common.logging.failure.OperationFailureLog.surface =
+            co.veyra.common.logging.failure.OperationFailureLog.SURFACE_RN
         reactContext.addLifecycleEventListener(this)
-        // the RN surface reports a never-attempted payment as its typed sdkErrorCode with
-        // no fabricated wire code. Safe to opt in bridge-wide: the JS mapper nulls an empty
-        // responseCode and carries sdkErrorCode, and the RN guide documents that shape.
-        co.veyra.softpos.payment.sdk.CardPaymentService.typedPreDispatchErrors = true
         // The SDK observers are registered after every initialise — see registerObservers.
     }
 
@@ -141,12 +151,12 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
 
     private inline fun withInit(promise: Promise, body: () -> Unit) {
         if (!initialized) {
-            VeyraPromises.reject(promise, "NOT_CONFIGURED", "Call Veyra.initialize first")
+            VeyraPromises.reject(promise, VeyraSetupCode.NOT_CONFIGURED, "Call Veyra.initialize first")
             return
         }
         if (!signedIn) {
             VeyraPromises.reject(
-                promise, "NOT_SIGNED_IN",
+                promise, VeyraSetupCode.NOT_SIGNED_IN,
                 "No customer is signed in — call Veyra.initialize with the customerId first",
             )
             return
@@ -165,7 +175,7 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
         try {
             val activity = hostActivity()
                 ?: return VeyraPromises.reject(
-                    promise, "NOT_CONFIGURED", "No Activity attached yet — call after the app is on screen"
+                    promise, VeyraSetupCode.NOT_CONFIGURED, "No Activity attached yet — call after the app is on screen"
                 )
             val customer = config.opt("customerId")?.takeIf { it.isNotBlank() }
                 ?: throw IllegalArgumentException("customerId is required")
@@ -173,13 +183,16 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
                 ?: throw IllegalArgumentException("softpos config is required")
             val walletMap = config.getMap("wallet")
                 ?: throw IllegalArgumentException("wallet config is required")
+            // One provider for both SDKs: each gets its own native object routed by SDK key, all
+            // answered by the same JS provider.
+            val providerMap = config.getMap("provider")
+            val walletProvider = connections.providerFor("wallet", providerMap)
+            val softposProvider = connections.providerFor("softpos", providerMap)
 
             val softpos = VeyraSoftPosSdkConfig.builder(
                 environment = Environment.fromString(softposMap.req("environment"))
                     ?: throw IllegalArgumentException("environment must be TEST or LIVE"),
                 paymentAppProviderId = softposMap.req("paymentAppProviderId"),
-                clientId = softposMap.req("clientId"),
-                clientSecret = softposMap.req("clientSecret"),
             ).apply {
                 if (softposMap.hasKey("enableNfc")) enableNfc(softposMap.getBoolean("enableNfc"))
             }.build()
@@ -189,8 +202,6 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
                     ?: throw IllegalArgumentException("environment must be TEST or LIVE"),
                 paymentAppProviderId = walletMap.req("paymentAppProviderId"),
                 tokenRequestorId = walletMap.req("tokenRequestorId"),
-                clientId = walletMap.req("clientId"),
-                clientSecret = walletMap.req("clientSecret"),
             ).apply {
                 if (walletMap.hasKey("enableNfc")) enableNfc(walletMap.getBoolean("enableNfc"))
                 walletMap.opt("appVersion")?.let { appVersion(it) }
@@ -203,25 +214,42 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
             // Umbrella first: installs the exclusive arbiter + InertBackstop and resets
             // to inert. Then the member SDKs — WITHOUT lifecycle binding (single-Activity
             // host: the focus session drives the mode, never the Activity observers).
-            VeyraSdk.initialize(activity, customer, VeyraSdkConfig(softpos, wallet))
-            VeyraWalletSdk.initialize(reactContext.applicationContext, customer, wallet, activity = null)
-            VeyraSoftPOSSdk.initializeHosted(activity, customer, softpos)
+            VeyraSdk.initialize(activity, customer, VeyraSdkConfig(softpos, wallet), walletProvider)
+            VeyraWalletSdk.initialize(reactContext.applicationContext, customer, wallet, walletProvider, activity = null)
+            VeyraSoftPOSSdk.initializeHosted(activity, customer, softpos, softposProvider)
             registerObservers()
 
             softposConfig = softpos
+            this.softposProvider = softposProvider
             contextClient = ContextPaymentClient(
                 reactContext.applicationContext,
                 softpos.environment!!,
-                softpos.clientId,
-                softpos.clientSecret,
             )
             customerId = customer
             initialized = true
             signedIn = true
             promise.resolve(null)
         } catch (t: Throwable) {
-            VeyraPromises.reject(promise, t)
+            // A bad config value is INVALID_CONFIGURATION here, not a call argument.
+            VeyraPromises.rejectInitialize(promise, t)
         }
+    }
+
+    // ── Connection callbacks (answers from JS) ──────────────────────────────────
+
+    /** JS answered a connection request; `value` null is a valid "no assertion" answer. */
+    @ReactMethod
+    fun resolveConnectionRequest(id: String, value: String?) = connections.resolve(id, value)
+
+    /** JS rejected a connection request. `httpStatus` -1 means none. */
+    @ReactMethod
+    fun rejectConnectionRequest(id: String, kind: String, neverSent: Boolean, httpStatus: Double, message: String?) =
+        connections.reject(id, kind, neverSent, httpStatus.toInt(), message)
+
+    /** The JS runtime is torn down (reload, destroy): fail whatever it was still answering. */
+    override fun invalidate() {
+        connections.failAllPending()
+        super.invalidate()
     }
 
     @ReactMethod
@@ -240,7 +268,7 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
     @ReactMethod
     fun sessionOpen(kind: String, promise: Promise) = withInit(promise) {
         val activity = hostActivity()
-            ?: return@withInit VeyraPromises.reject(promise, "NOT_CONFIGURED", "No Activity attached")
+            ?: return@withInit VeyraPromises.reject(promise, VeyraSetupCode.NOT_CONFIGURED, "No Activity attached")
         activity.runOnUiThread {
             try {
                 session.open(kindToMode(kind), activity)
@@ -270,7 +298,7 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
         if (session.sessionMode != mode) {
             val hook = if (mode == NfcMode.WALLET) "usePaySession" else "useGetPaidSession"
             VeyraPromises.reject(
-                promise, "SESSION_REQUIRED",
+                promise, VeyraSetupCode.SESSION_REQUIRED,
                 "This payment API arms NFC and needs its screen session open — mount $hook on the payment screen"
             )
             return false
@@ -282,38 +310,36 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun walletGetBanks(accountNumber: String?, promise: Promise) = withInit(promise) {
-        wallet().tokenisationService.getBanks(accountNumber) { result ->
-            result.fold(
-                { promise.resolve(Mappers.banks(it)) },
-                { VeyraPromises.reject(promise, it) },
-            )
-        }
+        wallet().tokenisationService.getBanks(accountNumber) { promise.resolve(Mappers.bankList(it)) }
     }
 
     @ReactMethod
     fun walletVerifyAccount(params: ReadableMap, promise: Promise) = withInit(promise) {
-        wallet().tokenisationService.checkAccountEligibility(Mappers.verifyAccountParams(params)) { result ->
-            result.fold(
-                { r ->
-                    promise.resolve(Arguments.createMap().apply {
-                        putString("responseCode", r.responseCode)
-                        putString("message", r.message)
-                        // What the call did, and why it decided that — carried verbatim.
-                        putString("responseStatus", r.responseStatus)
-                        putString("responseStatusReason", r.responseStatusReason)
-                        putBoolean("isApproved", r.responseCode == "APPROVED" || r.responseCode == "APPROVE_REQUIRE_AUTH")
-                    })
-                },
-                { VeyraPromises.reject(promise, it) },
-            )
+        val request = try {
+            Mappers.verifyAccountParams(params)
+        } catch (e: IllegalArgumentException) {
+            return@withInit promise.resolve(Mappers.verifyAccountRefused(Mappers.INVALID_REQUEST, e.message ?: "Invalid request"))
         }
+        wallet().tokenisationService.checkAccountEligibility(request) { promise.resolve(Mappers.verifyAccount(it)) }
     }
 
     @ReactMethod
     fun walletDigitise(params: ReadableMap, promise: Promise) = withInit(promise) {
-        wallet().tokenisationService.digitizeAccount(Mappers.digitiseParams(params)) { response ->
-            promise.resolve(Mappers.digitiseResult(response))
+        val request = try {
+            Mappers.digitiseParams(params)
+        } catch (e: IllegalArgumentException) {
+            return@withInit promise.resolve(Mappers.digitiseNotSent(Mappers.INVALID_REQUEST, e.message ?: "Invalid request"))
         }
+        wallet().tokenisationService.digitizeAccount(request) { promise.resolve(Mappers.digitiseResult(it)) }
+    }
+
+    /**
+     * Cancels the digitise started with [clientRequestId] (set from `params.clientRequestId` by
+     * [Mappers.digitiseParams]); resolves with the CancelResult name.
+     */
+    @ReactMethod
+    fun walletCancelDigitise(clientRequestId: String, promise: Promise) = withInit(promise) {
+        promise.resolve(Mappers.cancelResult(wallet().tokenisationService.cancelDigitise(clientRequestId)))
     }
 
     // ── Wallet: activation ──────────────────────────────────────────────────────
@@ -327,56 +353,19 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
             "VERIFY_ACCOUNT" -> "VERIFY_ACCOUNT"
             else -> "OTHER"
         }
-        wallet().tokenisationService.requestActivationCode(ref, medium, contact ?: "", reasonCode) { result ->
-            result.fold(
-                { r ->
-                    promise.resolve(Arguments.createMap().apply {
-                        putString("tokenUniqueReference", r.tokenUniqueReference)
-                        putString("expirationDateTime", r.expirationDateTime)
-                        putString("status", r.status)
-                        putString("message", r.message)
-                        // Raw wire value: JS carries codes verbatim (unknown codes included).
-                        putString("failureCode", r.failureCodeRaw)
-                    })
-                },
-                { VeyraPromises.reject(promise, it) },
-            )
+        wallet().tokenisationService.requestActivationCode(ref, medium, contact ?: "", reasonCode) {
+            promise.resolve(Mappers.activationCode(it))
         }
     }
 
     @ReactMethod
     fun walletActivate(ref: String, code: String, promise: Promise) = withInit(promise) {
-        wallet().tokenisationService.activate(ref, code) { result ->
-            result.fold(
-                { r ->
-                    promise.resolve(Arguments.createMap().apply {
-                        putString("tokenUniqueReference", r.tokenUniqueReference)
-                        putString("status", r.status)
-                        putString("message", r.message)
-                        // Raw wire values: JS carries codes verbatim (unknown codes included).
-                        putString("failureCode", r.failureCodeRaw)
-                        r.attemptsRemaining?.let { putInt("attemptsRemaining", it) } ?: putNull("attemptsRemaining")
-                        putString("recommendDelete", r.recommendDeleteRaw)
-                    })
-                },
-                { VeyraPromises.reject(promise, it) },
-            )
-        }
-    }
-
-    @ReactMethod
-    fun walletCheckTokenActive(ref: String, promise: Promise) = withInit(promise) {
-        @Suppress("DEPRECATION")
-        wallet().tokenisationService.checkTokenStatus(ref) { result ->
-            result.fold({ promise.resolve(it) }, { VeyraPromises.reject(promise, it) })
-        }
+        wallet().tokenisationService.activate(ref, code) { promise.resolve(Mappers.activate(it)) }
     }
 
     @ReactMethod
     fun walletTokenStatus(ref: String, promise: Promise) = withInit(promise) {
-        wallet().tokenisationService.tokenStatus(ref) { result ->
-            result.fold({ promise.resolve(it.value) }, { VeyraPromises.reject(promise, it) })
-        }
+        wallet().tokenisationService.tokenStatus(ref) { promise.resolve(Mappers.tokenStatusResult(it)) }
     }
 
     @ReactMethod
@@ -451,10 +440,10 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun walletSetActiveCard(cardId: String, promise: Promise) = withInit(promise) {
-        // Arms tap-to-pay for this card — pay session required (ISSUE-free single-Activity contract).
+        // Arms tap-to-pay for this card — pay session required (the iOS bridge gates it the same).
         if (!requireSession(NfcMode.WALLET, promise)) return@withInit
         val activity = hostActivity()
-        wallet().tokenisationService.setActiveToken(
+        val selection = wallet().tokenisationService.setActiveToken(
             cardId,
             activity,
             onTransactionStarted = { tokenId ->
@@ -485,7 +474,7 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
             // reach JS through `wallet.onPaymentRefusal`, which arms them for whichever card the
             // app is listening to — not only the active one.
         )
-        promise.resolve(null)
+        promise.resolve(Mappers.cardSelection(selection))
     }
 
     /**
@@ -541,12 +530,7 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun walletDeactivateToken(ref: String, promise: Promise) = withInit(promise) {
-        wallet().tokenisationService.deactivateToken(ref) { result ->
-            result.fold(
-                { r -> promise.resolve(Mappers.tokenStatusUpdate(r)) },
-                { VeyraPromises.reject(promise, it) },
-            )
-        }
+        wallet().tokenisationService.deactivateToken(ref) { promise.resolve(Mappers.tokenStatusUpdate(it)) }
     }
 
     // ── Wallet: scan-to-pay (MPM) ───────────────────────────────────────────────
@@ -567,15 +551,24 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
     @ReactMethod
     fun walletPayScannedContext(handle: String, promise: Promise) = withInit(promise) {
         val context = mpmContexts.take(handle)
-            ?: return@withInit VeyraPromises.reject(
-                promise, "VALIDATION", "Unknown or already-used payment handle — re-inspect the QR"
+            ?: return@withInit promise.resolve(
+                Mappers.paymentOutcomeNotSent(
+                    Mappers.INVALID_REQUEST, "Unknown or already-used payment handle — re-inspect the QR",
+                ),
             )
+        // Every refusal and no-answer is the outcome; only a setup error is a failure here.
         wallet().tokenisationService.payScannedContext(context) { result ->
             result.fold(
                 { promise.resolve(Mappers.paymentOutcome(it)) },
                 { VeyraPromises.reject(promise, it) },
             )
         }
+    }
+
+    /** Cancels the scan-to-pay of the QR carrying [merchantOrderId]; resolves with the CancelResult name. */
+    @ReactMethod
+    fun walletCancelPayment(merchantOrderId: String, promise: Promise) = withInit(promise) {
+        promise.resolve(Mappers.cancelResult(wallet().tokenisationService.cancelPayment(merchantOrderId)))
     }
 
     // ── Wallet: show-QR-to-pay (CPM) ────────────────────────────────────────────
@@ -622,21 +615,20 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
     @ReactMethod
     fun walletReconcilePendingTransactions(promise: Promise) = withInit(promise) {
         wallet().tokenisationService.reconcilePendingTransactions { result ->
-            result.fold({ promise.resolve(null) }, { VeyraPromises.reject(promise, it) })
+            promise.resolve(Mappers.reconcileResult(result))
         }
     }
 
     /**
      * The per-transaction counterpart to the reconcile above — one row, keyed by hash,
-     * resolving with the updated stored row rather than nothing. A transport failure rejects with
-     * the typed code (`NO_NETWORK_CONNECTION` when offline) and leaves the row untouched.
+     * resolving with the updated stored row rather than nothing. A check that could not be made
+     * resolves with its `failureReason` (`NO_NETWORK_CONNECTION` when offline) and the row untouched.
      */
     @ReactMethod
     fun walletRefreshTransactionStatus(transactionHash: String, promise: Promise) = withInit(promise) {
         scope.launch(Dispatchers.IO) {
             try {
-                val row = wallet().tokenisationService.refreshTransactionStatus(transactionHash)
-                promise.resolve(row?.let { Mappers.transactionSummary(it) })
+                promise.resolve(Mappers.transactionLookup(wallet().tokenisationService.refreshTransactionStatus(transactionHash)))
             } catch (t: Throwable) {
                 VeyraPromises.reject(promise, t)
             }
@@ -645,16 +637,15 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
 
     /**
      * "Check merchant credit now" for one wallet payment. Settlement only — it can never
-     * change the row's outcome triple. A transport failure rejects with the typed code
-     * (`NO_NETWORK_CONNECTION` when offline) and leaves the row untouched; an ineligible row makes no
-     * call at all and resolves unchanged.
+     * change the row's outcome triple. A check that could not be made resolves with its
+     * `failureReason` (`NO_NETWORK_CONNECTION` when offline) and the row untouched; an ineligible row
+     * makes no call at all and resolves unchanged.
      */
     @ReactMethod
     fun walletRefreshCreditConfirmation(transactionHash: String, promise: Promise) = withInit(promise) {
         scope.launch(Dispatchers.IO) {
             try {
-                val row = wallet().tokenisationService.refreshCreditConfirmation(transactionHash)
-                promise.resolve(row?.let { Mappers.transactionSummary(it) })
+                promise.resolve(Mappers.transactionLookup(wallet().tokenisationService.refreshCreditConfirmation(transactionHash)))
             } catch (t: Throwable) {
                 VeyraPromises.reject(promise, t)
             }
@@ -665,10 +656,7 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
     fun walletProcessReceipt(payload: String, expectedHash: String?, promise: Promise) =
         withInit(promise) {
             wallet().tokenisationService.processReceipt(payload, expectedHash) { result ->
-                result.fold(
-                    { promise.resolve(Mappers.receipt(it)) },
-                    { VeyraPromises.reject(promise, it) },
-                )
+                promise.resolve(Mappers.receiptScan(result))
             }
         }
 
@@ -702,26 +690,28 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun merchantRegister(registration: ReadableMap, promise: Promise) = withInit(promise) {
-        val (type, data) = Mappers.merchantRegistration(registration)
+        val (type, data) = try {
+            Mappers.merchantRegistration(registration)
+        } catch (e: IllegalArgumentException) {
+            return@withInit promise.resolve(
+                Mappers.merchantRegistrationRefused(Mappers.INVALID_REQUEST, e.message ?: "Invalid request"),
+            )
+        }
         val callback = { r: co.veyra.softpos.payment.sdk.merchant.MerchantRegistrationResponse ->
             promise.resolve(Mappers.merchantRegistrationResult(r))
         }
         when (type) {
             "PERSONAL" -> softpos().merchantService.registerPersonalMerchant(data, callback)
             "BUSINESS" -> softpos().merchantService.registerBusinessMerchant(data, callback)
-            else -> throw IllegalArgumentException("merchantType must be PERSONAL or BUSINESS")
+            else -> promise.resolve(
+                Mappers.merchantRegistrationRefused(Mappers.INVALID_REQUEST, "merchantType must be PERSONAL or BUSINESS"),
+            )
         }
     }
 
     @ReactMethod
     fun merchantGetSettlementBanks(promise: Promise) = withInit(promise) {
-        softpos().merchantService.getBanks { banks ->
-            if (banks == null) {
-                VeyraPromises.reject(promise, "REQUEST_FAILED", "Could not load settlement banks")
-            } else {
-                promise.resolve(Mappers.nubanBanks(banks))
-            }
-        }
+        softpos().merchantService.getBanks { promise.resolve(Mappers.settlementBankList(it)) }
     }
 
     @ReactMethod
@@ -734,48 +724,64 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
         promise.resolve(softpos().merchantService.getStoredMerchantData()?.let { Mappers.storedMerchant(it) })
     }
 
+    /** No merchant on this device: refused on the phone, nothing sent (the iOS bridge says the same). */
+    private fun noMerchant(): WritableMap =
+        Mappers.merchantStatusRefused("MISSING_MANDATORY_CONFIG", "No merchant is registered on this device")
+
+    /**
+     * A status read for the stored merchant — the same answer iOS's `merchant.status` gives. The
+     * SDK's own refresh also runs, so the stored profile and the merchant-status observer follow.
+     */
     @ReactMethod
     fun merchantRefreshStatus(promise: Promise) = withInit(promise) {
-        // Android's refresh is fire-and-forget; resolve the last-known stored status
-        // (the refresh continues in the background and updates the stored profile).
-        softpos().merchantService.refreshStatus()
-        promise.resolve(softpos().merchantService.getStoredMerchantData()?.merchantStatus)
+        val service = softpos().merchantService
+        val merchantId = service.getStoredMerchantId()?.takeIf { it.isNotBlank() }
+            ?: return@withInit promise.resolve(noMerchant())
+        val environment = softposConfig?.environment
+            ?: throw VeyraSetupException(VeyraSetupCode.INVALID_CONFIGURATION, "softpos.environment is not configured")
+        service.refreshStatus()
+        scope.launch {
+            try {
+                promise.resolve(
+                    Mappers.merchantStatus(MerchantStatusClient(reactContext.applicationContext, environment).fetchStatus(merchantId)),
+                )
+            } catch (t: Throwable) {
+                VeyraPromises.reject(promise, t)
+            }
+        }
     }
 
     @ReactMethod
     fun merchantActivate(promise: Promise) = withInit(promise) {
-        softpos().merchantService.activate { r -> promise.resolve(r?.merchantStatus) }
+        softpos().merchantService.activate { promise.resolve(Mappers.merchantStatus(it)) }
     }
 
     @ReactMethod
     fun merchantDeactivate(promise: Promise) = withInit(promise) {
-        softpos().merchantService.deactivate { r -> promise.resolve(r?.merchantStatus) }
+        softpos().merchantService.deactivate { promise.resolve(Mappers.merchantStatus(it)) }
     }
 
     @ReactMethod
     fun merchantUpdate(update: ReadableMap, promise: Promise) = withInit(promise) {
-        softpos().merchantService.updateMerchant(
-            merchantName = update.req("merchantName"),
-            emailAddress = update.req("emailAddress"),
-            phoneNumber = update.req("phoneNumber"),
-            addressLine1 = update.req("addressLine1"),
-            addressLine2 = update.opt("addressLine2") ?: "",
-            city = update.req("city"),
-            state = update.req("state"),
-            countryCode = update.req("countryCode"),
-            accountNumber = update.req("accountNumber"),
-            institutionCode = update.req("institutionCode"),
-            walletAccountId = update.opt("walletAccountId"),
-            bvn = update.opt("bvn"),
-        ) { r ->
-            // null = the update did NOT happen (no stored merchant, no environment, or the
-            // backend call failed) — reject so the app can say so, instead of resolving into
-            // a false "updated" success.
-            if (r == null) {
-                VeyraPromises.reject(promise, "REQUEST_FAILED", "Merchant update failed")
-            } else {
-                promise.resolve(r.merchantStatus)
-            }
+        val service = softpos().merchantService
+        try {
+            service.updateMerchant(
+                merchantName = update.req("merchantName"),
+                emailAddress = update.req("emailAddress"),
+                phoneNumber = update.req("phoneNumber"),
+                addressLine1 = update.req("addressLine1"),
+                addressLine2 = update.opt("addressLine2") ?: "",
+                city = update.req("city"),
+                state = update.req("state"),
+                countryCode = update.req("countryCode"),
+                accountNumber = update.req("accountNumber"),
+                institutionCode = update.req("institutionCode"),
+                walletAccountId = update.opt("walletAccountId"),
+                bvn = update.opt("bvn"),
+            ) { promise.resolve(Mappers.merchantStatus(it)) }
+        } catch (e: IllegalArgumentException) {
+            // Raised by the argument reads above, before anything reaches the SDK.
+            promise.resolve(Mappers.merchantStatusRefused(Mappers.INVALID_REQUEST, e.message ?: "Invalid request"))
         }
     }
 
@@ -785,26 +791,47 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
     fun merchantTapStart(request: ReadableMap, promise: Promise) = withInit(promise) {
         if (!requireSession(NfcMode.SOFTPOS, promise)) return@withInit
         val sessionId = UUID.randomUUID().toString()
-        val amount = request.getDouble("amountMinorUnits").toLong()
-        val currency = request.opt("currency") ?: "0566"
-        // the app's own order id, NOT a transaction reference — the SDK mints that and returns it
-        // on the result. Required: untyped JS that omits it is passed through blank so
-        // the SDK's rule refuses it with INVALID_REQUEST. This bridge used to invent one
-        // ("<millis>_<random>") and accept a legacy `merchantTransactionReference` in its place,
-        // which hid every missing order id behind a value no POS had ever issued.
-        val merchantOrderId = request.opt("merchantOrderId").orEmpty()
-        val txType = TransactionRequest.TxType.valueOf(request.opt("txType") ?: "PURCHASE")
 
         fun tapEvent(type: String): WritableMap = Arguments.createMap().apply {
             putString("type", type)
             putString("sessionId", sessionId)
         }
 
-        currentTapSessionId = sessionId
+        // the app's own order id, NOT a transaction reference — the SDK mints that and returns it
+        // on the result. Required: untyped JS that omits it is passed through blank so
+        // the SDK's rule refuses it with a NOT_SENT / INVALID_REQUEST result.
+        val merchantOrderId = request.opt("merchantOrderId").orEmpty()
+        val parsed = try {
+            Triple(
+                if (request.hasKey("amountMinorUnits") && !request.isNull("amountMinorUnits")) {
+                    request.getDouble("amountMinorUnits").toLong()
+                } else throw IllegalArgumentException("amountMinorUnits is required"),
+                request.opt("currency") ?: "0566",
+                TransactionRequest.TxType.valueOf(request.opt("txType") ?: "PURCHASE"),
+            )
+        } catch (e: IllegalArgumentException) {
+            // A bad argument ends the tap the way the SDK ends a blank order id: a NOT_SENT result
+            // on the event stream, with nothing armed.
+            promise.resolve(Arguments.createMap().apply { putString("sessionId", sessionId) })
+            // The bridge ended this tap itself, so the SDK never saw it: log the failure here.
+            @OptIn(co.veyra.common.VeyraInternalApi::class)
+            co.veyra.common.logging.failure.OperationFailureLog.report(
+                operation = co.veyra.common.logging.failure.SdkOperation.MERCHANT_TAP,
+                status = co.veyra.common.outcome.OutcomeStatus.NOT_SENT,
+                reason = Mappers.INVALID_REQUEST,
+                stage = co.veyra.common.logging.failure.FailureStage.VALIDATE,
+                ids = mapOf("merchant_order_id" to merchantOrderId),
+            )
+            emit(EventNames.MERCHANT_TAP, tapEvent("result").apply {
+                putMap("result", Mappers.tapResultNotSent(Mappers.INVALID_REQUEST, e.message ?: "Invalid request"))
+            })
+            return@withInit
+        }
+        val (amount, currency, txType) = parsed
+
         softpos().cardPaymentService.makeCardPayment(
             TransactionRequest.Builder(amount, currency, merchantOrderId, txType).build(),
             callback = { response ->
-                if (currentTapSessionId == sessionId) currentTapSessionId = null
                 emit(EventNames.MERCHANT_TAP, tapEvent("result").apply {
                     putMap("result", Mappers.tapResult(response))
                 })
@@ -819,13 +846,15 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
         promise.resolve(Arguments.createMap().apply { putString("sessionId", sessionId) })
     }
 
+    /**
+     * Cancels the SoftPOS payment started with [merchantOrderId] — tap, customer-QR charge or
+     * payment-QR create alike. Resolves with the [co.veyra.common.cancel.CancelResult] name; the
+     * payment itself still ends with its own outcome (a tap's on its `result` event). Leaving the
+     * get-paid screen needs no call here: the focus session's close tears down an armed tap itself.
+     */
     @ReactMethod
-    fun merchantTapCancel(sessionId: String, promise: Promise) = withInit(promise) {
-        if (currentTapSessionId == sessionId) {
-            softpos().cardPaymentService.cancelPendingPayment()
-            currentTapSessionId = null
-        }
-        promise.resolve(null)
+    fun merchantCancelPayment(merchantOrderId: String, promise: Promise) = withInit(promise) {
+        promise.resolve(Mappers.cancelResult(softpos().cancelPayment(merchantOrderId)))
     }
 
     // ── Merchant: get-paid QR (MPM) ─────────────────────────────────────────────
@@ -840,9 +869,9 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
         promise: Promise,
     ) =
         withInit(promise) {
-            val merchantId = softpos().merchantService.getStoredMerchantId()
-                ?: return@withInit VeyraPromises.reject(
-                    promise, "VALIDATION", "No registered merchant — register first"
+            val merchantId = softpos().merchantService.getStoredMerchantId()?.takeIf { it.isNotBlank() }
+                ?: return@withInit promise.resolve(
+                    Mappers.paymentContextQrNotSent("MISSING_MANDATORY_CONFIG", "No merchant is registered on this device"),
                 )
             scope.launch {
                 try {
@@ -856,9 +885,7 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
                             putString("scope", "merchant")
                             putNull("handle")
                         })
-                    } ?: return@launch VeyraPromises.reject(
-                        promise, "REQUEST_FAILED", "Could not create the payment QR"
-                    )
+                    }
                     promise.resolve(Mappers.paymentContextQr(created))
                 } catch (t: Throwable) {
                     VeyraPromises.reject(promise, t)
@@ -871,15 +898,18 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
         client().cancelQrExpiry(); promise.resolve(null)
     }
 
+    /**
+     * A context poll, as a lookup: the state, or why the poll could not be made — a poll's own
+     * failure is never the payment's status. Carried as the Android client answers it.
+     */
     @ReactMethod
     fun merchantContextStatus(txRef: String, promise: Promise) = withInit(promise) {
         scope.launch {
             try {
-                val status = client().contextStatus(txRef)
-                    ?: return@launch VeyraPromises.reject(
-                        promise, "REQUEST_FAILED", "Could not fetch the payment status"
-                    )
-                promise.resolve(Mappers.paymentContextStatus(status))
+                val result = client().contextStatus(txRef)
+                promise.resolve(
+                    Mappers.lookup(result.status?.let { Mappers.paymentContextStatus(it) }, result.failureReason, result.message),
+                )
             } catch (t: Throwable) {
                 VeyraPromises.reject(promise, t)
             }
@@ -890,44 +920,24 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun merchantInspectCustomerQr(payload: String, promise: Promise) = withInit(promise) {
-        val scanned = softpos().cpmCustomerQrService.inspect(payload)
-        promise.resolve(Arguments.createMap().apply {
-            putString("handle", cpmQrs.put(scanned))
-            putString("maskedCard", "•••• " + scanned.dpan.takeLast(4))
-            putDouble("amountMinorUnits", scanned.amountMinorUnits.toDouble())
-            putString("currencyNumeric", scanned.currencyNumeric4)
-            putString("cardholderName", scanned.cardholderName)
-        })
+        val inspection = softpos().cpmCustomerQrService.inspect(payload)
+        // A handle is issued only for a QR that can be charged; the card data stays native.
+        val handle = inspection.qr?.let { cpmQrs.put(it) }
+        promise.resolve(Mappers.customerQrInspection(inspection, handle))
     }
 
     @ReactMethod
     fun merchantChargeCustomerQr(handle: String, merchantOrderId: String?, promise: Promise) =
         withInit(promise) {
             val scanned = cpmQrs.take(handle)
-                ?: return@withInit VeyraPromises.reject(
-                    promise, "VALIDATION", "Unknown or already-used QR handle — re-scan"
+                ?: return@withInit promise.resolve(
+                    Mappers.customerQrChargeNotSent(Mappers.INVALID_REQUEST, "Unknown or already-used QR handle — re-scan"),
                 )
             scope.launch {
                 try {
                     val response = softpos().cpmCustomerQrService
                         .charge(scanned, merchantOrderId = merchantOrderId.orEmpty())
-                    promise.resolve(Arguments.createMap().apply {
-                        putBoolean("approved", response.responseCode == "00")
-                        putString("responseCode", response.responseCode)
-                        putString("transactionId", response.transactionId)
-                        // the MINTED reference, from the gateway's echo — not the
-                        // caller's value, which the SDK now ignores. Returning the caller's would
-                        // hand the app a key no gateway had ever seen, so every receipt lookup and
-                        // status poll built on it would miss.
-                        putString("merchantTransactionReference", response.merchantTransactionReference)
-                        putString("merchantOrderId", response.merchantOrderId)
-                        // an approved answer carries the merchant-bank credit id +
-                        // supported flag — the result screen's cue to wait for confirmation.
-                        putString("creditTransactionId", response.creditTransactionId)
-                        response.isCreditConfirmationSupported
-                            ?.let { putBoolean("isCreditConfirmationSupported", it) }
-                            ?: putNull("isCreditConfirmationSupported")
-                    })
+                    promise.resolve(Mappers.customerQrCharge(response))
                 } catch (t: Throwable) {
                     VeyraPromises.reject(promise, t)
                 }
@@ -964,15 +974,26 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
 
     /**
      * The on-demand "check status now" for one merchant transaction. Unlike
-     * [merchantGetTransaction] above this goes to the gateway, so a transport failure is a real
-     * rejection — `VeyraPromises.reject` carries the typed code, `NO_NETWORK_CONNECTION` included.
+     * [merchantGetTransaction] above this goes to the gateway; a check that could not be made
+     * resolves with its `failureReason` (`NO_NETWORK_CONNECTION` included) and the row untouched.
      */
+    /** Lookup by the app's own order id — a read: resolves a `VeyraLookup<OrderPaymentStatus>`. */
+    @ReactMethod
+    fun merchantPaymentStatus(merchantOrderId: String, promise: Promise) = withInit(promise) {
+        scope.launch(Dispatchers.IO) {
+            try {
+                promise.resolve(Mappers.orderPaymentLookup(softpos().transactionService.paymentStatus(merchantOrderId)))
+            } catch (t: Throwable) {
+                VeyraPromises.reject(promise, t)
+            }
+        }
+    }
+
     @ReactMethod
     fun merchantRefreshTransactionStatus(reference: String, promise: Promise) = withInit(promise) {
         scope.launch(Dispatchers.IO) {
             try {
-                val row = softpos().transactionService.refreshTransactionStatus(reference)
-                promise.resolve(row?.let { Mappers.merchantTransaction(it) })
+                promise.resolve(Mappers.merchantTransactionLookup(softpos().transactionService.refreshTransactionStatus(reference)))
             } catch (t: Throwable) {
                 VeyraPromises.reject(promise, t)
             }
@@ -981,15 +1002,14 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
 
     /**
      * "Check merchant credit now" for one sale. Unlike [merchantGetTransaction] this goes
-     * to the gateway, so a transport failure is a real rejection carrying the typed code
+     * to the gateway; a check that could not be made resolves with its `failureReason`
      * (`NO_NETWORK_CONNECTION` included). An ineligible row makes no call and resolves unchanged.
      */
     @ReactMethod
     fun merchantRefreshCreditConfirmation(reference: String, promise: Promise) = withInit(promise) {
         scope.launch(Dispatchers.IO) {
             try {
-                val row = softpos().transactionService.refreshCreditConfirmation(reference)
-                promise.resolve(row?.let { Mappers.merchantTransaction(it) })
+                promise.resolve(Mappers.merchantTransactionLookup(softpos().transactionService.refreshCreditConfirmation(reference)))
             } catch (t: Throwable) {
                 VeyraPromises.reject(promise, t)
             }
@@ -1041,7 +1061,8 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
         // Process singletons must re-bind to the recreated Activity (reader service);
         // lifecycle observers stay unbound — the focus session drives the mode.
         val customer = customerId ?: return // signed out: nothing to re-attach for
-        softposConfig?.let { VeyraSoftPOSSdk.initializeHosted(activity, customer, it) }
+        val provider = softposProvider ?: return
+        softposConfig?.let { VeyraSoftPOSSdk.initializeHosted(activity, customer, it, provider) }
     }
 
     override fun onHostPause() = Unit
@@ -1049,14 +1070,13 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
 
     // ── Helpers ─────────────────────────────────────────────────────────────────
 
-    private fun wallet(): VeyraWalletSdk =
-        VeyraWalletSdk.getInstance() ?: throw IllegalStateException("VeyraSdk not initialised")
+    private fun notInitialised() = VeyraSetupException(VeyraSetupCode.NOT_CONFIGURED, "Call Veyra.initialize first")
 
-    private fun softpos(): VeyraSoftPOSSdk =
-        VeyraSoftPOSSdk.getInstance() ?: throw IllegalStateException("VeyraSdk not initialised")
+    private fun wallet(): VeyraWalletSdk = VeyraWalletSdk.getInstance() ?: throw notInitialised()
 
-    private fun client(): ContextPaymentClient =
-        contextClient ?: throw IllegalStateException("VeyraSdk not initialised")
+    private fun softpos(): VeyraSoftPOSSdk = VeyraSoftPOSSdk.getInstance() ?: throw notInitialised()
+
+    private fun client(): ContextPaymentClient = contextClient ?: throw notInitialised()
 
     private object EventNames {
         const val ACTIVATION = "VeyraActivationEvent"

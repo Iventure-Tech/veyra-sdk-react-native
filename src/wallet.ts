@@ -1,5 +1,5 @@
-import type { EmitterSubscription } from 'react-native';
-import { nativeCall } from './errors';
+import { Platform, type EmitterSubscription } from 'react-native';
+import { cancelCall, nativeCall, VeyraError } from './errors';
 import { Events, VeyraNative, veyraEmitter } from './native';
 import type {
   ActivateResponse,
@@ -8,10 +8,10 @@ import type {
   ActivationEvent,
   ActivationMedium,
   ActivationReason,
-  Bank,
+  BankList,
   Card,
+  CancelResult,
   CardKeyStateEvent,
-  CardStatus,
   DigitiseParams,
   DigitiseResult,
   PaymentOutcome,
@@ -19,10 +19,15 @@ import type {
   QrExpiredEvent,
   ScanInspection,
   TokenStatusChangedEvent,
+  TokenStatusResult,
   TransactionReceipt,
+  CardSelection,
+  ReceiptScan,
+  ReconcileResult,
   TransactionSummary,
   VerifyAccountParams,
   VerifyAccountResponse,
+  VeyraLookup,
   VeyraSubscription,
   WalletPaymentRefusal,
   WalletTapEvent,
@@ -121,11 +126,17 @@ const refusalListeners = (() => {
   };
 })();
 
-/** Wallet (Pay) domain — add card, activation, card states, payments, history. */
+/**
+ * Wallet (Pay) domain — add card, activation, card states, payments, history.
+ *
+ * Every operation resolves with its outcome — branch on `responseStatus`, then
+ * `responseStatusReason`. A promise rejects only with a setup error (`VeyraError`).
+ */
 export const wallet = {
   // ── Add card / digitise ────────────────────────────────────────────────────
 
-  getBanks(accountNumber?: string): Promise<Bank[]> {
+  /** The banks a card can be added from — `banks` on `'APPROVED'`, else the reason there are none. */
+  getBanks(accountNumber?: string): Promise<BankList> {
     return nativeCall(() => VeyraNative.walletGetBanks(accountNumber ?? null));
   },
 
@@ -133,8 +144,28 @@ export const wallet = {
     return nativeCall(() => VeyraNative.walletVerifyAccount(params));
   },
 
+  /**
+   * Adds a card. Pass your own `clientRequestId` in `params` to be able to cancel it with
+   * {@link cancelDigitise}; without one the request cannot be cancelled.
+   */
   digitise(params: DigitiseParams): Promise<DigitiseResult> {
     return nativeCall(() => VeyraNative.walletDigitise(params));
+  },
+
+  /**
+   * Cancels the add-card ({@link digitise}) started with `clientRequestId`. Answers at once with a
+   * {@link CancelResult}:
+   *
+   * - `'CANCELLED'` — nothing was sent; `digitise` resolves `'NOT_SENT'` / `CANCELLED`, and the same
+   *   `clientRequestId` can be used again.
+   * - `'TOO_LATE_TO_CANCEL_REQUEST_ALREADY_SENT'` — the request has left the device; `digitise`
+   *   resolves with its normal result (an approved card is stored as usual). Tell the user it can
+   *   no longer be cancelled and keep waiting.
+   * - `'NO_DIGITISATION_IN_PROGRESS_FOR_CLIENT_REQUEST_ID'` — no add-card with that ID is running
+   *   (wrong ID, started without one, or already finished).
+   */
+  cancelDigitise(clientRequestId: string): Promise<CancelResult> {
+    return cancelCall(() => VeyraNative.walletCancelDigitise(clientRequestId));
   },
 
   // ── Activation ─────────────────────────────────────────────────────────────
@@ -154,17 +185,13 @@ export const wallet = {
     return nativeCall(() => VeyraNative.walletActivate(tokenUniqueReference, activationCode));
   },
 
-  /** One-shot server check: true when the token is active. */
-  checkTokenActive(tokenUniqueReference: string): Promise<boolean> {
-    return nativeCall(() => VeyraNative.walletCheckTokenActive(tokenUniqueReference));
-  },
-
   /**
    * One-shot server check, five-valued: lets the app explain a non-payable card —
    * SUSPENDED ("call your bank") vs PENDING_ACTIVATION ("enter your code") vs EXPIRED
-   * ("re-add the card"). Values this build does not know pass through verbatim.
+   * ("re-add the card"). `tokenStatus` on `'APPROVED'`; values this build does not know pass
+   * through verbatim. A check that could not be made is `'FAILED'` / `'NOT_SENT'` with the reason.
    */
-  tokenStatus(tokenUniqueReference: string): Promise<CardStatus | string> {
+  tokenStatus(tokenUniqueReference: string): Promise<TokenStatusResult> {
     return nativeCall(() => VeyraNative.walletTokenStatus(tokenUniqueReference));
   },
 
@@ -204,11 +231,15 @@ export const wallet = {
   },
 
   /**
-   * Selects the active card. On Android this also arms tap-to-pay for it, so it
-   * requires an open pay session (`SESSION_REQUIRED` otherwise); tap outcomes
-   * arrive via {@link onTapEvent}. On iOS it only marks the card active.
+   * Selects the active card. Requires an open pay session on both platforms
+   * (`SESSION_REQUIRED` otherwise). On Android this also arms tap-to-pay for it; tap
+   * events arrive via {@link onTapEvent}. On iOS it marks the card the QR rails pay with.
+   *
+   * Resolves a {@link CardSelection}: `'APPROVED'`, or `'FAILED'` with `CARD_NOT_FOUND` (not in this
+   * wallet) or `CARD_DATA_MISSING` (Android: remove the card and add it again). Rejects only on a
+   * setup error.
    */
-  setActiveCard(cardId: string): Promise<void> {
+  setActiveCard(cardId: string): Promise<CardSelection> {
     return nativeCall(() => VeyraNative.walletSetActiveCard(cardId));
   },
 
@@ -223,8 +254,19 @@ export const wallet = {
     return nativeCall(() => VeyraNative.walletDeactivateToken(tokenUniqueReference));
   },
 
-  /** Android-only tap-to-pay outcome stream (armed via {@link setActiveCard}). */
+  /**
+   * Android-only tap-to-pay event stream (armed via {@link setActiveCard}).
+   *
+   * Throws `VeyraError` `UNSUPPORTED_ON_PLATFORM` on iOS, which has no tap-to-pay: a listener that
+   * could never fire would be a silent no-op. Subscribe only where `Platform.OS === 'android'`.
+   */
   onTapEvent(listener: (e: WalletTapEvent) => void): EmitterSubscription {
+    if (Platform.OS !== 'android') {
+      throw new VeyraError(
+        'UNSUPPORTED_ON_PLATFORM',
+        'Wallet tap-to-pay is not available on iOS — subscribe to wallet.onTapEvent on Android only'
+      );
+    }
     return veyraEmitter.addListener(Events.walletTap, listener);
   },
 
@@ -264,18 +306,42 @@ export const wallet = {
 
   // `authenticateForPayment` was removed. The SDK raises the device
   // authentication sheet itself from inside `payScannedContext` and `showQrToPay`, so there is
-  // nothing to call first and no way to forget. Cancel/failure surface as AUTH_CANCELLED /
-  // AUTH_FAILED / AUTH_UNAVAILABLE on those calls.
+  // nothing to call first and no way to forget. Cancel/failure arrive as a `'NOT_SENT'` outcome
+  // with reason AUTH_CANCELLED / AUTH_FAILED / AUTH_UNAVAILABLE.
 
+  /**
+   * Pays an inspected merchant QR. Resolves with the outcome — an unknown or already-used handle is
+   * `'NOT_SENT'` / `INVALID_REQUEST`.
+   */
   payScannedContext(handle: string): Promise<PaymentOutcome> {
     return nativeCall(() => VeyraNative.walletPayScannedContext(handle));
+  },
+
+  /**
+   * Cancels the {@link payScannedContext} of the QR whose order ID is `merchantOrderId` (the
+   * inspection's `merchantOrderId`). Possible only while the payment is still on the device — key
+   * top-up, the authentication sheet, building the payment. Answers at once with a
+   * {@link CancelResult}:
+   *
+   * - `'CANCELLED'` — nothing was paid; `payScannedContext` resolves `'NOT_SENT'` / `CANCELLED`. An
+   *   authentication sheet already showing stays until the customer dismisses it.
+   * - `'TOO_LATE_TO_CANCEL_REQUEST_ALREADY_SENT'` — the payment has left the device and resolves
+   *   with its normal result. Tell the user it can no longer be cancelled and keep waiting.
+   * - `'NO_PAYMENT_IN_PROGRESS_FOR_ORDER_ID'` — no scan-to-pay with that order ID is running (wrong
+   *   ID, already finished, or a QR that carries no order ID).
+   *
+   * Show-QR-to-pay has no wallet-side cancel: the merchant's charge is the payment request.
+   */
+  cancelPayment(merchantOrderId: string): Promise<CancelResult> {
+    return cancelCall(() => VeyraNative.walletCancelPayment(merchantOrderId));
   },
 
   // ── Show-QR-to-pay (CPM) ───────────────────────────────────────────────────
 
   /**
-   * Renders a payment QR for the active card. Expiry fires once on the qr-expired
-   * channel ({@link onQrExpired}); a new render supersedes the old.
+   * Renders a payment QR for the active card: `payload` on `'APPROVED'`, or `'NOT_SENT'` with the
+   * reason no QR was made. Expiry fires once on the qr-expired channel ({@link onQrExpired}); a new
+   * render supersedes the old.
    */
   showQrToPay(amountMinorUnits: number): Promise<PaymentQr> {
     return nativeCall(() => VeyraNative.walletShowQrToPay(amountMinorUnits));
@@ -345,8 +411,16 @@ export const wallet = {
     return nativeCall(() => VeyraNative.walletGetTransactions(tokenUniqueReference, limit));
   },
 
-  /** Refreshes PENDING rows against the backend. */
-  reconcilePendingTransactions(): Promise<void> {
+  /**
+   * Refreshes PENDING rows against the backend. It asks about **every** open row on the device, so
+   * call it on an occasion (app foregrounded, history opened), never on a loop: a screen waiting for
+   * one payment — a displayed CPM QR — should call `refreshTransactionStatus` with that payment's
+   * hash instead, which is one request rather than one per open row. If the gateway throttles
+   * (`429`), the pass stops and the rest wait for the SDK's next sweep. A read: resolves a
+   * {@link ReconcileResult} whose `failureReason` is set only when the reconcile itself could not
+   * run. Rejects only on a setup error.
+   */
+  reconcilePendingTransactions(): Promise<ReconcileResult> {
     return nativeCall(() => VeyraNative.walletReconcilePendingTransactions());
   },
 
@@ -365,11 +439,12 @@ export const wallet = {
    * cannot disagree. It is **not** a way to force an outcome: a payment that is still unsettled
    * answers `PENDING` again.
    *
-   * Resolves `null` when no row on this device carries that hash; a row that already has a final
-   * outcome comes back unchanged without a network call. Rejects with `NO_NETWORK_CONNECTION` when
-   * the device is offline — a failed check never changes the stored row.
+   * `value` is `null` when no row on this device carries that hash; a row that already has a final
+   * outcome comes back unchanged without a network call. A check that could not be made carries
+   * `failureReason` (`NO_NETWORK_CONNECTION` when offline) and the row as it was — a failed check
+   * never changes the stored row.
    */
-  refreshTransactionStatus(transactionHash: string): Promise<TransactionSummary | null> {
+  refreshTransactionStatus(transactionHash: string): Promise<VeyraLookup<TransactionSummary>> {
     return nativeCall(() => VeyraNative.walletRefreshTransactionStatus(transactionHash));
   },
 
@@ -397,18 +472,24 @@ export const wallet = {
    * `responseCode` or `responseStatusReason`. There is deliberately no event beside it — the
    * resolved row and the SDK's stored history are the whole surface.
    *
-   * Resolves `null` when no row on this device carries that hash. Rejects with
-   * `NO_NETWORK_CONNECTION` when the device is offline — a failed check never changes the stored row.
+   * `value` is `null` when no row on this device carries that hash. A check that could not be made
+   * carries `failureReason` (`NO_NETWORK_CONNECTION` when offline) — a failed check never changes
+   * the stored row.
    */
-  refreshCreditConfirmation(transactionHash: string): Promise<TransactionSummary | null> {
+  refreshCreditConfirmation(transactionHash: string): Promise<VeyraLookup<TransactionSummary>> {
     return nativeCall(() => VeyraNative.walletRefreshCreditConfirmation(transactionHash));
   },
 
-  /** Verifies and stores a merchant receipt QR scanned by the customer. */
+  /**
+   * Verifies and stores a merchant receipt QR scanned by the customer — on the phone, nothing is sent.
+   * Resolves a {@link ReceiptScan}: `'APPROVED'` with the stored `receipt`, or `'FAILED'` with the
+   * reason (`INVALID_RECEIPT`, `RECEIPT_NOT_FROM_THIS_WALLET`, `RECEIPT_MISMATCH`,
+   * `PAYMENT_NOT_CONFIRMED`, `RECEIPT_FOR_ANOTHER_TRANSACTION`). Rejects only on a setup error.
+   */
   processReceipt(
     qrPayload: string,
     expectedTransactionHash: string | null = null
-  ): Promise<TransactionReceipt> {
+  ): Promise<ReceiptScan> {
     return nativeCall(() => VeyraNative.walletProcessReceipt(qrPayload, expectedTransactionHash));
   },
 

@@ -50,4 +50,9 @@ export const Events = {
   cardKeyState: 'VeyraCardKeyStateEvent',
   /** The merchant was deactivated, suspended or activated. */
   merchantStatus: 'VeyraMerchantStatusEvent',
+  /**
+   * Native asks JS to run a connection callback (an assertion, or a relay forward) and answer
+   * through `resolveConnectionRequest` / `rejectConnectionRequest`. Module-internal.
+   */
+  connectionRequest: 'VeyraConnectionRequest',
 } as const;

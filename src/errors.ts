@@ -1,79 +1,42 @@
+import type { CancelResult } from './types';
+
 /**
- * Typed error codes. Both native modules normalise their platform's failures into
- * these codes (Android's message prefixes, iOS's error enums), so JS never
- * string-matches an error message.
+ * The setup errors — the **only** thing a Veyra call rejects with. Each is a mistake in the app's
+ * integration, found in development, and the same five codes exist on Android
+ * (`VeyraSetupException`) and iOS (`VeyraWalletError` / `VeyraSoftPOSError`). Both native modules
+ * map their platform's setup error to the code by its type, so JS never string-matches a message.
+ *
+ * Everything that happens **to** a call — refused on the phone, offline, authentication dismissed,
+ * declined, no answer — is not an error: the promise resolves with the outcome, and its
+ * `responseStatus` / `responseStatusReason` say what happened (see {@link ResponseStatus}).
  */
 export type VeyraErrorCode =
-  /** SDK not initialised — call Veyra.initialize first. */
+  /** The SDK is not initialised — call `Veyra.initialize` first (also: no Activity attached yet on Android). */
   | 'NOT_CONFIGURED'
-  /** No customer is signed in (after Veyra.signOut) — call Veyra.initialize with the customerId. */
+  /** No customer is signed in (after `Veyra.signOut`) — call `Veyra.initialize` with the customerId. */
   | 'NOT_SIGNED_IN'
-  /** Method not available on this platform (e.g. wallet tap-to-pay on iOS). */
-  | 'UNSUPPORTED_ON_PLATFORM'
   /**
-   * A payment API was called without an open focus session. Mount usePaySession /
-   * useGetPaidSession on the payment screen — the SDK arms only while it is focused.
+   * The configuration cannot be used; the message names the problem — an unusable provider, a
+   * provider of a different kind from an earlier `initialize`, a blank customerId, or a missing
+   * required setting (environment, payment app provider ID, token requestor ID, `appleTeamId` on iOS…).
+   */
+  | 'INVALID_CONFIGURATION'
+  /**
+   * A payment API was called without its screen session open. Mount `usePaySession` /
+   * `useGetPaidSession` on the payment screen — the SDK arms only while it is focused. Raised for
+   * `merchant.tap.*` and `wallet.setActiveCard`, on both platforms.
    */
   | 'SESSION_REQUIRED'
-  /** The mode claim was refused (the other mode's payment is mid-flight). */
-  | 'MODE_REFUSED'
-  /** Card temporarily can't pay; device must come online. SDK self-heals. */
-  | 'ONLINE_REQUIRED'
-  /**
-   * The amount is larger than this card can carry in one payment. Unlike `ONLINE_REQUIRED`
-   * this does NOT resolve by going online — offer a smaller amount or another card.
-   */
-  | 'AMOUNT_EXCEEDS_CARD_LIMIT'
-  | 'TOKEN_NOT_ACTIVE'
-  /**
-   * The card was added on another device (or before this app was reinstalled) and cannot be
-   * issued payment keys here. Neither going online nor a smaller amount helps — ask the user to
-   * add the card again on this phone.
-   */
-  | 'DEVICE_NOT_BOUND'
-  /**
-   * The customer dismissed the device authentication sheet the SDK raised. Nothing was sent —
-   * offer the payment again.
-   */
-  | 'AUTH_CANCELLED'
-  /** The customer attempted authentication and the device rejected it. Nothing was sent. */
-  | 'AUTH_FAILED'
-  /**
-   * This device can perform no authentication at all: no enrolled biometric AND no screen lock.
-   * Unlike `AUTH_FAILED`, a retry cannot help — send the user to system settings to set a
-   * screen lock.
-   */
-  | 'AUTH_UNAVAILABLE'
-  | 'NO_ACTIVE_CARD'
-  | 'CARD_CANNOT_SHOW_QR'
-  | 'MISSING_MANDATORY_CONFIG'
-  /** Request-level validation failed; `field` names the offending parameter. */
-  | 'VALIDATION'
-  /**
-   * The device has no working internet connection, so the call never left it — tell the user to
-   * connect and try again. Nothing was sent, so nothing needs undoing.
-   *
-   * Not to be confused with `ONLINE_REQUIRED`, which is about the *card* (its payment keys are
-   * used up and the wallet must refresh them) rather than the *device*. Both end with "get
-   * online", and they need different copy: `ONLINE_REQUIRED` on a connected phone resolves by
-   * itself in seconds; this one does not resolve until the user restores their connection.
-   */
-  | 'NO_NETWORK_CONNECTION'
-  /**
-   * Refused before anything was sent because an argument is invalid, e.g. a blank
-   * `merchantOrderId` (required on every merchant payment). Fix the call; there is no payment.
-   */
-  | 'INVALID_REQUEST'
-  /** Network/backend failure. */
-  | 'REQUEST_FAILED'
-  /** Anything not otherwise classified; see message + nativeErrorCode. */
+  /** A method this platform cannot perform — e.g. wallet tap-to-pay (`wallet.onTapEvent`) on iOS. */
+  | 'UNSUPPORTED_ON_PLATFORM'
+  /** Anything not otherwise classified — an SDK defect, not an outcome; see `message`. */
   | 'UNKNOWN';
 
 export class VeyraError extends Error {
   readonly code: VeyraErrorCode;
-  /** Platform error identifier when one exists (e.g. an Android SdkErrorCode name). */
+  /** Platform error identifier when one exists. */
   readonly nativeErrorCode: string | null;
-  /** Offending field for VALIDATION errors. */
+  /** The offending field, when an error names one. No setup error sets it today. */
   readonly field: string | null;
 
   constructor(
@@ -93,23 +56,9 @@ export class VeyraError extends Error {
 const KNOWN_CODES: ReadonlySet<string> = new Set<VeyraErrorCode>([
   'NOT_CONFIGURED',
   'NOT_SIGNED_IN',
-  'UNSUPPORTED_ON_PLATFORM',
+  'INVALID_CONFIGURATION',
   'SESSION_REQUIRED',
-  'MODE_REFUSED',
-  'ONLINE_REQUIRED',
-  'AMOUNT_EXCEEDS_CARD_LIMIT',
-  'TOKEN_NOT_ACTIVE',
-  'DEVICE_NOT_BOUND',
-  'AUTH_CANCELLED',
-  'AUTH_FAILED',
-  'AUTH_UNAVAILABLE',
-  'NO_ACTIVE_CARD',
-  'CARD_CANNOT_SHOW_QR',
-  'MISSING_MANDATORY_CONFIG',
-  'VALIDATION',
-  'NO_NETWORK_CONNECTION',
-  'INVALID_REQUEST',
-  'REQUEST_FAILED',
+  'UNSUPPORTED_ON_PLATFORM',
   'UNKNOWN',
 ]);
 
@@ -142,4 +91,28 @@ export async function nativeCall<T>(call: () => Promise<T>): Promise<T> {
   } catch (e) {
     throw toVeyraError(e);
   }
+}
+
+/** Every answer a cancel can give — the five values of {@link CancelResult}. */
+const CANCEL_RESULTS: ReadonlySet<string> = new Set<CancelResult>([
+  'CANCELLED',
+  'TOO_LATE_TO_CANCEL_REQUEST_ALREADY_SENT',
+  'TOO_LATE_TO_CANCEL_TASK_ALREADY_PROCESSED',
+  'NO_PAYMENT_IN_PROGRESS_FOR_ORDER_ID',
+  'NO_DIGITISATION_IN_PROGRESS_FOR_CLIENT_REQUEST_ID',
+]);
+
+/**
+ * Reads a native cancel answer. Both native modules resolve with the answer's name; anything else
+ * means the JS and native halves of the package are from different builds — an SDK defect, so it
+ * rejects `UNKNOWN` rather than handing the app an answer its `switch` cannot know.
+ */
+export function toCancelResult(raw: unknown): CancelResult {
+  if (typeof raw === 'string' && CANCEL_RESULTS.has(raw)) return raw as CancelResult;
+  throw new VeyraError('UNKNOWN', `Unrecognised cancel answer from the native module: ${String(raw)}`);
+}
+
+/** Runs a native cancel: setup rejections become typed VeyraErrors, the answer a {@link CancelResult}. */
+export function cancelCall(call: () => Promise<unknown>): Promise<CancelResult> {
+  return nativeCall(call).then(toCancelResult);
 }
