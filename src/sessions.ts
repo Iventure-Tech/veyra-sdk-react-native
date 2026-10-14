@@ -16,7 +16,7 @@ import type { SessionKind } from './types';
  * decision — a payment mid-flight is never interrupted, and a screen that opens no
  * session leaves the device inert.
  *
- * `merchant.tap.start` and `wallet.setActiveCard` require their session to be open and
+ * `softpos.tap.start` and `wallet.setActiveToken` require their session to be open and
  * reject with `SESSION_REQUIRED` otherwise, on both platforms. QR flows work without a
  * session (they never arm NFC).
  *

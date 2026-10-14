@@ -4,12 +4,11 @@
 // and a file that imports both cannot name `CancelResult` unqualified.
 import Foundation
 
-extension VeyraSoftPOS.Payments {
-    /// Cancel the payment you started with `merchantOrderID` — a card tap
-    /// (``Tap/session(amountMinorUnits:currencyCode:merchantOrderID:onEvent:)``), a customer-QR
-    /// charge (``chargeCustomerQr(_:merchantOrderID:)``) or a payment-QR create
-    /// (``createContext(merchantID:amountMinorUnits:currency:onExpired:merchantOrderID:)``). You
-    /// don't say which: the order ID names the payment.
+extension VeyraSoftPOS {
+    /// Cancel the payment you started with `merchantOrderID` — a card tap (`tap.start`), a
+    /// customer-QR charge (``chargeCustomerQr(_:merchantOrderID:)``) or a payment-QR create
+    /// (``createPaymentContext(amountMinorUnits:currency:merchantOrderID:onExpired:)``). You don't
+    /// say which: the order ID names the payment.
     ///
     /// A payment can be cancelled only while its request is still on this device:
     /// - ``CancelResult/cancelled`` — nothing was sent. The payment itself ends `NOT_SENT` /

@@ -1,27 +1,28 @@
 import { Platform, type EmitterSubscription } from 'react-native';
 import { cancelCall, nativeCall, VeyraError } from './errors';
 import { Events, VeyraNative, veyraEmitter } from './native';
+import { activationRegistry, observerKind, oneShotSlot } from './observers';
 import type {
   ActivateResponse,
   TokenStatusUpdateResponse,
   ActivationCodeResponse,
-  ActivationEvent,
   ActivationMedium,
   ActivationReason,
   BankList,
-  Card,
   CancelResult,
-  CardKeyStateEvent,
+  TokenKeyStateEvent,
   DigitiseParams,
   DigitiseResult,
   PaymentOutcome,
   PaymentQr,
   QrExpiredEvent,
   ScanInspection,
+  Token,
   TokenStatusChangedEvent,
   TokenStatusResult,
   TransactionReceipt,
-  CardSelection,
+  TokenSelection,
+  PaySessionResult,
   ReceiptScan,
   ReconcileResult,
   TransactionSummary,
@@ -86,6 +87,15 @@ const refusalListeners = (() => {
       }
     },
 
+    /** Remove every listener for one card and release its native registration. */
+    removeAll(tokenUniqueReference: string): void {
+      if (!byToken.delete(tokenUniqueReference)) return;
+      void nativeCall(() =>
+        VeyraNative.walletStopObservingPaymentRefusals(tokenUniqueReference)
+      ).catch(() => {});
+      closeChannelIfIdle();
+    },
+
     add(
       tokenUniqueReference: string,
       listener: (r: WalletPaymentRefusal) => void
@@ -104,6 +114,7 @@ const refusalListeners = (() => {
         });
       }
       set.add(listener);
+      const registeredIn = set;
 
       let removed = false;
       return {
@@ -111,7 +122,9 @@ const refusalListeners = (() => {
           if (removed) return; // remove() is idempotent, as EmitterSubscription's is
           removed = true;
           const current = byToken.get(tokenUniqueReference);
-          if (!current) return;
+          // Gone already (stopObservingPaymentRefusals) — a later registration for the same card
+          // is a different set, and this subscription must not remove from it.
+          if (current !== registeredIn || !current.has(listener)) return;
           current.delete(listener);
           if (current.size === 0) {
             byToken.delete(tokenUniqueReference);
@@ -125,6 +138,29 @@ const refusalListeners = (() => {
     },
   };
 })();
+
+const activations = activationRegistry(veyraEmitter, Events.activation);
+const tapEvents = observerKind<WalletTapEvent>(veyraEmitter, Events.walletTap);
+/** The `onExpired` of the wallet QR most recently rendered by `showQrToPay`. */
+const qrExpiry = oneShotSlot<QrExpiredEvent>(veyraEmitter, Events.qrExpired, (e) => e.scope === 'wallet');
+const tokenStatusEvents = observerKind<TokenStatusChangedEvent>(
+  veyraEmitter,
+  Events.tokenStatusChanged
+);
+const transactionResolvedEvents = observerKind<WalletTransactionResolvedEvent>(
+  veyraEmitter,
+  Events.walletTransactionResolved
+);
+const tokenKeyStateEvents = observerKind<TokenKeyStateEvent>(veyraEmitter, Events.tokenKeyState);
+
+function requireAndroidTap(): void {
+  if (Platform.OS !== 'android') {
+    throw new VeyraError(
+      'UNSUPPORTED_ON_PLATFORM',
+      'Wallet tap-to-pay is not available on iOS — observe wallet tap events on Android only'
+    );
+  }
+}
 
 /**
  * Wallet (Pay) domain — add card, activation, card states, payments, history.
@@ -168,16 +204,38 @@ export const wallet = {
     return cancelCall(() => VeyraNative.walletCancelDigitise(clientRequestId));
   },
 
+  /**
+   * Deactivates, on the server, the token that the {@link digitise} sent with `clientRequestId`
+   * created — for a digitise that ended `'FAILED'` with `NO_RESPONSE_RECEIVED` or `UPSTREAM_ERROR`
+   * after it was sent, whose token details never reached this device. Only this device can do it.
+   * The same call and shape as Android's and iOS's `deactivateDigitise`:
+   *
+   * - `'APPROVED'` — deactivated (or already was); `tokenUniqueReference` names it. If that card is
+   *   on this device, it is removed with its data.
+   * - `'FAILED'` / `NO_TOKEN_CREATED` — the digitise ended before a token was created.
+   * - `'FAILED'` / `DIGITISATION_NOT_FOUND` — no finished digitise with that id from this device. One
+   *   still running is not found until it ends: call again after it would have timed out.
+   * - `'PENDING'` — sent, no usable answer; call again (a repeat is harmless).
+   *
+   * {@link DigitiseResult.clientRequestId} holds the id, including one the SDK generated.
+   */
+  deactivateDigitise(clientRequestId: string): Promise<TokenStatusUpdateResponse> {
+    return nativeCall(() => VeyraNative.walletDeactivateDigitise(clientRequestId));
+  },
+
   // ── Activation ─────────────────────────────────────────────────────────────
 
+  /**
+   * Asks the issuer to send an activation code by `medium` — one of the token's
+   * `activationMethods[].medium`. The issuer sends it to the contact it holds for that medium.
+   */
   requestActivationCode(
     tokenUniqueReference: string,
     medium: ActivationMedium,
-    contact: string | null = null,
     reason: ActivationReason = 'ADD_CARD'
   ): Promise<ActivationCodeResponse> {
     return nativeCall(() =>
-      VeyraNative.walletRequestActivationCode(tokenUniqueReference, medium, contact, reason)
+      VeyraNative.walletRequestActivationCode(tokenUniqueReference, medium, reason)
     );
   },
 
@@ -196,12 +254,28 @@ export const wallet = {
   },
 
   /**
-   * Polls activation (every 10s, ≤5min) and emits on the activation event channel.
-   * Re-observing the same token replaces the prior observer. Subscribe with
-   * {@link onActivationEvent}.
+   * Watches a token until it is activated — polling every 10s for up to 5 minutes — and calls back
+   * once: `onActivated` when it is, `onTimeout` when 5 minutes pass first, `onError` when the
+   * check fails. The same callbacks as the Android and iOS SDKs.
+   *
+   * Each callback ends the observation. Re-observing the same token replaces the earlier callbacks
+   * (and restarts the 5-minute clock); {@link pauseActivationObserver} / {@link resumeActivationObserver}
+   * keep them; {@link stopActivationObserver}, `Veyra.signOut` and a `Veyra.initialize` that switches
+   * customer drop them (a same-customer `initialize` keeps them).
    */
-  observeActivation(tokenUniqueReference: string): Promise<void> {
-    return nativeCall(() => VeyraNative.walletObserveActivation(tokenUniqueReference));
+  observeActivation(
+    tokenUniqueReference: string,
+    onActivated: () => void,
+    onTimeout: () => void,
+    onError?: (message: string) => void
+  ): Promise<void> {
+    // Registered before the native call so the first poll's answer can never arrive unheard.
+    const registration = activations.set(tokenUniqueReference, { onActivated, onTimeout, onError });
+    return nativeCall<void>(() => VeyraNative.walletObserveActivation(tokenUniqueReference)).catch((e) => {
+      // Not observing after all — drop these callbacks, unless a newer observe replaced them.
+      activations.release(tokenUniqueReference, registration);
+      throw e;
+    });
   },
 
   pauseActivationObserver(tokenUniqueReference: string): Promise<void> {
@@ -212,35 +286,72 @@ export const wallet = {
     return nativeCall(() => VeyraNative.walletResumeActivationObserver(tokenUniqueReference));
   },
 
+  /** Stops watching the token; its {@link observeActivation} callbacks are dropped and never fire. */
   stopActivationObserver(tokenUniqueReference: string): Promise<void> {
+    activations.release(tokenUniqueReference);
     return nativeCall(() => VeyraNative.walletStopActivationObserver(tokenUniqueReference));
   },
 
-  onActivationEvent(listener: (e: ActivationEvent) => void): EmitterSubscription {
-    return veyraEmitter.addListener(Events.activation, listener);
+  /** Whether an activation observer is running for this token ({@link observeActivation}). */
+  hasActivationObserver(tokenUniqueReference: string): Promise<boolean> {
+    return nativeCall(() => VeyraNative.walletHasActivationObserver(tokenUniqueReference));
   },
 
-  // ── Cards ──────────────────────────────────────────────────────────────────
+  // ── Tokens ─────────────────────────────────────────────────────────────────
 
-  getCards(): Promise<Card[]> {
-    return nativeCall(() => VeyraNative.walletGetCards());
+  /** Every token (card) stored in this wallet. Local read — no network call. */
+  getTokens(): Promise<Token[]> {
+    return nativeCall(() => VeyraNative.walletGetTokens());
   },
 
-  getActiveCard(): Promise<Card | null> {
-    return nativeCall(() => VeyraNative.walletGetActiveCard());
+  /** The token selected with {@link setActiveToken}, or `null` when none is. */
+  getActiveToken(): Promise<Token | null> {
+    return nativeCall(() => VeyraNative.walletGetActiveToken());
+  },
+
+  /** One stored token, or `null` when no token on this device has that reference. */
+  getToken(tokenUniqueReference: string): Promise<Token | null> {
+    return nativeCall(() => VeyraNative.walletGetToken(tokenUniqueReference));
   },
 
   /**
-   * Selects the active card. Requires an open pay session on both platforms
+   * Selects the active token. Requires an open pay session on both platforms
    * (`SESSION_REQUIRED` otherwise). On Android this also arms tap-to-pay for it; tap
-   * events arrive via {@link onTapEvent}. On iOS it marks the card the QR rails pay with.
+   * events arrive via {@link observeTapEvents}. On iOS it marks the token the QR rails pay with.
    *
-   * Resolves a {@link CardSelection}: `'APPROVED'`, or `'FAILED'` with `CARD_NOT_FOUND` (not in this
+   * Resolves a {@link TokenSelection}: `'APPROVED'`, or `'FAILED'` with `CARD_NOT_FOUND` (not in this
    * wallet) or `CARD_DATA_MISSING` (Android: remove the card and add it again). Rejects only on a
    * setup error.
    */
-  setActiveCard(cardId: string): Promise<CardSelection> {
-    return nativeCall(() => VeyraNative.walletSetActiveCard(cardId));
+  setActiveToken(tokenUniqueReference: string): Promise<TokenSelection> {
+    return nativeCall(() => VeyraNative.walletSetActiveToken(tokenUniqueReference));
+  },
+
+  /**
+   * Arms tap-to-pay on the pay screen — the same call as Android's and iOS's `openPaySession`.
+   * Mount {@link usePaySession} on the pay screen as before; use this to re-arm within it, for example
+   * after {@link closePaySession} on a timeout. While the session is open the screen stays awake.
+   *
+   * Resolves a {@link PaySessionResult}: `'APPROVED'`, or `'FAILED'` (nothing changed) with
+   * `NFC_DISABLED`, `NFC_UNAVAILABLE` (always on iOS — no tap-to-pay there), `MODE_REFUSED` or
+   * `SCREEN_NOT_ACTIVE`. Rejects only on a setup error.
+   */
+  openPaySession(): Promise<PaySessionResult> {
+    return nativeCall(() => VeyraNative.walletOpenPaySession());
+  },
+
+  /**
+   * Disarms tap-to-pay at once — on Cancel, on your own countdown expiring, or when leaving the pay
+   * screen. A terminal tapping the phone then gets "application not found"; a tap already under way
+   * finishes. Safe with no session open. A no-op on iOS.
+   */
+  closePaySession(): Promise<void> {
+    return nativeCall(() => VeyraNative.walletClosePaySession());
+  },
+
+  /** Whether tap-to-pay is armed on the pay screen. Always `false` on iOS. */
+  isPaySessionOpen(): Promise<boolean> {
+    return nativeCall(() => VeyraNative.walletIsPaySessionOpen());
   },
 
   /**
@@ -255,19 +366,20 @@ export const wallet = {
   },
 
   /**
-   * Android-only tap-to-pay event stream (armed via {@link setActiveCard}).
+   * Android-only tap-to-pay event stream (armed via {@link setActiveToken}).
    *
    * Throws `VeyraError` `UNSUPPORTED_ON_PLATFORM` on iOS, which has no tap-to-pay: a listener that
-   * could never fire would be a silent no-op. Subscribe only where `Platform.OS === 'android'`.
+   * could never fire would be a silent no-op. Observe only where `Platform.OS === 'android'`.
    */
-  onTapEvent(listener: (e: WalletTapEvent) => void): EmitterSubscription {
-    if (Platform.OS !== 'android') {
-      throw new VeyraError(
-        'UNSUPPORTED_ON_PLATFORM',
-        'Wallet tap-to-pay is not available on iOS — subscribe to wallet.onTapEvent on Android only'
-      );
-    }
-    return veyraEmitter.addListener(Events.walletTap, listener);
+  observeTapEvents(listener: (e: WalletTapEvent) => void): VeyraSubscription {
+    requireAndroidTap();
+    return tapEvents.observe(listener);
+  },
+
+  /** Removes every {@link observeTapEvents} listener. Throws `UNSUPPORTED_ON_PLATFORM` on iOS. */
+  stopObservingTapEvents(): void {
+    requireAndroidTap();
+    tapEvents.stopAll();
   },
 
   /**
@@ -287,14 +399,20 @@ export const wallet = {
    * rails on iOS, which has no tap-to-pay. A refusal the SDK could not attribute to a card
    * (`tokenUniqueReference: null`) reaches **every** registered handler rather than none.
    *
-   * Call `remove()` on the returned subscription to stop that card's handler; the native
+   * Call `remove()` on the returned subscription to stop that one handler, or
+   * {@link stopObservingPaymentRefusals} to stop every handler for the card; the native
    * registration is released once the last listener for that card has gone.
    */
-  onPaymentRefusal(
+  observePaymentRefusals(
     tokenUniqueReference: string,
     listener: (refusal: WalletPaymentRefusal) => void
   ): VeyraSubscription {
     return refusalListeners.add(tokenUniqueReference, listener);
+  },
+
+  /** Removes every {@link observePaymentRefusals} handler for this card. */
+  stopObservingPaymentRefusals(tokenUniqueReference: string): void {
+    refusalListeners.removeAll(tokenUniqueReference);
   },
 
   // ── Scan-to-pay (MPM) ──────────────────────────────────────────────────────
@@ -340,21 +458,32 @@ export const wallet = {
 
   /**
    * Renders a payment QR for the active card: `payload` on `'APPROVED'`, or `'NOT_SENT'` with the
-   * reason no QR was made. Expiry fires once on the qr-expired channel ({@link onQrExpired}); a new
-   * render supersedes the old.
+   * reason no QR was made.
+   *
+   * `onExpired` fires once, when this QR expires — clear it from the screen and offer a new one.
+   * A later `showQrToPay` supersedes the QR and its `onExpired`, and {@link cancelQrExpiry} clears it
+   * (call it when the screen goes). A call that renders no QR never fires it.
    */
-  showQrToPay(amountMinorUnits: number): Promise<PaymentQr> {
-    return nativeCall(() => VeyraNative.walletShowQrToPay(amountMinorUnits));
+  showQrToPay(amountMinorUnits: number, onExpired?: () => void): Promise<PaymentQr> {
+    // Armed before the native call so an expiry can never slip in between; cleared again if no QR
+    // was made, unless a newer render has replaced it meanwhile.
+    const token = qrExpiry.arm(onExpired);
+    return nativeCall<PaymentQr>(() => VeyraNative.walletShowQrToPay(amountMinorUnits)).then(
+      (qr) => {
+        if (qr.responseStatus !== 'APPROVED') qrExpiry.clearIf(token);
+        return qr;
+      },
+      (e) => {
+        qrExpiry.clearIf(token);
+        throw e;
+      }
+    );
   },
 
+  /** Stops the QR's expiry timer and drops its `onExpired` — call it when the QR screen goes. */
   cancelQrExpiry(): Promise<void> {
+    qrExpiry.clear();
     return nativeCall(() => VeyraNative.walletCancelQrExpiry());
-  },
-
-  onQrExpired(listener: (e: QrExpiredEvent) => void): EmitterSubscription {
-    return veyraEmitter.addListener(Events.qrExpired, (e: QrExpiredEvent) => {
-      if (e.scope === 'wallet') listener(e);
-    });
   },
 
   // ── The SDK tells you when stored truth changes ────────────────────────────
@@ -367,12 +496,17 @@ export const wallet = {
    * while the customer is looking at it is otherwise invisible until something makes the app read
    * the card list again.
    *
-   * Branch on `canPay`, not on `status`. There is no replay — read `getCards()` at start-up.
+   * Branch on `canPay`, not on `status`. There is no replay — read `getTokens()` at start-up.
    */
-  onTokenStatusChanged(
+  observeTokenStatusChanged(
     listener: (e: TokenStatusChangedEvent) => void
-  ): EmitterSubscription {
-    return veyraEmitter.addListener(Events.tokenStatusChanged, listener);
+  ): VeyraSubscription {
+    return tokenStatusEvents.observe(listener);
+  },
+
+  /** Removes every {@link observeTokenStatusChanged} listener. */
+  stopObservingTokenStatusChanged(): void {
+    tokenStatusEvents.stopAll();
   },
 
   /**
@@ -383,10 +517,15 @@ export const wallet = {
    * can settle days later, long after the screen that made it is gone. No replay, so a screen
    * still reads `getTransactions()` when it appears.
    */
-  onTransactionResolved(
+  observeTransactionResolved(
     listener: (e: WalletTransactionResolvedEvent) => void
-  ): EmitterSubscription {
-    return veyraEmitter.addListener(Events.walletTransactionResolved, listener);
+  ): VeyraSubscription {
+    return transactionResolvedEvents.observe(listener);
+  },
+
+  /** Removes every {@link observeTransactionResolved} listener. */
+  stopObservingTransactionResolved(): void {
+    transactionResolvedEvents.stopAll();
   },
 
   /**
@@ -394,19 +533,42 @@ export const wallet = {
    * flipping.
    *
    * Covers key **consumption** and **refresh** only. Keys also expire by clock, with no SDK code
-   * running, so nothing fires for that; such a card reads as `requiresOnline` on your next
-   * `getCards()`. Do not word your UI as though this were live coverage of every case.
+   * running, so nothing fires for that; such a token reads as `requiresOnline` on your next
+   * `getTokens()`. Do not word your UI as though this were live coverage of every case.
    *
    * Observation only — there is deliberately no API to trigger a key refresh.
    */
-  onCardKeyStateChanged(
-    listener: (e: CardKeyStateEvent) => void
-  ): EmitterSubscription {
-    return veyraEmitter.addListener(Events.cardKeyState, listener);
+  observeTokenKeyStateChanged(
+    listener: (e: TokenKeyStateEvent) => void
+  ): VeyraSubscription {
+    return tokenKeyStateEvents.observe(listener);
+  },
+
+  /** Removes every {@link observeTokenKeyStateChanged} listener. */
+  stopObservingTokenKeyStateChanged(): void {
+    tokenKeyStateEvents.stopAll();
+  },
+
+  // ── Identity ───────────────────────────────────────────────────────────────
+
+  /**
+   * This install's payment application instance ID — generated by the SDK on first use and kept
+   * for the life of the install (a reinstall gets a new one). Read-only.
+   */
+  getPaymentApplicationInstanceId(): Promise<string> {
+    return nativeCall(() => VeyraNative.walletGetPaymentApplicationInstanceId());
   },
 
   // ── History & receipts ─────────────────────────────────────────────────────
 
+  /**
+   * A card's transaction history: the last `limit` payments made with it, on every rail this
+   * platform has, most recent first — outcome, merchant and, where the merchant's bank supports
+   * it, the credit confirmation, as the SDK last recorded them.
+   *
+   * Local read — no network call. Empty when no card on this device has that reference, or the
+   * card has no payments yet. Same name and default on Android, iOS and React Native.
+   */
   getTransactions(tokenUniqueReference: string, limit = 50): Promise<TransactionSummary[]> {
     return nativeCall(() => VeyraNative.walletGetTransactions(tokenUniqueReference, limit));
   },
@@ -504,3 +666,12 @@ export const wallet = {
 
 /** Module-internal (not exported from the package): re-arm per-card refusals after initialise. */
 export const rearmPaymentRefusalListeners = (): void => refusalListeners.rearm();
+
+/**
+ * Module-internal: drop every activation callback. Called on sign-out and on an initialise that
+ * switches customer — exactly when the native SDKs stop every activation observer — so a callback
+ * never outlives its observer, and a same-customer initialise keeps them all.
+ */
+export const releaseActivationObservers = (): void => {
+  activations.clearAll();
+};

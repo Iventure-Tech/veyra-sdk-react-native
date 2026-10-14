@@ -27,6 +27,12 @@ RCT_EXTERN_METHOD(sessionOpen : (NSString *)kind
 RCT_EXTERN_METHOD(sessionClose : (NSString *)kind
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(walletOpenPaySession : (RCTPromiseResolveBlock)resolve
+                  rejecter : (RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(walletClosePaySession : (RCTPromiseResolveBlock)resolve
+                  rejecter : (RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(walletIsPaySessionOpen : (RCTPromiseResolveBlock)resolve
+                  rejecter : (RCTPromiseRejectBlock)reject)
 
 // ── Wallet ───────────────────────────────────────────────────────────────────
 RCT_EXTERN_METHOD(walletGetBanks : (NSString *)accountNumber
@@ -43,7 +49,6 @@ RCT_EXTERN_METHOD(walletCancelDigitise : (NSString *)clientRequestId
                   rejecter : (RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(walletRequestActivationCode : (NSString *)ref
                   medium : (NSString *)medium
-                  contact : (NSString *)contact
                   reason : (NSString *)reason
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
@@ -66,17 +71,28 @@ RCT_EXTERN_METHOD(walletResumeActivationObserver : (NSString *)ref
 RCT_EXTERN_METHOD(walletStopActivationObserver : (NSString *)ref
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
-RCT_EXTERN_METHOD(walletGetCards : (RCTPromiseResolveBlock)resolve
+RCT_EXTERN_METHOD(walletHasActivationObserver : (NSString *)ref
+                  resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
-RCT_EXTERN_METHOD(walletGetActiveCard : (RCTPromiseResolveBlock)resolve
+RCT_EXTERN_METHOD(walletGetTokens : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
-RCT_EXTERN_METHOD(walletSetActiveCard : (NSString *)cardId
+RCT_EXTERN_METHOD(walletGetActiveToken : (RCTPromiseResolveBlock)resolve
+                  rejecter : (RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(walletGetToken : (NSString *)tokenUniqueReference
+                  resolver : (RCTPromiseResolveBlock)resolve
+                  rejecter : (RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(walletGetPaymentApplicationInstanceId : (RCTPromiseResolveBlock)resolve
+                  rejecter : (RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(walletSetActiveToken : (NSString *)tokenUniqueReference
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(walletObservePaymentRefusals : (NSString *)tokenUniqueReference
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(walletStopObservingPaymentRefusals : (NSString *)tokenUniqueReference
+                  resolver : (RCTPromiseResolveBlock)resolve
+                  rejecter : (RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(walletDeactivateDigitise : (NSString *)clientRequestId
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(walletDeactivateToken : (NSString *)ref
@@ -119,65 +135,89 @@ RCT_EXTERN_METHOD(walletGetReceiptForTransaction : (NSString *)hash
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
 
-// ── Merchant ─────────────────────────────────────────────────────────────────
-RCT_EXTERN_METHOD(merchantRegister : (NSDictionary *)registration
+// ── SoftPOS ──────────────────────────────────────────────────────────────────
+RCT_EXTERN_METHOD(softposRegister : (NSDictionary *)registration
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
-RCT_EXTERN_METHOD(merchantGetSettlementBanks : (RCTPromiseResolveBlock)resolve
+RCT_EXTERN_METHOD(softposGetBanks : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
-RCT_EXTERN_METHOD(merchantIsRegistered : (RCTPromiseResolveBlock)resolve
+RCT_EXTERN_METHOD(softposIsRegistered : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
-RCT_EXTERN_METHOD(merchantGetStored : (RCTPromiseResolveBlock)resolve
+RCT_EXTERN_METHOD(softposGetStoredMerchantData : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
-RCT_EXTERN_METHOD(merchantRefreshStatus : (RCTPromiseResolveBlock)resolve
+RCT_EXTERN_METHOD(softposRefreshStatus : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
-RCT_EXTERN_METHOD(merchantActivate : (RCTPromiseResolveBlock)resolve
+RCT_EXTERN_METHOD(softposActivate : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
-RCT_EXTERN_METHOD(merchantDeactivate : (RCTPromiseResolveBlock)resolve
+RCT_EXTERN_METHOD(softposDeactivate : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
-RCT_EXTERN_METHOD(merchantUpdate : (NSDictionary *)update
+RCT_EXTERN_METHOD(softposUpdateMerchant : (NSDictionary *)update
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
-RCT_EXTERN_METHOD(merchantTapStart : (NSDictionary *)request
+RCT_EXTERN_METHOD(softposTapStart : (NSDictionary *)request
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
-RCT_EXTERN_METHOD(merchantCancelPayment : (NSString *)merchantOrderId
+RCT_EXTERN_METHOD(softposCancelPayment : (NSString *)merchantOrderId
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
-RCT_EXTERN_METHOD(merchantCreatePaymentContext : (double)amountMinorUnits
+RCT_EXTERN_METHOD(softposCreatePaymentContext : (double)amountMinorUnits
                   currency : (NSString *)currency
                   merchantOrderId : (NSString *_Nullable)merchantOrderId
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
-RCT_EXTERN_METHOD(merchantCancelQrExpiry : (RCTPromiseResolveBlock)resolve
+RCT_EXTERN_METHOD(softposCancelQrExpiry : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
-RCT_EXTERN_METHOD(merchantContextStatus : (NSString *)txRef
+RCT_EXTERN_METHOD(softposContextStatus : (NSString *)txRef
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
-RCT_EXTERN_METHOD(merchantInspectCustomerQr : (NSString *)payload
+RCT_EXTERN_METHOD(softposInspectCustomerQr : (NSString *)payload
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
-RCT_EXTERN_METHOD(merchantChargeCustomerQr : (NSString *)handle
+RCT_EXTERN_METHOD(softposChargeCustomerQr : (NSString *)handle
                   merchantOrderId : (NSString *)merchantOrderId
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
-RCT_EXTERN_METHOD(merchantGetTransactions : (double)limit
+RCT_EXTERN_METHOD(softposGetTransactions : (double)limit
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
-RCT_EXTERN_METHOD(merchantGetTransaction : (NSString *)reference
+RCT_EXTERN_METHOD(softposGetTransaction : (NSString *)reference
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
-RCT_EXTERN_METHOD(merchantPaymentStatus : (NSString *)merchantOrderId
+RCT_EXTERN_METHOD(softposPaymentStatus : (NSString *)merchantOrderId
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
-RCT_EXTERN_METHOD(merchantRefreshTransactionStatus : (NSString *)reference
+RCT_EXTERN_METHOD(softposRefreshTransactionStatus : (NSString *)reference
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
-RCT_EXTERN_METHOD(merchantRefreshCreditConfirmation : (NSString *)reference
+RCT_EXTERN_METHOD(softposRefreshCreditConfirmation : (NSString *)reference
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
-RCT_EXTERN_METHOD(merchantGetReceipt : (NSString *)reference
+RCT_EXTERN_METHOD(softposGetReceipt : (NSString *)reference
                   resolver : (RCTPromiseResolveBlock)resolve
                   rejecter : (RCTPromiseRejectBlock)reject)
 
+RCT_EXTERN_METHOD(softposGetStoredMerchantId : (RCTPromiseResolveBlock)resolve
+                  rejecter : (RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(softposHasStoredMerchant : (RCTPromiseResolveBlock)resolve
+                  rejecter : (RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(softposIsMerchantActive : (RCTPromiseResolveBlock)resolve
+                  rejecter : (RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(softposIsTransactionInProgress : (RCTPromiseResolveBlock)resolve
+                  rejecter : (RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(softposIsAwaitingCardTap : (RCTPromiseResolveBlock)resolve
+                  rejecter : (RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(softposGetStoredMerchantDataFor : (NSString *)customerId
+                  resolver : (RCTPromiseResolveBlock)resolve
+                  rejecter : (RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(softposIsMerchantRegistered : (NSString *)customerId
+                  resolver : (RCTPromiseResolveBlock)resolve
+                  rejecter : (RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(softposGetTransactionStatus : (NSString *)reference
+                  transactionDate : (NSString *)transactionDate
+                  resolver : (RCTPromiseResolveBlock)resolve
+                  rejecter : (RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(softposGetCreditConfirmation : (NSString *)creditTransactionId
+                  amountMinorUnits : (double)amountMinorUnits
+                  resolver : (RCTPromiseResolveBlock)resolve
+                  rejecter : (RCTPromiseRejectBlock)reject)
 @end

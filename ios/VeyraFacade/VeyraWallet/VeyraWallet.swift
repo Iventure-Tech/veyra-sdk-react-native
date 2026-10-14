@@ -4,9 +4,9 @@
 // typed errors). KMP/Obj-C types (VKMP*) must never appear in public signatures — every
 // boundary maps to a Swift type here.
 //
-// Android ↔ iOS name mapping (excerpt; full table in the package README):
-// VeyraWalletSdk.getInstance()?.tokenisationService.getBanks { … }
-// ↔ try await VeyraWallet.shared.tokenisation.banks()
+// Android ↔ iOS name mapping (excerpt): the same operations on the same owner, with Swift naming
+// (no `get` prefix) — VeyraWalletSdk.getInstance()?.getBanks { … }
+// ↔ try await VeyraWallet.shared.banks()
 import Foundation
 import VeyraKMP
 
@@ -16,13 +16,7 @@ import VeyraKMP
 /// that is needed; endpoints resolve from the SDK's shared defaults (the same single source of
 /// truth as Android). The only URL hooks are development overrides.
 public struct VeyraWalletConfiguration: Sendable {
-    public enum Environment: String, Sendable {
-        case local = "LOCAL"
-        case test = "TEST"
-        case live = "LIVE"
-    }
-
-    public let environment: Environment
+    public let environment: VeyraEnvironment
     /// Wallet identity (mirrors Android's `VeyraWalletSdkConfig`; required for eligibility/digitise).
     /// The `paymentApplicationInstanceID` is NOT configured — the SDK generates and persists an
     /// install-scoped one and sends it on every eligibility/digitise request (read it via
@@ -31,11 +25,10 @@ public struct VeyraWalletConfiguration: Sendable {
     public let tokenRequestorID: String?
     /// App version reported to the backend during digitise.
     public let appVersion: String
-    /// Optional override for the app's bundle id (the attestation `package_name` / App Attest
-    /// app-id suffix). Normally leave `nil` — the SDK auto-detects it from `Bundle.main`, like
-    /// Android reads `context.packageName`. Only the Team ID must be supplied.
-    public let bundleID: String?
-    /// **Your app's** Apple Developer Team ID (e.g. `"TV4JRK677Z"`). With `bundleID` this is the
+    /// The app's bundle id override for attestation — always `nil` for apps: the SDK detects it
+    /// from `Bundle.main`, as Android reads `context.packageName`.
+    let bundleID: String? = nil
+    /// **Your app's** Apple Developer Team ID (e.g. `"TV4JRK677Z"`). With the app's bundle id this is the
     /// App Attest app id (`teamID.bundleID`) the attestation binds to and the backend verifies.
     /// App Attest attests the *app*, so this is your team — not the SDK vendor's. **Mandatory:**
     /// `digitise` fails fast if it is missing.
@@ -63,13 +56,18 @@ public struct VeyraWalletConfiguration: Sendable {
     public let cdcvmPaySubtitle: String?
     public let cdcvmShowQrTitle: String?
     public let cdcvmShowQrSubtitle: String?
+    /// The longest the SDK waits for one backend call, start to finish, in seconds (5–60).
+    /// `nil` (the default) keeps the SDK's own timeouts. A value outside 5–60 makes `configure`
+    /// throw `invalidConfiguration`. A payment that runs out of time is **pending**, not failed:
+    /// the request may have reached the server, so the SDK checks the result later. A shorter
+    /// timeout answers sooner but leaves more payments pending.
+    public let requestTimeoutSeconds: Int?
 
     public init(
-        environment: Environment,
+        environment: VeyraEnvironment,
         paymentAppProviderID: String? = nil,
         tokenRequestorID: String? = nil,
         appVersion: String = "1.0.0",
-        bundleID: String? = nil,
         appleTeamID: String,
         allowedAcquirerIDs: [String] = [],
         allowedMerchantIDs: [String] = [],
@@ -77,13 +75,13 @@ public struct VeyraWalletConfiguration: Sendable {
         cdcvmPayTitle: String? = nil,
         cdcvmPaySubtitle: String? = nil,
         cdcvmShowQrTitle: String? = nil,
-        cdcvmShowQrSubtitle: String? = nil
+        cdcvmShowQrSubtitle: String? = nil,
+        requestTimeoutSeconds: Int? = nil
     ) {
         self.environment = environment
         self.paymentAppProviderID = paymentAppProviderID
         self.tokenRequestorID = tokenRequestorID
         self.appVersion = appVersion
-        self.bundleID = bundleID
         self.appleTeamID = appleTeamID
         self.allowedAcquirerIDs = allowedAcquirerIDs
         self.allowedMerchantIDs = allowedMerchantIDs
@@ -92,6 +90,7 @@ public struct VeyraWalletConfiguration: Sendable {
         self.cdcvmPaySubtitle = cdcvmPaySubtitle
         self.cdcvmShowQrTitle = cdcvmShowQrTitle
         self.cdcvmShowQrSubtitle = cdcvmShowQrSubtitle
+        self.requestTimeoutSeconds = requestTimeoutSeconds
     }
 }
 
@@ -143,47 +142,203 @@ public enum TokenizationRecommendationReason: String, Sendable {
     case other = "OTHER"
 }
 
-/// A tokenised card stored in this wallet — display metadata for the wallet screen (the token
-/// material itself stays in secure storage and is never exposed).
-public struct StoredCard: Sendable, Hashable, Identifiable {
-    /// Token unique reference — the card's identity for activation/removal/status calls.
+/// What `VeyraWallet.verifyAccount(_:)` checks — the same fields as Android's and React Native's
+/// `VerifyAccountParams`.
+/// Where the account number in a verify / digitise request came from. The same values as Android and
+/// React Native `AccountNumberSource`.
+public enum AccountNumberSource: String, Sendable {
+    case cardOnFile = "CARD_ON_FILE"
+    case manual = "MANUAL"
+    case recent = "RECENT"
+    case scan = "SCAN"
+    case application = "APPLICATION"
+    case existingToken = "EXISTING_TOKEN"
+    case other = "OTHER"
+}
+
+public struct VerifyAccountParams: Sendable, Hashable {
+    public var accountNumber: String
+    public var institutionCode: String
+    /// The account's registered email address or phone number — see
+    /// ``DigitiseParams/walletAccountID``.
+    public var walletAccountID: String
+    public var accountHolderName: String?
+    public var accountNumberSource: AccountNumberSource?
+
+    public init(
+        accountNumber: String,
+        institutionCode: String,
+        walletAccountID: String,
+        accountHolderName: String? = nil,
+        accountNumberSource: AccountNumberSource? = nil
+    ) {
+        self.accountNumber = accountNumber
+        self.institutionCode = institutionCode
+        self.walletAccountID = walletAccountID
+        self.accountHolderName = accountHolderName
+        self.accountNumberSource = accountNumberSource
+    }
+}
+
+/// The card to add with `VeyraWallet.digitise(_:)` — the same fields, and the same required
+/// ones, as Android's and React Native's `DigitiseParams`.
+public struct DigitiseParams: Sendable, Hashable {
+    public var accountNumber: String
+    public var institutionCode: String
+    public var accountHolderName: String
+    /// The wallet's own identifier for this user — **use the account's registered email address
+    /// or phone number**. The SDK hashes it and the issuer recomputes that hash from the
+    /// email/phone on its own record and compares. A value the bank does not hold (a GUID, an
+    /// internal user id, a placeholder) hashes fine and matches nothing, costing the
+    /// digitisation its identity-match signal and raising its risk score.
+    public var walletAccountID: String
+    public var emailAddress: String
+    /// The wallet provider's own judgement — never defaulted by the SDK.
+    public var recommendation: TokenizationRecommendation
+    public var consumerIdentifier: String?
+    /// The account holder's BVN. Optional when your payment app provider is registered as the
+    /// account issuer; otherwise the backend refuses with `BVN_REQUIRED`
+    /// (`DigitiseResult.responseStatusReason`). Blank is sent as absent.
+    public var bvn: String?
+    public var accountHolderAddress: String?
+    public var mobileNumber: String?
+    /// Your own unique ID for this add-card. Set one to be able to cancel it with
+    /// `VeyraWallet.cancelDigitise(clientRequestID:)`; leave it `nil` and the SDK generates one.
+    public var clientRequestID: String?
+    public var accountNumberSource: AccountNumberSource?
+    public var deviceScore: TrustScore?
+    public var accountScore: TrustScore?
+    public var recommendationReasons: [TokenizationRecommendationReason]?
+    /// Shown on the stored card.
+    public var bankName: String?
+
+    public init(
+        accountNumber: String,
+        institutionCode: String,
+        accountHolderName: String,
+        walletAccountID: String,
+        emailAddress: String,
+        recommendation: TokenizationRecommendation,
+        consumerIdentifier: String? = nil,
+        bvn: String? = nil,
+        accountHolderAddress: String? = nil,
+        mobileNumber: String? = nil,
+        clientRequestID: String? = nil,
+        accountNumberSource: AccountNumberSource? = nil,
+        deviceScore: TrustScore? = nil,
+        accountScore: TrustScore? = nil,
+        recommendationReasons: [TokenizationRecommendationReason]? = nil,
+        bankName: String? = nil
+    ) {
+        self.accountNumber = accountNumber
+        self.institutionCode = institutionCode
+        self.accountHolderName = accountHolderName
+        self.walletAccountID = walletAccountID
+        self.emailAddress = emailAddress
+        self.recommendation = recommendation
+        self.consumerIdentifier = consumerIdentifier
+        self.bvn = bvn
+        self.accountHolderAddress = accountHolderAddress
+        self.mobileNumber = mobileNumber
+        self.clientRequestID = clientRequestID
+        self.accountNumberSource = accountNumberSource
+        self.deviceScore = deviceScore
+        self.accountScore = accountScore
+        self.recommendationReasons = recommendationReasons
+        self.bankName = bankName
+    }
+}
+
+/// A token (tokenised card) in this wallet, from `tokens()`, `token(_:)` and `activeToken()`. The
+/// same type, with the same fields, as Android and React Native `Token`. It carries no card data:
+/// the token material itself stays in secure storage and is never exposed.
+public struct Token: Sendable, Hashable, Identifiable {
+    /// Token unique reference — the identifier every wallet call takes.
     public let tokenUniqueReference: String
-    /// Last four digits of the device PAN (empty when unavailable).
-    public let panLastFour: String
-    /// Masked device PAN for display, e.g. "**** **** **** 1112" (empty when unavailable).
+    /// The token's number masked to its last four digits for display, e.g. "**** **** **** 1112"
+    /// (empty when unavailable).
     public let maskedPAN: String
-    /// Card expiry for display, "MM/YY" (empty when the response carried none).
-    public let expiry: String
-    /// The card's display name — the scheme's application label and the masked last four of the
-    /// device PAN, e.g. `AFRIGO ****1234`. It is **not** a person's name: a token is not a named
-    /// credential, so this carries no personal data. It is also what the card presents to a
-    /// terminal in EMV tag `5F20`, so a receipt and this field read the same.
-    ///
-    /// Empty on cards digitised before it existed — re-digitise to populate it.
+    /// Last four digits of the token's number (empty when unavailable).
+    public let panLastFour: String
+    /// The card's display name — the scheme's application label and the masked last four, e.g.
+    /// `AFRIGO ****1234`. It is **not** a person's name, and it is what the card presents to a
+    /// terminal in EMV tag `5F20`, so a receipt and this field read the same. Empty on cards added
+    /// before it existed.
     public let cardHolderName: String
-    /// Account holder name as digitised.
-    public let accountHolderName: String
+    /// Expiry for display, "MM/YY" (empty when the token carries none).
+    public let expiry: String
     /// Bank display name supplied at digitise time.
     public let bankName: String?
-    /// Raw digitise response code (e.g. "APPROVED", "APPROVE_REQUIRE_AUTH").
-    public let status: String
+    /// The card scheme, when known.
+    public let cardScheme: CardScheme?
+    /// The token's lifecycle status as the SDK last saw it — lets a card list say *why* a card is
+    /// not payable (suspended, pending activation, expired) without a network call per card.
+    /// `nil` when the token has never been status-synced.
+    public let status: TokenStatus?
+    /// True when the token is activated and can pay.
+    public let isActive: Bool
+    /// True on the token payments use (`setActiveToken(_:)`). At most one token is selected.
+    public let isSelected: Bool
     /// True when the token still needs user activation before it can pay.
     public let requiresActivation: Bool
-    /// True on the wallet's **active** token — the one payments use by default. At most one
-    /// stored card is active; change the selection with `setActiveToken(_:)`.
-    public let isActive: Bool
-    /// True when this card cannot pay until the wallet app has been **online** to refresh it —
-    /// render the card greyed out / not tappable and prompt the user to connect.
-    /// Derived fresh on every read; it clears on its own once a refresh succeeds.
+    /// When ``requiresActivation``, how the user can activate; `nil` when none were offered.
+    public let activationMethods: [ActivationMethodInfo]?
+    /// True when this token cannot pay until the wallet app has been **online** to refresh it —
+    /// render it greyed out / not tappable and prompt the user to connect. Derived fresh on every
+    /// read; it clears on its own once a refresh succeeds.
     public let requiresOnline: Bool
-    /// True when this card was added on **another device** (or before this app was reinstalled)
+    /// True when this token was added on **another device** (or before this app was reinstalled)
     /// and the Veyra backend will not issue it new payment keys here. It cannot pay on this phone
-    /// again: prompt the user to remove it and add it again. Going online does not help, so a card
-    /// in this state always reads `requiresOnline == false`; payments with it throw
-    /// `VeyraWalletError.deviceNotBound`.
-    public internal(set) var deviceNotBound: Bool = false
+    /// again: prompt the user to remove it and add it again. A token in this state always reads
+    /// `requiresOnline == false`.
+    public let deviceNotBound: Bool
 
     public var id: String { tokenUniqueReference }
+}
+
+/// The payment network a token belongs to. The same values as Android and React Native `CardScheme`.
+public enum CardScheme: String, Sendable {
+    case iventurePay = "IVENTUREPAY"
+    case visa = "VISA"
+    case mastercard = "MASTERCARD"
+    case amex = "AMEX"
+    case discover = "DISCOVER"
+    case unknown = "UNKNOWN"
+}
+
+/// A token's lifecycle status. The same values as Android and React Native `TokenStatus`.
+public enum TokenStatus: Sendable, Hashable {
+    case active
+    case pendingActivation
+    case suspended
+    case deactivated
+    case expired
+    /// A value this build does not know — `raw` carries the stored value. Not payable.
+    case unknown(raw: String)
+
+    /// The status for a stored or wire value.
+    public init(raw: String) {
+        switch raw.uppercased() {
+        case "ACTIVE": self = .active
+        case "PENDING_ACTIVATION": self = .pendingActivation
+        case "SUSPENDED": self = .suspended
+        case "DEACTIVATED": self = .deactivated
+        case "EXPIRED": self = .expired
+        default: self = .unknown(raw: raw)
+        }
+    }
+
+    /// The wire value (`"ACTIVE"`, `"PENDING_ACTIVATION"`…), or the raw value for an unknown status.
+    public var rawValue: String {
+        switch self {
+        case .active: return "ACTIVE"
+        case .pendingActivation: return "PENDING_ACTIVATION"
+        case .suspended: return "SUSPENDED"
+        case .deactivated: return "DEACTIVATED"
+        case .expired: return "EXPIRED"
+        case .unknown(let raw): return raw
+        }
+    }
 }
 
 /// Outcome of a digitise attempt. On success the token material has already been decrypted and
@@ -194,16 +349,17 @@ public struct DigitiseResult: Sendable, Hashable {
     public let message: String?
     /// What the **call** did, as distinct from what the issuer decided: `"APPROVED"`,
     /// `"DECLINED"`, `"FAILED"` or `"NOT_SENT"` (never reached Veyra — retry with the same request).
-    /// Digitise is never `"PENDING"`. Nil on a backend older than this field, and
-    /// carried verbatim — a value this SDK has never heard of still reaches you.
-    public let responseStatus: String?
+    /// Digitise is never `"PENDING"`. Carried verbatim — a value this SDK has never heard of
+    /// still reaches you.
+    public let responseStatus: String
     /// **Why** — the symbolic cause, and the field to branch on.
     ///
     /// Carries the issuer's own cause verbatim (`ACCOUNT_NAME_MISMATCH`, `BVN_MISMATCH`,
     /// `ACCOUNT_NOT_LINKED_TO_BVN`, `ACCOUNT_ADDRESS_MISMATCH`, `ACCOUNT_BLOCKED`,
     /// `MAX_ACTIVE_TOKENS_EXCEEDED`, `RISK_SCORE_BELOW_THRESHOLD`, …), the token provider's when
-    /// it decided this itself (`INVALID_ACCOUNT_NUMBER`, `UNKNOWN_ISSUER`, …), or an API failure
-    /// on a `FAILED` call.
+    /// it decided this itself (`INVALID_ACCOUNT_NUMBER`, `UNKNOWN_ISSUER`, `BVN_REQUIRED` — no
+    /// `bvn` and your payment app provider is not registered as the account issuer, …), or an API
+    /// failure on a `FAILED` call.
     ///
     /// **Present on `APPROVE_REQUIRE_AUTH` too**, which is the case worth handling: it says why
     /// step-up is required — usually an identity mismatch — so the activation prompt can say
@@ -212,38 +368,30 @@ public struct DigitiseResult: Sendable, Hashable {
     /// Before this existed the cause reached apps only inside `message`, prose the backend is free
     /// to reword. Keep a default branch: the vocabulary grows without an SDK release.
     public let responseStatusReason: String?
-    public let activationMethods: [DigitiseActivationMethod]
+    public let activationMethods: [ActivationMethodInfo]
     /// True when provisioning data was decrypted + stored (the wallet now holds the token material).
     public let tokenStored: Bool
+    /// The `client_request_id` this digitise was sent with — yours, or the one the SDK generated.
+    /// Keep it when the result is `"FAILED"` with `NO_RESPONSE_RECEIVED` or `UPSTREAM_ERROR`: the
+    /// token provider may have created a token whose details never reached the phone, and
+    /// ``VeyraWallet/deactivateDigitise(clientRequestID:)`` switches it off. Then digitise again
+    /// with a new ID.
+    public let clientRequestID: String?
 
-    /// `responseCode == "APPROVED"` — token active and ready.
-    public var isApproved: Bool { responseCode == "APPROVED" }
-    /// `responseCode == "APPROVE_REQUIRE_AUTH"` — provisioned, activation required.
+    /// True when the token was added — ``responseStatus`` is `APPROVED`. Read from the status,
+    /// never the code.
+    public var isApproved: Bool { responseStatus == ResponseStatus.approved }
+    /// True when the token was added but must be activated before it can pay (decision
+    /// `APPROVE_REQUIRE_AUTH`).
     public var requiresActivation: Bool { responseCode == "APPROVE_REQUIRE_AUTH" }
 }
 
-/// An activation channel offered by the backend (masked email/phone, etc.).
-public struct DigitiseActivationMethod: Sendable, Hashable {
+/// One way a token can be activated, as the backend offered it — on a ``DigitiseResult`` and on a
+/// ``Token``. `medium` is an ``ActivationMedium`` value; `contact` the masked address or number to
+/// show, when there is one. The same type as Android and React Native `ActivationMethodInfo`.
+public struct ActivationMethodInfo: Sendable, Hashable {
     public let medium: String
     public let contact: String?
-}
-
-/// A NUBAN-compatible bank that can be linked to an account number.
-public struct Bank: Sendable, Hashable, Identifiable {
-    /// Bank slug identifier (e.g. `"9_payment_service_bank"`).
-    public let slug: String
-    /// Display name (e.g. `"9 payment service Bank"`).
-    public let name: String
-    /// Institution code (e.g. `"120001"`) — used for verify/digitise.
-    public let institutionCode: String
-
-    public var id: String { institutionCode }
-
-    public init(slug: String, name: String, institutionCode: String) {
-        self.slug = slug
-        self.name = name
-        self.institutionCode = institutionCode
-    }
 }
 
 /// Result of an account eligibility check. Eligible when `responseCode == "APPROVED"`.
@@ -253,17 +401,17 @@ public struct VerifyAccountResponse: Sendable, Hashable {
     /// What the **call** did: `"APPROVED"`, `"DECLINED"` (the check ran, the answer is no),
     /// or `"FAILED"` (it could not be run, so nothing was decided about the account — also when it never
     /// reached Veyra; retry as is). A check changes nothing, so it is never `"PENDING"`.
-    public let responseStatus: String?
+    public let responseStatus: String
     /// **Why** — the symbolic cause, and the field to branch on. Same vocabulary as
     /// `DigitiseResult.responseStatusReason`; see it for the values and the warning about
     /// defaulting.
     public let responseStatusReason: String?
 
     /// Convenience: the account is within the allowed range and digitise may proceed.
-    public var isApproved: Bool { responseCode == "APPROVED" }
+    public var isApproved: Bool { responseStatus == ResponseStatus.approved }
 
     public init(responseCode: String?, message: String?,
-                responseStatus: String? = nil, responseStatusReason: String? = nil) {
+                responseStatus: String, responseStatusReason: String? = nil) {
         self.responseCode = responseCode
         self.message = message
         self.responseStatus = responseStatus
@@ -271,10 +419,17 @@ public struct VerifyAccountResponse: Sendable, Hashable {
     }
 }
 
-/// How an activation code is delivered to the customer (mirrors Android `ActivationMethods`).
-public enum ActivationMethod: String, Sendable {
+/// How a token can be activated — the same six values as Android and React Native's
+/// `ActivationMedium`. `requestActivationCode` sends a code by ``maskedEmail`` or
+/// ``maskedMobilePhone``; the others are instructions to show the customer (call the bank, visit
+/// its website, open its app).
+public enum ActivationMedium: String, Sendable {
     case maskedEmail = "MASKED_EMAIL"
     case maskedMobilePhone = "MASKED_MOBILE_PHONE"
+    case automatedCallCenterPhone = "AUTOMATED_CALL_CENTER_PHONE"
+    case callCenterPhone = "CALL_CENTER_PHONE"
+    case website = "WEBSITE"
+    case mobileApplication = "MOBILE_APPLICATION"
 }
 
 /// Why an activation code is being requested (mirrors Android `ActivationCodeReason`).
@@ -473,20 +628,20 @@ public struct VerifiedPayment: Sendable {
     public let merchantName: String
     public let merchantCity: String?
     /// Display amount, major units with 2 decimals (e.g. `"5000.00"`).
-    public let amount: String
+    public let amountDisplay: String
     /// Amount in minor units (e.g. kobo).
     public let amountMinorUnits: Int64
     /// ISO 4217 numeric currency (e.g. `"566"`).
-    public let currencyNumeric: String
+    public let currencyCode: String
     /// When the scanned context expires (epoch seconds) — pay before this.
-    public let expiryEpochSeconds: Int64
+    public let expiresAtEpochSeconds: Int64
     /// The merchant's order ID for this sale, signed into the QR — pass it to
     /// `cancelPayment(merchantOrderID:)` to cancel the payment. Nil for a QR that carries none;
     /// such a payment cannot be cancelled.
     public let merchantOrderID: String?
 
     /// The verified KMP context, kept for `payScannedContext` (never public API).
-    let raw: VerifiedPaymentContext
+    let raw: VeyraKMP.VerifiedPayment
 }
 
 /// Why a scanned QR was rejected. A rejected payload must never reach a confirm screen.
@@ -522,10 +677,10 @@ public struct PaymentOutcome: Sendable, Hashable {
     /// `"PENDING"`. The push is a synchronous call, but it can still answer `PENDING` — a hop
     /// below the gateway timed out, errored, or is still settling — and that means *not yet
     /// known*, never refused. The SDK stores such a payment open and keeps asking until the
-    /// gateway states a final outcome, which then appears on the row in `recentActivity`.
+    /// gateway states a final outcome, which then appears on the row in `transactions(tokenUniqueReference:limit:)`.
     ///
     /// A plain string, not an enum, so a value added after this version shipped still reaches you.
-    public let responseStatus: String?
+    public let responseStatus: String
     /// The stated cause (`"INSUFFICIENT_FUNDS"`, `"NO_RESPONSE_RECEIVED"`, …) — display and log.
     public let responseStatusReason: String?
     public let message: String?
@@ -535,6 +690,12 @@ public struct PaymentOutcome: Sendable, Hashable {
     /// Registered merchant location (`"city, state"`) returned by the gateway. Nil when the
     /// gateway did not supply one (fall back to the scanned QR's `merchantCity`).
     public let merchantLocation: String?
+    /// The merchant-bank credit's identifier; nil unless the payment was approved and the gateway
+    /// sent one.
+    public let creditTransactionID: String?
+    /// Whether the merchant's bank can confirm the credit at all — the backend's payment-time
+    /// decision. Settlement news only: it never changes the outcome above.
+    public let isCreditConfirmationSupported: Bool?
 }
 
 /// One rendered "show QR to pay" code (dynamic CPM): the payload to display plus its display
@@ -553,7 +714,7 @@ public struct PaymentQr: Sendable, Hashable {
     /// Amount in minor units (e.g. kobo) — bound into the cryptogram.
     public let amountMinorUnits: Int64
     /// ISO 4217 numeric currency, e.g. `"566"`.
-    public let currencyNumeric: String?
+    public let currencyCode: String?
     /// When the wallet should stop displaying this QR and offer regenerate.
     public let expiresAtEpochMillis: Int64
     /// SHA-256(cryptogram‖ATC‖UN) hex — this render's unique transaction hash. Match it against a
@@ -565,23 +726,43 @@ public struct PaymentQr: Sendable, Hashable {
     public let message: String?
 }
 
-/// A token's Limited-Use Key state — for a "keys remaining" indicator and refresh prompts.
-public struct LukState: Sendable, Hashable {
-    /// How many provisioned keys can still pay (not expired, under their thresholds).
-    public let usableKeyCount: Int
-    /// True when the SDK considers a key refresh due — the card is running low on
-    /// full-capacity keys. The SDK refreshes automatically; this is observe-only.
-    public let refreshDue: Bool
+/// A payment was refused on the phone before anything was built or sent — delivered to the handlers
+/// passed to `observePaymentRefusals`. The same payload as Android and React Native
+/// `WalletPaymentRefusal`. ``type`` says which refusal, and the advice differs: `requireOnline`
+/// (connect and try again), `amountExceedCardLimit` (pay less or use another card — going online
+/// does not help), `deviceNotBound` (remove the card and add it again on this phone).
+public struct WalletPaymentRefusal: Sendable, Hashable {
+    /// `"requireOnline"`, `"amountExceedCardLimit"` or `"deviceNotBound"`.
+    public let type: String
+    /// The token the payment was attempted with; nil when the SDK could not attribute it.
+    public let tokenUniqueReference: String?
+    /// The amount that was refused, in minor units.
+    public let amountMinorUnits: Int64
+    /// The card's per-payment cap in minor units — on `amountExceedCardLimit` only, when known.
+    public let cardLimitMinorUnits: Int64?
+    /// The rail the payment was attempted on: `CPM_QR` or `MPM_QR` (iOS has no tap-to-pay).
+    public let rail: String
+    /// A human-readable description, for logs.
+    public let message: String
+
+    init(_ k: KmpWalletPaymentRefusal) {
+        type = k.type
+        tokenUniqueReference = k.tokenUniqueReference
+        amountMinorUnits = k.amountMinorUnits
+        cardLimitMinorUnits = k.cardLimitMinorUnits?.int64Value
+        rail = k.rail
+        message = k.message
+    }
 }
 
 /// A card's lifecycle status changed — the issuer suspended, reactivated, expired or deactivated
-/// it. Delivered to `tokenisation.observeTokenLifecycle`.
-public struct TokenStatusChange: Sendable, Hashable {
+/// it. Delivered to `VeyraWallet.shared.observeTokenStatusChanged`.
+public struct TokenStatusChangedEvent: Sendable, Hashable {
     /// Which card. Fires per card, so an app holding several must check it.
     public let tokenUniqueReference: String
     /// `ACTIVE`, `PENDING_ACTIVATION`, `SUSPENDED`, `DEACTIVATED`, `EXPIRED`, or `UNKNOWN` for a
     /// value this SDK build does not recognise.
-    public let status: String
+    public let status: TokenStatus
     /// The status exactly as stored, recognised or not. For `UNKNOWN` this is the only thing that
     /// identifies it — quote it in logs and support calls.
     public let rawStatus: String
@@ -597,8 +778,8 @@ public struct TokenStatusChange: Sendable, Hashable {
 }
 
 /// A wallet payment that was left `PENDING` has reached its final outcome. Delivered to
-/// `tokenisation.observeTransactionResolved`.
-public struct WalletTransactionResolution: Sendable, Hashable {
+/// `VeyraWallet.shared.observeTransactionResolved`.
+public struct WalletTransactionResolvedEvent: Sendable, Hashable {
     /// The hash identifying this payment on every rail — the same value a receipt links on, and
     /// what you pass to look the row up again.
     public let transactionHash: String
@@ -616,17 +797,26 @@ public struct WalletTransactionResolution: Sendable, Hashable {
     public let merchantName: String
 }
 
-/// One payment in a token's recent activity — a terminal scan-to-pay outcome.
-public struct TokenActivity: Sendable, Hashable {
-    public let merchantName: String
-    /// Amount in minor units (e.g. kobo).
-    public let amountMinorUnits: Int64
-    /// ISO 4217 numeric currency in the stored 4-digit shape (e.g. `"0566"`).
-    public let currencyNumeric: String
-    /// `"APPROVED"` or `"DECLINED"`.
-    public let status: String
-    /// When the payment was made (epoch milliseconds).
-    public let atEpochMillis: Int64
+/// A card's payment-key state changed — delivered by `observeTokenKeyStateChanged(onTokenKeyStateChanged:)`.
+///
+/// The same event Android and React Native deliver as `TokenKeyStateEvent`.
+public struct TokenKeyStateEvent: Sendable, Hashable {
+    /// Which card. Fires per card, so an app holding several must check it.
+    public let tokenUniqueReference: String
+    /// `true` when the card cannot pay until the SDK refreshes its keys — the same value
+    /// `Token.requiresOnline` carries.
+    public let requiresOnline: Bool
+    /// `true` when the backend has refused this device payment keys for the card (it was added on
+    /// another device, or before this app was reinstalled). Going online cannot fix it, so
+    /// `requiresOnline` is `false` alongside it: prompt the user to add the card again. The same
+    /// value `Token.deviceNotBound` carries.
+    public let deviceNotBound: Bool
+
+    public init(tokenUniqueReference: String, requiresOnline: Bool, deviceNotBound: Bool) {
+        self.tokenUniqueReference = tokenUniqueReference
+        self.requiresOnline = requiresOnline
+        self.deviceNotBound = deviceNotBound
+    }
 }
 
 /// One row of the customer's transaction history — a payment on any rail (MPM or CPM QR).
@@ -635,11 +825,13 @@ public struct TransactionSummary: Sendable, Hashable {
     /// Amount in minor units (e.g. kobo). 64-bit, matching `MerchantTransaction.amount` and every
     /// gateway field either side of it — a 32-bit amount could not carry a payment above
     /// ₦21,474,836.47.
-    public let amountInMinorUnit: Int64
-    /// ISO 4217 numeric currency in the stored 4-digit shape (e.g. `"0566"`), or nil.
-    public let transactionCurrencyCode: String?
+    public let amountMinorUnits: Int64
+    /// ISO 4217 numeric currency, three digits (e.g. `"566"`), or nil.
+    public let currencyCode: String?
     /// SHA-256(cryptogram‖ATC‖UN) hex — the join key to a `TransactionReceipt`, or nil.
     public let transactionHash: String?
+    /// The token that paid.
+    public let tokenUniqueReference: String?
     /// `"PENDING"`, `"APPROVED"`, `"DECLINED"`, `"FAILED"`, or nil for unknown.
     public let authorizationStatus: String?
     /// The outcome's response code (`"00"`, `"51"`, `"91"`…), carried verbatim from the rail
@@ -650,6 +842,9 @@ public struct TransactionSummary: Sendable, Hashable {
     /// as a plain string — display it, never parse it; nil on legacy/unresolved rows.
     public let responseStatusReason: String?
     /// When the payment was recorded (epoch milliseconds), for the QR rails; nil for tap rows.
+    /// ISO 8601 local date-time with timezone, from the terminal's EMV date and time — tap rows
+    /// only; QR rows carry ``atEpochMillis`` instead. Nil on legacy rows.
+    public let localTransactionDateTime: String?
     public let atEpochMillis: Int64?
     /// How this wallet paid: `"TAP"`, `"QR_GENERATED"` (showed a CPM QR), `"QR_SCANNED"`
     /// (scanned a merchant MPM QR); nil on legacy rows — show nothing rather than guess.
@@ -662,7 +857,7 @@ public struct TransactionSummary: Sendable, Hashable {
     /// which carry no cryptogram hash. Nil for tap/legacy rows.
     public let merchantTransactionReference: String?
     /// The merchant id from the verified QR context; nil for tap/legacy rows.
-    public let merchantId: String?
+    public let merchantID: String?
     /// The beneficiary credit's identifier (NIP session id inter-bank, batch reference intra-bank)
     /// — display and support only. The SDK polls the confirmation itself; never pass this back.
     /// Nil on rows that were not approved, and from gateways predating the credit rail.
@@ -696,12 +891,30 @@ public struct TransactionSummary: Sendable, Hashable {
 /// The outcome of choosing the card payments use (`setActiveToken`). On the phone; nothing is sent.
 /// `APPROVED`: selected. `FAILED`: not selected, `responseStatusReason` says why — `CARD_NOT_FOUND`
 /// (no such card in this wallet).
-public struct CardSelection: Sendable, Hashable {
+public struct TokenSelection: Sendable, Hashable {
     public let responseStatus: String
     public let responseStatusReason: String?
     public let message: String?
     /// True when the card is now the one payments use.
-    public var selected: Bool { responseStatus == VeyraResponseStatus.approved }
+    public var selected: Bool { responseStatus == ResponseStatus.approved }
+}
+
+/// The answer to ``VeyraWallet/openPaySession()`` — the same type and reasons as Android's
+/// `PaySessionResult`. iPhone cannot pay by tap (Apple keeps card emulation to itself), so on iOS it is
+/// always `FAILED` / `NFC_UNAVAILABLE` — the answer an Android phone without NFC gives, which a
+/// cross-platform app already handles by offering a QR rail.
+public struct PaySessionResult: Sendable, Hashable {
+    public static let modeRefused = "MODE_REFUSED"
+    public static let nfcUnavailable = "NFC_UNAVAILABLE"
+    public static let nfcDisabled = "NFC_DISABLED"
+    public static let tapRoutingRefused = "TAP_ROUTING_REFUSED"
+    public static let screenNotActive = "SCREEN_NOT_ACTIVE"
+
+    public let responseStatus: String
+    public let responseStatusReason: String?
+    public let message: String?
+    /// True when tap-to-pay is armed on the pay screen. Never on iOS.
+    public var opened: Bool { responseStatus == ResponseStatus.approved }
 }
 
 /// The answer to `reconcilePendingTransactions` — a read across every open transaction, so it states no
@@ -726,69 +939,32 @@ public struct ReceiptScan: Sendable, Hashable {
     public let responseStatusReason: String?
     public let message: String?
     /// True when the receipt was accepted and stored.
-    public var stored: Bool { responseStatus == VeyraResponseStatus.approved && receipt != nil }
+    public var stored: Bool { responseStatus == ResponseStatus.approved && receipt != nil }
 }
 
 public struct TransactionReceipt: Sendable, Hashable {
     public let merchantName: String
-    public let merchantId: String?
+    public let merchantID: String?
     public let merchantAddress: String?
     public let transactionType: String
     public let transactionStatus: String
     public let transactionTime: String
     /// Amount in minor units, as a string (e.g. `"10000"`).
-    public let totalAmount: String
+    public let totalAmountMinorUnits: Int64
     /// Display string (e.g. `"100.00"`).
     public let totalAmountFormatted: String
-    public let currency: String?
+    public let currencyCode: String?
     public let maskedToken: String?
     public let merchantTransactionReference: String?
     public let cdcvmApprovedByWallet: Bool?
     public let cdcvmOutcome: String?
-    public let transactionId: String?
+    public let transactionID: String?
     /// SHA-256(cryptogram‖ATC‖UN) hex — links this receipt to a `TransactionSummary`.
     public let transactionHash: String?
 }
 
-/// The setup errors — the **only** thing a Veyra wallet call throws. Each is a mistake in the app's
-/// integration, found in development; everything that happens to a call (authentication dismissed,
-/// card refused on the phone, offline, declined, no answer…) is the outcome the call returns. The
-/// same five codes exist on Android (`VeyraSetupException`) and React Native (`VeyraError.code`).
-public enum VeyraWalletError: Error, Sendable {
-    /// `VeyraWallet.configure(_:customerID:)` has not been called.
-    case notConfigured
-    /// No customer is signed in — `VeyraWallet.signOut()` was called. Call
-    /// `VeyraWallet.configure(_:customerID:)` with the customer to use the wallet again.
-    case notSignedIn
-    /// The configuration cannot be used — the message names the problem: an unusable provider, a
-    /// provider of a different kind from an earlier `configure`, a blank customer ID, or a missing
-    /// required setting (payment app provider ID, token requestor ID, Apple Team ID…).
-    case invalidConfiguration(message: String)
-    /// A payment call made without its screen session (raised by the React Native bridge).
-    case sessionRequired
-    /// A method this platform cannot perform — e.g. wallet tap-to-pay on iOS.
-    case unsupportedOnPlatform
-}
-
 // Without LocalizedError, `error.localizedDescription` renders the useless
-// "The operation couldn't be completed. (VeyraWallet.VeyraWalletError error N.)".
-extension VeyraWalletError: LocalizedError {
-    public var errorDescription: String? {
-        switch self {
-        case .notConfigured:
-            return "VeyraWallet is not configured — call VeyraWallet.configure(_:customerID:) at launch."
-        case .notSignedIn:
-            return "No customer is signed in — call VeyraWallet.configure(_:customerID:) with the customer."
-        case .invalidConfiguration(let message):
-            return message
-        case .sessionRequired:
-            return "This payment call needs its screen session."
-        case .unsupportedOnPlatform:
-            return "This method is not supported on iOS."
-        }
-    }
-}
-
+// "The operation couldn't be completed. (VeyraWallet.VeyraError error N.)".
 /// The wallet's per-customer work, stopped and started by the shared customer session when a
 /// customer signs out or another signs in.
 private final class WalletCustomerWork: NSObject, CustomerSessionParticipant {
@@ -800,10 +976,11 @@ private final class WalletCustomerWork: NSObject, CustomerSessionParticipant {
 
 /// Entry point of the Veyra wallet SDK on iOS.
 ///
-/// Configure once at launch, then use the service accessors:
+/// Configure once at launch, then call the wallet's operations on `VeyraWallet.shared`:
 /// ```swift
-/// VeyraWallet.configure(.init(environment: .test, apiBaseURL: url, …), customerID: signedInCustomer)
-/// let banks = try await VeyraWallet.shared.tokenisation.banks()
+/// try VeyraWallet.configure(customerID: signedInCustomer, config: .init(environment: .test, …), provider: provider)
+/// let wallet = VeyraWallet.shared
+/// let banks = try await wallet.banks()
 /// ```
 public final class VeyraWallet: @unchecked Sendable {
 
@@ -814,6 +991,10 @@ public final class VeyraWallet: @unchecked Sendable {
     // Kept so a sign-in can build the instance for whoever is signed in.
     private var configuration: VeyraWalletConfiguration?
     private lazy var customerWork = WalletCustomerWork(owner: self)
+    // Tokens with a live activation observer, for `hasActivationObserver`, each with the
+    // registration it belongs to so a replaced observer's late callback cannot clear its
+    // successor. Guarded by `lock`.
+    private var observedActivations: [String: UUID] = [:]
 
     private init() {}
 
@@ -833,21 +1014,28 @@ public final class VeyraWallet: @unchecked Sendable {
     ///   - provider: How the SDK reaches Veyra — required, no default: your `VeyraAssertionProvider` or
     ///     `VeyraProxyProvider`. A combined app passes the same one to both SDKs.
     ///
-    /// - Throws: `VeyraWalletError.invalidConfiguration` when the provider cannot be used (the
-    ///   message names the problem) or is of a different kind from an earlier `configure`. Every
+    /// - Throws: `VeyraError.invalidConfiguration` when the provider cannot be used (the
+    ///   message names the problem) or is of a different kind from an earlier `configure`, or when
+    ///   `requestTimeoutSeconds` is outside 5–60. Every
     ///   `configure` re-binds the provider, which background work uses too.
-    public static func configure(_ configuration: VeyraWalletConfiguration, customerID: String, provider: any VeyraProvider) throws {
+    @discardableResult
+    public static func configure(customerID: String, config configuration: VeyraWalletConfiguration, provider: any VeyraProvider) throws -> VeyraWallet {
         guard !customerID.trimmingCharacters(in: .whitespaces).isEmpty else {
-            throw VeyraWalletError.invalidConfiguration(message: "customerID must not be blank")
+            throw VeyraError.invalidConfiguration(message: "customerID must not be blank")
+        }
+        let requestTimeout: KotlinInt?
+        switch KmpConnectionBridge.kmpRequestTimeout(configuration.requestTimeoutSeconds) {
+        case .failure(let problem): throw VeyraError.invalidConfiguration(message: problem.message)
+        case .success(let value): requestTimeout = value
         }
         switch KmpConnectionBridge.kmpProvider(provider) {
         case .failure(let problem):
-            throw VeyraWalletError.invalidConfiguration(message: problem.message)
+            throw VeyraError.invalidConfiguration(message: problem.message)
         case .success(let kmpProvider):
             do {
-                try IosConnections.shared.bindWallet(environmentName: configuration.environment.rawValue, provider: kmpProvider)
+                try IosConnections.shared.bindWallet(environmentName: configuration.environment.rawValue, provider: kmpProvider, requestTimeoutSeconds: requestTimeout)
             } catch {
-                throw VeyraWalletError.invalidConfiguration(message: error.localizedDescription)
+                throw VeyraError.invalidConfiguration(message: error.localizedDescription)
             }
         }
         // Stop and drop the current instance (a reconfigure, or another customer), keep the
@@ -856,17 +1044,20 @@ public final class VeyraWallet: @unchecked Sendable {
         shared.lock.lock()
         let previous = shared.kmp
         shared.kmp = nil
+        // Stopping the instance stops its activation pollers too.
+        shared.observedActivations.removeAll()
         shared.configuration = configuration
         shared.lock.unlock()
         previous?.stopCustomerWork()
         CustomerSession.shared.register(participant: shared.customerWork)
         CustomerSession.shared.signIn(customerId: customerID)
+        return shared
     }
 
     /// The customer has logged out: stop everything the wallet runs for them and drop every
     /// observer registration. Their cards, keys, history and receipts stay on the device for when
     /// they sign in again (nothing is downloaded then). Until the next `configure` every call
-    /// throws `VeyraWalletError.notSignedIn`.
+    /// throws `VeyraError.notSignedIn`.
     public static func signOut() {
         CustomerSession.shared.signOut()
     }
@@ -884,6 +1075,8 @@ public final class VeyraWallet: @unchecked Sendable {
         lock.lock()
         let current = kmp
         kmp = nil
+        // The instance stops every activation poller with its work.
+        observedActivations.removeAll()
         lock.unlock()
         current?.stopCustomerWork()
     }
@@ -918,9 +1111,6 @@ public final class VeyraWallet: @unchecked Sendable {
         )
     }
 
-    /// Tokenisation service — bank lookup, eligibility, digitise, activation.
-    public var tokenisation: Tokenisation { Tokenisation(owner: self) }
-
     /// This install's SDK-generated `payment_application_instance_id` (`VYRA` + 32 hex chars):
     /// minted on first use, persisted install-scoped (never backed up), new on reinstall.
     /// Read-only — the app cannot set or regenerate it. Mirrors Android's
@@ -929,823 +1119,846 @@ public final class VeyraWallet: @unchecked Sendable {
         try requireKmp().paymentApplicationInstanceId()
     }
 
+    // MARK: Pay session — the same three calls as Android and React Native
+
+    /// Arms tap-to-pay on the pay screen. iPhone cannot pay by tap, so this always answers
+    /// `FAILED` / `NFC_UNAVAILABLE` and changes nothing. It exists so the same integration runs on
+    /// every platform: on Android the same call arms the screen.
+    public func openPaySession() -> PaySessionResult {
+        PaySessionResult(
+            responseStatus: ResponseStatus.failed,
+            responseStatusReason: PaySessionResult.nfcUnavailable,
+            message: "iPhone cannot pay by tap; pay with a QR code"
+        )
+    }
+
+    /// Disarms tap-to-pay. Nothing is ever armed on iOS, so this does nothing.
+    public func closePaySession() {}
+
+    /// Whether tap-to-pay is armed on the pay screen. Always `false` on iOS.
+    public func isPaySessionOpen() -> Bool { false }
+
     fileprivate func requireKmp() throws -> WalletKmp {
         lock.lock()
         defer { lock.unlock() }
         guard let kmp else {
-            throw configuration == nil ? VeyraWalletError.notConfigured : VeyraWalletError.notSignedIn
+            throw configuration == nil ? VeyraError.notConfigured : VeyraError.notSignedIn
         }
         return kmp
     }
+}
 
-    /// Tokenisation operations (mirrors Android's `TokenisationService`).
-    public struct Tokenisation: Sendable {
-        fileprivate let owner: VeyraWallet
+// MARK: - Wallet operations
+//
+// Every wallet operation hangs off `VeyraWallet.shared` — the same owner as Android's
+// `VeyraWalletSdk` and React Native's `wallet`.
+extension VeyraWallet {
 
-        /// Fetch the NUBAN banks that can be linked (optionally filtered by account number).
-        /// Mirrors Android `getBanks` incl. de-duplication by institution code.
-        public func banks(accountNumber: String? = nil) async throws -> BankList {
-            try await call { kmp in
-                let r = try await kmp.banks(accountNumber: accountNumber)
-                return BankList(
-                    banks: r.banks.map { Bank(slug: $0.slug, name: $0.name, institutionCode: $0.institutionCode) },
-                    responseStatus: r.responseStatus, responseStatusReason: r.responseStatusReason, message: r.message
-                )
-            }
-        }
-
-        /// Check account eligibility before digitising (mirrors Android `checkAccountEligibility`).
-        /// Requires `paymentAppProviderID`/`tokenRequestorID` in the configuration.
-        public func verifyAccount(
-            accountNumber: String,
-            institutionCode: String,
-            walletAccountID: String,
-            accountHolderName: String,
-            accountNumberSource: String? = nil
-        ) async throws -> VerifyAccountResponse {
-            try await call { kmp in
-                let r = try await kmp.verifyAccount(
-                    accountNumber: accountNumber,
-                    institutionCode: institutionCode,
-                    walletAccountId: walletAccountID,
-                    accountHolderName: accountHolderName,
-                    accountNumberSource: accountNumberSource
-                )
-                return VerifyAccountResponse(
-                    responseCode: r.responseCode,
-                    message: r.message,
-                    responseStatus: r.responseStatus,
-                    responseStatusReason: r.responseStatusReason
-                )
-            }
-        }
-
-        /// Digitise (tokenise) an account: attests, sends the device key, and on success decrypts
-        /// and stores the token material on-device. Requires `paymentAppProviderID`/`tokenRequestorID` in the
-        /// configuration.
-        ///
-        /// - Parameter clientRequestID: your own ID for this add-card. Pass one to be able to cancel it
-        ///   with ``cancelDigitise(clientRequestID:)``; omit it and the SDK generates one. Either way,
-        ///   cancelling the Swift `Task` that awaits this call cancels it while it is still on the
-        ///   device: it then returns `NOT_SENT` / `CANCELLED`. Once the request has been sent a cancel
-        ///   is refused and the card is added (or refused) as normal.
-        public func digitise(
-            accountNumber: String,
-            institutionCode: String,
-            walletAccountID: String,
-            accountHolderName: String,
-            emailAddress: String,
-            recommendation: TokenizationRecommendation,
-            mobileNumber: String? = nil,
-            bvn: String? = nil,
-            accountHolderAddress: String? = nil,
-            accountNumberSource: String? = nil,
-            consumerIdentifier: String? = nil,
-            deviceScore: TrustScore? = nil,
-            accountScore: TrustScore? = nil,
-            recommendationReasons: [TokenizationRecommendationReason]? = nil,
-            bankName: String? = nil,
-            clientRequestID: String? = nil
-        ) async throws -> DigitiseResult {
-            // With no ID from the app, one is made here rather than by the core, so cancelling the
-            // Task can still name this digitisation.
-            let requestID = clientRequestID?.trimmingCharacters(in: .whitespaces).nilIfEmpty ?? UUID().uuidString
-            // number_of_active_tokens is SDK-computed from its token registry — no caller input.
-            return try await TaskCancelBridge.run(
-                cancel: { [self] in cancelDigitise(clientRequestID: requestID) },
-                notFound: .noDigitisationInProgressForClientRequestID
-            ) { try await call { kmp in
-                let r = try await kmp.digitise(
-                    accountNumber: accountNumber,
-                    institutionCode: institutionCode,
-                    walletAccountId: walletAccountID,
-                    accountHolderName: accountHolderName,
-                    emailAddress: emailAddress,
-                    recommendation: recommendation.rawValue,
-                    mobileNumber: mobileNumber,
-                    bvn: bvn,
-                    accountHolderAddress: accountHolderAddress,
-                    accountNumberSource: accountNumberSource,
-                    consumerIdentifier: consumerIdentifier,
-                    deviceScore: deviceScore?.rawValue,
-                    accountScore: accountScore?.rawValue,
-                    recommendationReasons: recommendationReasons.map { $0.map(\.rawValue) },
-                    bankName: bankName,
-                    clientRequestId: requestID
-                )
-                return DigitiseResult(
-                    tokenUniqueReference: r.tokenUniqueReference,
-                    responseCode: r.responseCode,
-                    message: r.message,
-                    responseStatus: r.responseStatus,
-                    responseStatusReason: r.responseStatusReason,
-                    activationMethods: r.activationMethods.map { DigitiseActivationMethod(medium: $0.medium, contact: $0.contact) },
-                    tokenStored: r.tokenStored
-                )
-            } }
-        }
-
-
-        /// The tokens this wallet holds — the SDK's own registry, written by
-        /// `digitise` on a successful provision; includes which token is active. Local read,
-        /// no network.
-        public func tokens() async throws -> [StoredCard] {
-            try await call { kmp in
-                try await kmp.tokens().map {
-                    StoredCard(
-                        tokenUniqueReference: $0.tokenUniqueReference,
-                        panLastFour: $0.panLastFour,
-                        maskedPAN: $0.maskedPan,
-                        expiry: $0.expiry,
-                        cardHolderName: $0.cardHolderName,
-                        accountHolderName: $0.accountHolderName,
-                        bankName: $0.bankName,
-                        status: $0.status,
-                        requiresActivation: $0.requiresActivation,
-                        isActive: $0.isActive,
-                        requiresOnline: $0.requiresOnline,
-                        deviceNotBound: $0.deviceNotBound
-                    )
-                }
-            }
-        }
-
-        /// The wallet's active token — the one payments use — or `nil` when the wallet is empty.
-        public var activeToken: StoredCard? {
-            get async throws {
-                try await tokens().first(where: \.isActive)
-            }
-        }
-
-        /// Select the token payments use. Answers a ``CardSelection``: `APPROVED`, or `FAILED` /
-        /// `CARD_NOT_FOUND` when the token is not in this wallet. On the phone; only a setup mistake
-        /// throws.
-        @discardableResult
-        public func setActiveToken(_ tokenUniqueReference: String) async throws -> CardSelection {
-            try await call { kmp in
-                let r = try await kmp.setActiveToken(tokenUniqueReference: tokenUniqueReference)
-                return CardSelection(responseStatus: r.responseStatus, responseStatusReason: r.responseStatusReason,
-                                     message: r.message)
-            }
-        }
-
-        /// Request an activation code delivered via the chosen method (mirrors Android).
-        public func requestActivationCode(
-            tokenUniqueReference: String,
-            method: ActivationMethod,
-            reason: ActivationReason = .addCard
-        ) async throws -> ActivationCodeResponse {
-            try await call { kmp in
-                let r = try await kmp.requestActivationCode(
-                    tokenUniqueReference: tokenUniqueReference,
-                    selectedActivationMethod: method.rawValue,
-                    preferredActivationChannel: method.rawValue,
-                    reasonCode: reason.rawValue
-                )
-                return ActivationCodeResponse(
-                    tokenUniqueReference: r.tokenUniqueReference,
-                    expirationDateTime: r.expirationDateTime,
-                    status: r.status,
-                    message: r.message,
-                    failureCode: ActivationFailureCode(kmp: r.failureCode, raw: r.failureCodeRaw),
-                    failureCodeRaw: r.failureCodeRaw,
-                    responseStatus: r.responseStatus ?? VeyraResponseStatus.failed,
-                    responseStatusReason: r.responseStatusReason
-                )
-            }
-        }
-
-        /// Activate a token with the code the customer received.
-        public func activate(tokenUniqueReference: String, activationCode: String) async throws -> ActivateResponse {
-            try await call { kmp in
-                let r = try await kmp.activate(tokenUniqueReference: tokenUniqueReference, activationCode: activationCode)
-                return ActivateResponse(
-                    tokenUniqueReference: r.tokenUniqueReference,
-                    status: r.status,
-                    message: r.message,
-                    failureCode: ActivationFailureCode(kmp: r.failureCode, raw: r.failureCodeRaw),
-                    failureCodeRaw: r.failureCodeRaw,
-                    attemptsRemaining: r.attemptsRemaining?.intValue,
-                    recommendDelete: RecommendDelete(kmp: r.recommendDelete, raw: r.recommendDeleteRaw),
-                    recommendDeleteRaw: r.recommendDeleteRaw,
-                    responseStatus: r.responseStatus ?? VeyraResponseStatus.failed,
-                    responseStatusReason: r.responseStatusReason
-                )
-            }
-        }
-
-        /// Deactivate a token on the backend. On success the SDK also wipes every on-device
-        /// artefact for the token and promotes the next token when the active one was removed;
-        /// on failure nothing local changes.
-        public func deactivateToken(_ tokenUniqueReference: String) async throws -> TokenStatusUpdateResponse {
-            try await call { kmp in
-                let r = try await kmp.deactivateToken(tokenUniqueReference: tokenUniqueReference)
-                return TokenStatusUpdateResponse(tokenUniqueReference: r.tokenUniqueReference, status: r.status, message: r.message,
-                                                 responseStatus: r.responseStatus ?? VeyraResponseStatus.failed,
-                                                 responseStatusReason: r.responseStatusReason)
-            }
-        }
-
-        /// Current backend status of a token (e.g. `"ACTIVE"`), as an outcome — a read, never `PENDING`.
-        public func tokenStatus(tokenUniqueReference: String) async throws -> TokenStatusResult {
-            try await call { kmp in
-                let r = try await kmp.tokenStatus(tokenUniqueReference: tokenUniqueReference)
-                return TokenStatusResult(tokenStatus: r.tokenStatus, responseStatus: r.responseStatus,
-                                         responseStatusReason: r.responseStatusReason, message: r.message)
-            }
-        }
-
-        /// Observe a token until it activates:
-        /// the SDK polls the token's status every 10 seconds for up to 5 minutes. `onActivated`
-        /// fires exactly once when the token becomes ACTIVE (navigate to the wallet);
-        /// `onTimeout` after 5 minutes without activation; `onError` reports each failed check
-        /// and polling continues. Callbacks arrive on the main thread. Observing the same token
-        /// again replaces the previous observer. Pair with `pauseActivationObserver` /
-        /// `resumeActivationObserver` (scene background/foreground — the timeout clock keeps
-        /// running while paused) and `stopActivationObserver` (screen dismissed).
-        public func observeActivation(
-            tokenUniqueReference: String,
-            onActivated: @escaping () -> Void,
-            onTimeout: @escaping () -> Void,
-            onError: ((String) -> Void)? = nil
-        ) throws {
-            let kmp = try owner.requireKmp()
-            kmp.observeActivation(
-                tokenUniqueReference: tokenUniqueReference,
-                onActivated: onActivated,
-                onTimeout: onTimeout,
-                onError: onError
+    /// Fetch the NUBAN banks that can be linked (optionally filtered by account number).
+    /// Mirrors Android `getBanks` incl. de-duplication by institution code.
+    public func banks(accountNumber: String? = nil) async throws -> BankList {
+        try await call { kmp in
+            let r = try await kmp.banks(accountNumber: accountNumber)
+            return BankList(
+                banks: r.banks.map { Bank(slug: $0.slug, name: $0.name, institutionCode: $0.institutionCode) },
+                responseStatus: r.responseStatus, responseStatusReason: r.responseStatusReason, message: r.message
             )
         }
+    }
 
-        /// Pause an activation observer's polling (call when the app backgrounds); the
-        /// 5-minute timeout clock keeps running while paused.
-        public func pauseActivationObserver(tokenUniqueReference: String) throws {
-            try owner.requireKmp().pauseActivationObserver(tokenUniqueReference: tokenUniqueReference)
-        }
-
-        /// Resume a paused activation observer; if the timeout window elapsed while paused,
-        /// `onTimeout` fires immediately.
-        public func resumeActivationObserver(tokenUniqueReference: String) throws {
-            try owner.requireKmp().resumeActivationObserver(tokenUniqueReference: tokenUniqueReference)
-        }
-
-        /// Stop observing a token's activation (call when the screen is dismissed); no further
-        /// callbacks fire.
-        public func stopActivationObserver(tokenUniqueReference: String) throws {
-            try owner.requireKmp().stopActivationObserver(tokenUniqueReference: tokenUniqueReference)
-        }
-
-        // ── Payment refusals ───────────────────────────────────────────────────────────────
-
-        /// Observe payments refused before any proof was built, **for one card**.
-        ///
-        /// Handlers are registered against a token's unique reference and only ever hear about
-        /// that card. Registering the same card again replaces its handlers; other cards are
-        /// untouched. Call ``stopObservingPaymentRefusals(forTokenUniqueReference:)`` to clear one.
-        ///
-        /// Two callbacks, because the advice differs and giving the payer the wrong one wastes
-        /// their time:
-        /// - `onRequireOnline` — the card's payment keys need refreshing and the wallet could not
-        ///   reach the server. Tell the payer to connect and try again.
-        /// - `onAmountExceedsCardLimit` — the amount is larger than this card can carry in one
-        ///   payment. **Never tell them to go online here**: a refreshed key carries the same cap,
-        ///   so they would connect, retry and fail identically with no way to learn what was
-        ///   wrong. Tell them to pay less or use another card. `cardLimitMinorUnits` is that cap
-        ///   when it is known, and `nil` when it could not be read — omit the figure rather than
-        ///   show a guess.
-        ///
-        /// - `onDeviceNotBound` (optional) — the card was added on another device (or before this
-        ///   app was reinstalled) and cannot be issued payment keys here. Neither going online nor
-        ///   a smaller amount helps: tell the payer to add the card again on this phone. Unlike the
-        ///   other two this *is* a card state — `StoredCard.deviceNotBound` reads `true` too.
-        ///
-        /// The first two report **this payment**, not the card's state: `requiresOnline` on a card answers
-        /// the different question "can this card pay *anything* offline?" and stays `false` for a
-        /// card that can still make smaller payments. Show a message about the payment that just
-        /// failed; don't grey the card out on the strength of one refused amount.
-        ///
-        /// These fire from the QR rails (`rail` is `"CPM_QR"` or `"MPM_QR"`); there is no
-        /// tap-to-pay on iOS, so no `"TAP"` refusal can occur. The pay calls also answer the same
-        /// refusal as their own outcome — `NOT_SENT` with reason `ONLINE_REQUIRED` /
-        /// `AMOUNT_EXCEEDS_CARD_LIMIT` — this observer is additional, for hosts that would rather
-        /// handle refusals in one place than at every call site.
-        ///
-        /// A refusal the SDK could not attribute to a card reaches **every** registered handler
-        /// rather than none: the payer was refused either way. The callback's own
-        /// `tokenUniqueReference` is `nil` in that case, so a host can tell the two apart.
-        ///
-        /// Callbacks arrive on the main thread.
-        public func observePaymentRefusals(
-            forTokenUniqueReference tokenUniqueReference: String,
-            onRequireOnline: @escaping (_ tokenUniqueReference: String?, _ amountMinorUnits: Int64, _ rail: String) -> Void,
-            onAmountExceedsCardLimit: @escaping (_ tokenUniqueReference: String?, _ amountMinorUnits: Int64, _ cardLimitMinorUnits: Int64?, _ rail: String) -> Void,
-            onDeviceNotBound: ((_ tokenUniqueReference: String?, _ amountMinorUnits: Int64, _ rail: String) -> Void)? = nil
-        ) throws {
-            let kmp = try owner.requireKmp()
-            kmp.observePaymentRefusals(
-                tokenUniqueReference: tokenUniqueReference,
-                onRequireOnline: { tokenUniqueReference, amountMinorUnits, rail in
-                    onRequireOnline(tokenUniqueReference, amountMinorUnits.int64Value, rail)
-                },
-                onAmountExceedsCardLimit: { tokenUniqueReference, amountMinorUnits, cardLimitMinorUnits, rail in
-                    onAmountExceedsCardLimit(
-                        tokenUniqueReference,
-                        amountMinorUnits.int64Value,
-                        cardLimitMinorUnits?.int64Value,
-                        rail
-                    )
-                },
-                onDeviceNotBound: { tokenUniqueReference, amountMinorUnits, rail in
-                    onDeviceNotBound?(tokenUniqueReference, amountMinorUnits.int64Value, rail)
-                }
+    /// Check account eligibility before digitising — the same call as Android's and React Native's
+    /// `verifyAccount(params)`. Requires `paymentAppProviderID`/`tokenRequestorID` in the
+    /// configuration.
+    public func verifyAccount(_ params: VerifyAccountParams) async throws -> VerifyAccountResponse {
+        try await call { kmp in
+            let r = try await kmp.verifyAccount(
+                accountNumber: params.accountNumber,
+                institutionCode: params.institutionCode,
+                walletAccountId: params.walletAccountID,
+                accountHolderName: params.accountHolderName ?? "",
+                accountNumberSource: params.accountNumberSource?.rawValue
             )
-        }
-
-        /// Stop observing payment refusals for one card; its handlers fire no more. Other cards'
-        /// registrations are unaffected.
-        public func stopObservingPaymentRefusals(forTokenUniqueReference tokenUniqueReference: String) throws {
-            try owner.requireKmp().stopObservingPaymentRefusals(tokenUniqueReference: tokenUniqueReference)
-        }
-
-        // ── The SDK tells you when stored truth changes ────────────────────────────────────
-
-        /// Observe the issuer changing a card's status — suspended, reactivated, expired,
-        /// deactivated.
-        ///
-        /// **Why you want this.** The SDK polls token status in the background and writes the
-        /// answer to its store. Without this observer your app finds out only the next time it
-        /// reads `cards()` — which, if the customer is already sitting on a card screen, means it
-        /// never finds out at all. They tap a card your UI still shows as usable, and it fails at
-        /// the terminal.
-        ///
-        /// `canPay` is the SDK's own answer, not something to re-derive from `status`: it is
-        /// exactly the predicate the payment gates use, so a status added to the backend after
-        /// this SDK shipped is correctly reported as not payable rather than guessed at.
-        ///
-        /// - `status` is the parsed vocabulary value — `ACTIVE`, `PENDING_ACTIVATION`,
-        ///   `SUSPENDED`, `DEACTIVATED`, `EXPIRED`, or `UNKNOWN` for a value this build does not
-        ///   know. `rawStatus` is the literal as stored; quote it in logs and support calls,
-        ///   because for `UNKNOWN` it is the only thing that identifies the status.
-        /// - `previousStatus` is what the card held before, or `nil` if this is its first status —
-        ///   useful because the *transition* is often what you act on (`ACTIVE` → `SUSPENDED`
-        ///   deserves an interruption; `PENDING_ACTIVATION` → `ACTIVE` is good news).
-        ///
-        /// Register once, at start-up — not per card screen. It fires for **any** stored card,
-        /// including ones no screen is showing, which is the case that matters.
-        ///
-        /// It does **not** replay: an app that was not running when the status changed is served
-        /// by reading `cards()` at start-up, so keep that read. The observer is a convenience over
-        /// the store, not a delivery guarantee.
-        ///
-        /// Callbacks arrive on the main thread. Observing again replaces the previous observer
-        /// (last registration wins); `stopObservingTokenLifecycle()` clears it.
-        public func observeTokenLifecycle(
-            onTokenStatusChanged: @escaping (_ change: TokenStatusChange) -> Void
-        ) throws {
-            let kmp = try owner.requireKmp()
-            kmp.observeTokenLifecycle { tokenUniqueReference, status, rawStatus, canPay, previousRawStatus in
-                onTokenStatusChanged(TokenStatusChange(
-                    tokenUniqueReference: tokenUniqueReference,
-                    status: status,
-                    rawStatus: rawStatus,
-                    canPay: canPay.boolValue,
-                    previousStatus: previousRawStatus
-                ))
-            }
-        }
-
-        /// Stop observing token lifecycle changes; no further callbacks fire.
-        public func stopObservingTokenLifecycle() throws {
-            try owner.requireKmp().stopObservingTokenLifecycle()
-        }
-
-        /// Observe a payment that was left `PENDING` reaching its final outcome.
-        ///
-        /// A wallet payment that gets no immediate answer is stored and polled by the SDK until
-        /// the backend settles it — which can be seconds or days. This is how your app hears the
-        /// answer without polling the store itself. It fires from every route that resolves a row:
-        /// the background sweep, an on-demand status check, and the scan-to-pay push.
-        ///
-        /// `status` is `APPROVED`, `DECLINED` or `FAILED` — never `PENDING`, because a row that is
-        /// still open has not resolved. `reason` is a plain string to display and log, never to
-        /// parse; `responseCode` is the wire literal for receipts and support.
-        ///
-        /// Register once, at start-up — not per payment: the payment most likely to need this is
-        /// one that settles after the screen (or the process) that made it is gone. It does
-        /// **not** replay, so keep reading history at start-up.
-        ///
-        /// Callbacks arrive on the main thread. Observing again replaces the previous observer
-        /// (last registration wins); `stopObservingTransactionResolved()` clears it.
-        public func observeTransactionResolved(
-            onTransactionResolved: @escaping (_ resolution: WalletTransactionResolution) -> Void
-        ) throws {
-            let kmp = try owner.requireKmp()
-            kmp.observeTransactionResolved { transactionHash, tokenUniqueReference, status, responseCode, reason, amountMinorUnits, merchantName in
-                onTransactionResolved(WalletTransactionResolution(
-                    transactionHash: transactionHash,
-                    tokenUniqueReference: tokenUniqueReference,
-                    status: status,
-                    responseCode: responseCode,
-                    reason: reason,
-                    amountMinorUnits: amountMinorUnits.int64Value,
-                    merchantName: merchantName
-                ))
-            }
-        }
-
-        /// Stop observing transaction resolutions; no further callbacks fire.
-        public func stopObservingTransactionResolved() throws {
-            try owner.requireKmp().stopObservingTransactionResolved()
-        }
-
-        /// Observe a card running out of payment keys — or getting them back.
-        ///
-        /// Cards hold a pool of single-use payment keys. When it is exhausted the card cannot pay
-        /// until the SDK refreshes them, which is the state `StoredCard.requiresOnline` reports.
-        /// `requiresOnline` here is that **same value** — the observer and `cards()` read one
-        /// function, so a callback can never contradict the list you are about to draw.
-        ///
-        /// **What it covers, and what it does not.** It fires when a payment consumes a key and
-        /// when a refresh delivers new ones — the moments the SDK is actually executing. Keys also
-        /// expire by *clock*, which happens with no code running at all: a card whose last key
-        /// expires while your app sits idle is reported as `requiresOnline` by the next `cards()`
-        /// read, exactly as it is today, and **nothing fires**. Write your UI copy accordingly and
-        /// keep reading the card list when a screen appears.
-        ///
-        /// The first evaluation of a card after launch is a silent baseline — there is nothing to
-        /// compare against yet, and at launch you are reading `cards()` anyway.
-        ///
-        /// Observation only: there is deliberately no API to trigger a key refresh. The SDK owns
-        /// when keys are replenished.
-        ///
-        /// **A card that can never be re-keyed here.** When the backend refuses this device payment
-        /// keys for a card — it was added on another device, or before this app was reinstalled —
-        /// the card stops being `requiresOnline` (going online cannot help) and becomes
-        /// `StoredCard.deviceNotBound`. When you pass `onDeviceNotBound`, it fires **instead of**
-        /// `onKeyStateChanged` for that change, with the card's reference: prompt the user to add
-        /// the card again. Without it, `onKeyStateChanged` reports `requiresOnline == false` — read
-        /// `deviceNotBound` from the card list before treating the card as payable.
-        ///
-        /// Callbacks arrive on the main thread. Observing again replaces the previous observer;
-        /// `stopObservingCardKeyState()` clears it.
-        public func observeCardKeyState(
-            onKeyStateChanged: @escaping (_ tokenUniqueReference: String, _ requiresOnline: Bool) -> Void,
-            onDeviceNotBound: ((_ tokenUniqueReference: String) -> Void)? = nil
-        ) throws {
-            let kmp = try owner.requireKmp()
-            kmp.observeCardKeyState { tokenUniqueReference, requiresOnline, deviceNotBound in
-                if deviceNotBound.boolValue, let onDeviceNotBound {
-                    onDeviceNotBound(tokenUniqueReference)
-                } else {
-                    onKeyStateChanged(tokenUniqueReference, requiresOnline.boolValue)
-                }
-            }
-        }
-
-        /// Stop observing card key state; no further callbacks fire.
-        public func stopObservingCardKeyState() throws {
-            try owner.requireKmp().stopObservingCardKeyState()
-        }
-
-        // ── Scan-to-pay: inspect → authenticate (Face ID / Touch ID) → pay ─────────────────
-
-        /// Inspect a scanned merchant QR payload. Verification happens **on-device** (gateway
-        /// signature against the SDK's pinned key + expiry). Only `.verified` may be shown on a
-        /// confirm screen; every `.rejected` must end the flow.
-        public func inspectScannedQr(_ payload: String) throws -> ScanInspection {
-            let kmp = try owner.requireKmp()
-            let result = kmp.inspectScannedQr(payload: payload)
-            if let verified = result as? MpmScanResultVerified {
-                let ctx = verified.context
-                return .verified(VerifiedPayment(
-                    txRef: ctx.txRef,
-                    merchantID: ctx.merchantId,
-                    merchantName: ctx.merchantName,
-                    merchantCity: ctx.merchantCity,
-                    amount: ctx.amount,
-                    amountMinorUnits: ctx.amountMinorUnits,
-                    currencyNumeric: ctx.currencyNumeric,
-                    expiryEpochSeconds: ctx.expiryEpochSeconds,
-                    merchantOrderID: ctx.merchantOrderId,
-                    raw: ctx
-                ))
-            }
-            if let rejected = result as? MpmScanResultRejected {
-                let reason = ScanRejectionReason(rawValue: rejected.reason.name) ?? .malformed
-                return .rejected(reason, detail: rejected.detail)
-            }
-            return .rejected(.malformed, detail: "unrecognised inspection result")
-        }
-
-        // `authenticateForScannedPayment` was removed. It was the call an app had
-        // to make before paying; skipping it, or letting its single-use authentication go stale
-        // while the customer read the confirm screen, refused the payment. `payScannedContext` and
-        // `showQrToPay` now raise the same system sheet themselves.
-
-        /// Pay a verified scanned payment with the wallet's **active token**.
-        ///
-        /// **The SDK asks for the customer's authentication itself** — it raises the system
-        /// sheet (Face ID / Touch ID, falling back to the device passcode) before it builds the
-        /// payment, naming the merchant and amount so the gesture is bound to what it authorizes.
-        /// You make no authentication call. One gesture per payment attempt: a retry asks again.
-        ///
-        /// Every payment ends with an outcome — branch on `responseStatus`. `NOT_SENT` means nothing
-        /// was sent: `AUTH_CANCELLED` (the customer dismissed the sheet), `AUTH_FAILED`,
-        /// `AUTH_UNAVAILABLE` (no passcode or biometry), `ONLINE_REQUIRED`, `AMOUNT_EXCEEDS_CARD_LIMIT`,
-        /// `TOKEN_NOT_ACTIVE`, `DEVICE_NOT_BOUND`, `NO_ACTIVE_CARD`, `CARD_CANNOT_PAY`,
-        /// `NO_NETWORK_CONNECTION`, `SDK_UNABLE_TO_CONNECT`… — fix it and pay the same QR again.
-        /// `PENDING` means the push may have gone through: never pay again; the SDK resolves it.
-        ///
-        /// Whatever the gateway states — approved, declined, failed or still pending — also
-        /// lands in the paying token's `recentActivity`; a pending row keeps being polled by the
-        /// SDK until the gateway states a final outcome.
-        ///
-        /// To cancel it while it is still on the device, call ``cancelPayment(merchantOrderID:)`` with
-        /// ``VerifiedPayment/merchantOrderID``, or cancel the Swift `Task` awaiting this call; it then
-        /// returns `NOT_SENT` / `CANCELLED`. A QR with no order ID cannot be cancelled.
-        public func payScannedContext(_ payment: VerifiedPayment) async throws -> PaymentOutcome {
-            guard let orderID = payment.merchantOrderID?.trimmingCharacters(in: .whitespaces).nilIfEmpty else {
-                return try await pay(payment)
-            }
-            return try await TaskCancelBridge.run(
-                cancel: { [self] in cancelPayment(merchantOrderID: orderID) },
-                notFound: .noPaymentInProgressForOrderID
-            ) { try await pay(payment) }
-        }
-
-        private func pay(_ payment: VerifiedPayment) async throws -> PaymentOutcome {
-            try await call { kmp in
-                let outcome = try await kmp.payScannedContext(verified: payment.raw)
-                return PaymentOutcome(
-                    approved: outcome.approved,
-                    responseCode: outcome.responseCode,
-                    responseStatus: outcome.responseStatus,
-                    responseStatusReason: outcome.responseStatusReason,
-                    message: outcome.message,
-                    merchantName: outcome.merchantName,
-                    merchantLocation: outcome.merchantLocation
-                )
-            }
-        }
-
-        /// Render a **show QR to pay** code (dynamic CPM): key the merchant-stated amount first —
-        /// it rides inside the QR's cryptogram, so the merchant's scan charges exactly that
-        /// amount or fails verification. The SDK raises the system authentication sheet itself
-        /// (one gesture per QR — a regenerate after `expiresAtEpochMillis` is a fresh payment
-        /// attempt and asks again). Fully offline: nothing is sent; the merchant's SoftPOS
-        /// submits the payment and the outcome appears via the wallet's history polling.
-        /// - Parameter onExpired: the SDK calls this once, on the main thread, when the
-        /// returned QR reaches its `expiresAtEpochMillis`. Blank/replace the code on this so it
-        /// can't be scanned once lapsed (a dimmed QR is still machine-readable). The SDK owns the
-        /// timer: a new `showQrToPay` supersedes it, and `cancelQrExpiry()` stops it (call on
-        /// teardown). Omit to keep the old behaviour.
-        public func showQrToPay(amountMinorUnits: Int64, onExpired: (() -> Void)? = nil) async throws -> PaymentQr {
-            try await call { kmp in
-                let qr = try await kmp.showQrToPay(amountMinorUnits: amountMinorUnits, onExpired: onExpired)
-                return PaymentQr(
-                    tokenUniqueReference: qr.tokenUniqueReference,
-                    payload: qr.payload,
-                    amountMinorUnits: qr.amountMinorUnits,
-                    currencyNumeric: qr.currencyNumeric,
-                    expiresAtEpochMillis: qr.expiresAtEpochMillis,
-                    transactionHash: qr.transactionHash,
-                    responseStatus: qr.responseStatus,
-                    responseStatusReason: qr.responseStatusReason,
-                    message: qr.message
-                )
-            }
-        }
-
-        /// Stop the active show-to-pay QR expiry watch started by `showQrToPay`. Call on
-        /// teardown (the QR screen is dismissed) so the `onExpired` callback can't fire into dead
-        /// UI. Idempotent; a new `showQrToPay` also supersedes any prior watch.
-        public func cancelQrExpiry() {
-            (try? owner.requireKmp())?.cancelQrExpiry()
-        }
-
-        /// The token's recent activity: terminal scan-to-pay outcomes, most recent first.
-        /// Local read, no network.
-        public func recentActivity(tokenUniqueReference: String) async throws -> [TokenActivity] {
-            try await call { kmp in
-                try await kmp.recentActivity(tokenUniqueReference: tokenUniqueReference).map {
-                    TokenActivity(
-                        merchantName: $0.merchantName,
-                        amountMinorUnits: $0.amountMinorUnits,
-                        currencyNumeric: $0.currencyNumeric,
-                        status: $0.status,
-                        atEpochMillis: $0.atEpochMillis
-                    )
-                }
-            }
-        }
-
-        // ── Receipts & transaction history ─────────────────────────────────────
-
-        /// Process a scanned merchant-receipt QR: decode/validate, verify it matches a transaction
-        /// this wallet made, dedupe, and store. Raw JSON or base64. Checked on the phone; nothing is
-        /// sent. Answers a ``ReceiptScan``: `APPROVED` with the stored receipt, or `FAILED` with the
-        /// reason (`INVALID_RECEIPT`, `RECEIPT_NOT_FROM_THIS_WALLET`, `RECEIPT_MISMATCH`,
-        /// `PAYMENT_NOT_CONFIRMED`, `RECEIPT_FOR_ANOTHER_TRANSACTION`). Only a setup mistake throws.
-        /// - Parameter expectedTransactionHash: set when the scan was launched FROM a specific
-        /// transaction's screen — a receipt belonging to a different transaction is
-        /// rejected (and not stored) instead of silently linking elsewhere. Nil = unscoped.
-        @discardableResult
-        public func processReceipt(_ qrPayload: String, expectedTransactionHash: String? = nil) async throws -> ReceiptScan {
-            try await call { kmp in
-                let r = try await kmp.processReceipt(qrPayload: qrPayload, expectedTransactionHash: expectedTransactionHash)
-                return ReceiptScan(receipt: r.receipt.map(map), responseStatus: r.responseStatus,
-                                   responseStatusReason: r.responseStatusReason, message: r.message)
-            }
-        }
-
-        /// The last `limit` stored receipts, most recent first. Local read, no network.
-        public func receipts(limit: Int = 100) async throws -> [TransactionReceipt] {
-            try await call { kmp in try await kmp.receipts(limit: Int32(limit)).map(map) }
-        }
-
-        /// The receipt linked to a transaction by its hash, or nil. Local read.
-        public func receipt(forTransactionHash transactionHash: String) async throws -> TransactionReceipt? {
-            try await call { kmp in
-                try await kmp.receiptForTransaction(transactionHash: transactionHash).map(map)
-            }
-        }
-
-        /// The token's full transaction history (all rails), most recent first. Local read.
-        public func transactionHistory(tokenUniqueReference: String, limit: Int = 100) async throws -> [TransactionSummary] {
-            try await call { kmp in
-                try await kmp.transactionHistory(tokenUniqueReference: tokenUniqueReference, limit: Int32(limit))
-                    .map(Self.map)
-            }
-        }
-
-        /// Ask the backend about **one** pending transaction now, keyed by its transaction hash, and
-        /// return the updated stored row.
-        ///
-        /// The per-transaction counterpart to `reconcilePendingTransactions()`, which asks about
-        /// every open row and returns nothing — this one answers about the row the customer is
-        /// actually looking at. The SDK polls a pending transaction for you with exponential backoff
-        /// and **stops after 30 days**; this is how a customer gets an answer sooner than the next
-        /// rung, and the only route to one once that window has closed.
-        ///
-        /// It runs the SDK's own background sweep for this single row — same query, same reading of
-        /// the answer, same write into the same local history — so an on-demand check and a
-        /// background check cannot disagree. It is **not** a way to force an outcome: a payment that
-        /// is still unsettled answers `PENDING` again.
-        ///
-        /// - Returns: the transaction as it stands after the check, or `nil` if no row on this device
-        ///   carries that hash. A row that already has a final outcome is returned unchanged, without
-        ///   a network call.
-        /// A check that could not be made is not thrown: ``VeyraLookup/failureReason`` says why
-        /// (`NO_NETWORK_CONNECTION` when offline). A failed check never changes the stored row.
-        public func refreshTransactionStatus(transactionHash: String) async throws -> VeyraLookup<TransactionSummary> {
-            try await call { kmp in
-                let r = try await kmp.refreshTransactionStatus(transactionHash: transactionHash)
-                return VeyraLookup(value: r.transaction.map(Self.map), failureReason: r.failureReason, message: r.message)
-            }
-        }
-
-        /// Check the merchant credit **now** for one approved payment — "has the merchant's bank
-        /// actually received the funds I paid?" — and return the updated stored row.
-        ///
-        /// The SDK already asks this in the background, with exponential backoff, for **30 days**
-        /// after the payment, and then records the row as `"UNABLE_TO_CONFIRM"` — which means *"we
-        /// stopped asking"*, never *"the merchant was not paid"*. This is how a customer gets an
-        /// answer sooner than the next rung, and the only route to one once that window has closed:
-        /// it still works on a row already marked `"UNABLE_TO_CONFIRM"`, and a later `"RECEIVED"`
-        /// replaces that give-up.
-        ///
-        /// **Check `isCreditConfirmationSupported` on the transaction first.** Not every merchant's
-        /// bank is on the confirmation rail. Offer this action only while
-        /// ```swift
-        /// txn.authorizationStatus == "APPROVED"
-        ///     && txn.isCreditConfirmationSupported == true
-        ///     && txn.creditConfirmationStatus != "RECEIVED"
-        /// ```
-        /// A call on a row that fails that predicate makes **no network request** and returns the row
-        /// unchanged rather than throwing.
-        ///
-        /// Settlement only: nothing on this path can change the payment's `authorizationStatus`,
-        /// `responseCode` or `responseStatusReason`. There is deliberately no callback — the returned
-        /// row and the SDK's stored history are the whole surface.
-        ///
-        /// - Returns: the transaction as it stands after the check, or `nil` if no row on this device
-        ///   carries that hash.
-        /// A check that could not be made is not thrown: ``VeyraLookup/failureReason`` says why
-        /// (`NO_NETWORK_CONNECTION` when offline). A failed check never changes the stored row.
-        public func refreshCreditConfirmation(transactionHash: String) async throws -> VeyraLookup<TransactionSummary> {
-            try await call { kmp in
-                let r = try await kmp.refreshCreditConfirmation(transactionHash: transactionHash)
-                return VeyraLookup(value: r.transaction.map(Self.map), failureReason: r.failureReason, message: r.message)
-            }
-        }
-
-        private static func map(_ r: VeyraKMP.TransactionSummary) -> TransactionSummary {
-            TransactionSummary(
-                merchantName: r.merchantName,
-                amountInMinorUnit: r.amountInMinorUnit,
-                transactionCurrencyCode: r.transactionCurrencyCode,
-                transactionHash: r.transactionHash,
-                authorizationStatus: r.authorizationStatus,
+            return VerifyAccountResponse(
                 responseCode: r.responseCode,
+                message: r.message,
+                responseStatus: r.responseStatus,
+                responseStatusReason: r.responseStatusReason
+            )
+        }
+    }
+
+    /// Digitise (tokenise) an account — the same call as Android's and React Native's
+    /// `digitise(params)`: attests, sends the device key, and on success decrypts and stores the
+    /// token material on-device. Requires `paymentAppProviderID`/`tokenRequestorID` in the
+    /// configuration.
+    ///
+    /// Set ``DigitiseParams/clientRequestID`` to be able to cancel it with
+    /// ``cancelDigitise(clientRequestID:)``; leave it `nil` and the SDK generates one. Either way,
+    /// cancelling the Swift `Task` that awaits this call cancels it while it is still on the
+    /// device: it then returns `NOT_SENT` / `CANCELLED`. Once the request has been sent a cancel
+    /// is refused and the card is added (or refused) as normal.
+    public func digitise(_ params: DigitiseParams) async throws -> DigitiseResult {
+        // With no ID from the app, one is made here rather than by the core, so cancelling the
+        // Task can still name this digitisation.
+        let requestID = params.clientRequestID?.trimmingCharacters(in: .whitespaces).nilIfEmpty ?? UUID().uuidString
+        // number_of_active_tokens is SDK-computed from its token registry — no caller input.
+        return try await TaskCancelBridge.run(
+            cancel: { [self] in cancelDigitise(clientRequestID: requestID) },
+            notFound: .noDigitisationInProgressForClientRequestID
+        ) { try await call { kmp in
+            let r = try await kmp.digitise(
+                accountNumber: params.accountNumber,
+                institutionCode: params.institutionCode,
+                walletAccountId: params.walletAccountID,
+                accountHolderName: params.accountHolderName,
+                emailAddress: params.emailAddress,
+                recommendation: params.recommendation.rawValue,
+                mobileNumber: params.mobileNumber,
+                bvn: params.bvn,
+                accountHolderAddress: params.accountHolderAddress,
+                accountNumberSource: params.accountNumberSource?.rawValue,
+                consumerIdentifier: params.consumerIdentifier,
+                deviceScore: params.deviceScore?.rawValue,
+                accountScore: params.accountScore?.rawValue,
+                recommendationReasons: params.recommendationReasons.map { $0.map(\.rawValue) },
+                bankName: params.bankName,
+                clientRequestId: requestID
+            )
+            return DigitiseResult(
+                tokenUniqueReference: r.tokenUniqueReference,
+                responseCode: r.responseCode,
+                message: r.message,
+                responseStatus: r.responseStatus,
                 responseStatusReason: r.responseStatusReason,
-                atEpochMillis: r.atEpochMillis?.int64Value,
-                entryMethod: r.entryMethod,
-                merchantLocation: r.merchantLocation,
-                merchantTransactionReference: r.merchantTransactionReference,
-                merchantId: r.merchantId,
-                creditTransactionID: r.creditTransactionId,
-                isCreditConfirmationSupported: r.isCreditConfirmationSupported?.boolValue,
-                creditConfirmationStatus: r.creditConfirmationStatus,
-                creditedAt: r.creditedAt,
-                bankReference: r.bankReference,
-                merchantOrderID: r.merchantOrderId
+                activationMethods: r.activationMethods.map { ActivationMethodInfo(medium: $0.medium, contact: $0.contact) },
+                tokenStored: r.tokenStored,
+                clientRequestID: requestID
+            )
+        } }
+    }
+
+    /// The tokens this wallet holds — the SDK's own registry, written by
+    /// `digitise` on a successful provision; includes which token is active. Local read,
+    /// no network.
+    public func tokens() async throws -> [Token] {
+        try await call { kmp in
+            try await kmp.tokens().map {
+                Token(
+                    tokenUniqueReference: $0.tokenUniqueReference,
+                    maskedPAN: $0.maskedPan,
+                    panLastFour: $0.panLastFour,
+                    cardHolderName: $0.cardHolderName,
+                    expiry: $0.expiry,
+                    bankName: $0.bankName,
+                    cardScheme: nil,
+                    status: $0.status.isEmpty ? nil : TokenStatus(raw: $0.status),
+                    isActive: $0.isActive,
+                    isSelected: $0.isSelected,
+                    requiresActivation: $0.requiresActivation,
+                    activationMethods: nil,
+                    requiresOnline: $0.requiresOnline,
+                    deviceNotBound: $0.deviceNotBound
+                )
+            }
+        }
+    }
+
+    /// The wallet's active token — the one payments use — or `nil` when the wallet is empty.
+    public func activeToken() async throws -> Token? {
+        try await tokens().first(where: \.isSelected)
+    }
+
+    /// One token by its unique reference, or `nil` when it is not in this wallet. Local read.
+    public func token(_ tokenUniqueReference: String) async throws -> Token? {
+        try await tokens().first { $0.tokenUniqueReference == tokenUniqueReference }
+    }
+
+    /// Select the token payments use. Answers a ``TokenSelection``: `APPROVED`, or `FAILED` /
+    /// `CARD_NOT_FOUND` when the token is not in this wallet. On the phone; only a setup mistake
+    /// throws.
+    @discardableResult
+    public func setActiveToken(_ tokenUniqueReference: String) async throws -> TokenSelection {
+        try await call { kmp in
+            let r = try await kmp.setActiveToken(tokenUniqueReference: tokenUniqueReference)
+            return TokenSelection(responseStatus: r.responseStatus, responseStatusReason: r.responseStatusReason,
+                                 message: r.message)
+        }
+    }
+
+    /// Request an activation code delivered via the chosen medium — one of the token's
+    /// `activationMethods` from `digitise`. The same call as Android and React Native.
+    public func requestActivationCode(
+        tokenUniqueReference: String,
+        medium: ActivationMedium,
+        reason: ActivationReason = .addCard
+    ) async throws -> ActivationCodeResponse {
+        try await call { kmp in
+            let r = try await kmp.requestActivationCode(
+                tokenUniqueReference: tokenUniqueReference,
+                selectedActivationMethod: medium.rawValue,
+                preferredActivationChannel: medium.rawValue,
+                reasonCode: reason.rawValue
+            )
+            return ActivationCodeResponse(
+                tokenUniqueReference: r.tokenUniqueReference,
+                expirationDateTime: r.expirationDateTime,
+                status: r.status,
+                message: r.message,
+                failureCode: ActivationFailureCode(kmp: r.failureCode, raw: r.failureCodeRaw),
+                failureCodeRaw: r.failureCodeRaw,
+                responseStatus: r.responseStatus ?? ResponseStatus.failed,
+                responseStatusReason: r.responseStatusReason
             )
         }
+    }
 
-        /// Reconcile still-PENDING transactions against the backend. It asks about **every** open
-        /// transaction on the device, so call it on an occasion (scene-active, history opened), never
-        /// on a loop: a screen waiting for one payment — a displayed CPM QR — should call
-        /// ``refreshTransactionStatus(transactionHash:)`` with that payment's hash instead, which is
-        /// one request rather than one per open transaction. If the gateway throttles (`429`), the
-        /// pass stops and the rest wait for the SDK's next sweep. Best-effort: a row whose check fails
-        /// is left as it is. Answers a ``ReconcileResult``: `failureReason` is set only when the
-        /// reconcile itself could not run. Only a setup mistake throws.
-        @discardableResult
-        public func reconcilePendingTransactions() async throws -> ReconcileResult {
-            try await call { kmp in
-                let r = try await kmp.reconcilePendingTransactions()
-                return ReconcileResult(failureReason: r.failureReason, message: r.message)
-            }
-        }
-
-        private func map(_ r: VeyraKMP.TransactionReceipt) -> TransactionReceipt {
-            TransactionReceipt(
-                merchantName: r.merchantName,
-                merchantId: r.merchantId,
-                merchantAddress: r.merchantAddress,
-                transactionType: r.transactionType,
-                transactionStatus: r.transactionStatus,
-                transactionTime: r.transactionTime,
-                totalAmount: r.totalAmount,
-                totalAmountFormatted: r.totalAmountFormatted,
-                currency: r.currency,
-                maskedToken: r.maskedToken,
-                merchantTransactionReference: r.merchantTransactionReference,
-                cdcvmApprovedByWallet: r.cdcvmApprovedByWallet?.boolValue,
-                cdcvmOutcome: r.cdcvmOutcome,
-                transactionId: r.transactionId,
-                transactionHash: r.transactionHash
+    /// Activate a token with the code the customer received.
+    public func activate(tokenUniqueReference: String, activationCode: String) async throws -> ActivateResponse {
+        try await call { kmp in
+            let r = try await kmp.activate(tokenUniqueReference: tokenUniqueReference, activationCode: activationCode)
+            return ActivateResponse(
+                tokenUniqueReference: r.tokenUniqueReference,
+                status: r.status,
+                message: r.message,
+                failureCode: ActivationFailureCode(kmp: r.failureCode, raw: r.failureCodeRaw),
+                failureCodeRaw: r.failureCodeRaw,
+                attemptsRemaining: r.attemptsRemaining?.intValue,
+                recommendDelete: RecommendDelete(kmp: r.recommendDelete, raw: r.recommendDeleteRaw),
+                recommendDeleteRaw: r.recommendDeleteRaw,
+                responseStatus: r.responseStatus ?? ResponseStatus.failed,
+                responseStatusReason: r.responseStatusReason
             )
         }
+    }
 
-        // ── LUK refresh: keep the token paying past its initial key allotment ──────────────
-
-        /// The token's Limited-Use Key state — how many keys can still pay and whether a refresh
-        /// is due. For a "keys remaining" indicator. Local read, no network.
-        public func lukState(tokenUniqueReference: String) async throws -> LukState {
-            try await call { kmp in
-                let s = try await kmp.lukState(tokenUniqueReference: tokenUniqueReference)
-                return LukState(usableKeyCount: Int(s.usableKeyCount), refreshDue: s.refreshDue)
-            }
+    /// Deactivate a token on the backend. On success the SDK also wipes every on-device
+    /// artefact for the token and promotes the next token when the active one was removed;
+    /// on failure nothing local changes.
+    public func deactivateToken(_ tokenUniqueReference: String) async throws -> TokenStatusUpdateResponse {
+        try await call { kmp in
+            let r = try await kmp.deactivateToken(tokenUniqueReference: tokenUniqueReference)
+            return TokenStatusUpdateResponse(tokenUniqueReference: r.tokenUniqueReference, status: r.status, message: r.message,
+                                             responseStatus: r.responseStatus ?? ResponseStatus.failed,
+                                             responseStatusReason: r.responseStatusReason)
         }
+    }
 
-        /// Run wallet maintenance **now**: the SDK syncs each stored card's server status (a
-        /// suspended card becomes non-payable until polled active again; a deactivated one is
-        /// removed), self-heals cards the server marks as needing refresh, and tops up the
-        /// active card's payment keys if they're running low — the key check also runs
-        /// automatically before every payment.
-        ///
-        /// The SDK already runs all of this itself — at `configure`, whenever the app becomes
-        /// active, and every 15 minutes while the app is running — so calling it is **optional**:
-        /// an immediate nudge (e.g. after your own "refresh" gesture), not required wiring. A
-        /// call landing while an automatic run is in flight is a no-op. Best-effort: a no-op
-        /// without cards; failures never throw.
-        public func topUpKeysIfNeeded() async throws {
-            try await call { kmp in
-                try await kmp.topUpKeysIfNeeded()
-            }
+    /// Deactivate, on the server, the token that the ``digitise(_:)`` sent with `clientRequestID`
+    /// created — for a digitise that ended `"FAILED"` with `NO_RESPONSE_RECEIVED` or `UPSTREAM_ERROR`
+    /// after it was sent, whose token details never reached this device. Only this device can do it.
+    ///
+    /// - `"APPROVED"` — deactivated (or already was); `tokenUniqueReference` names it. If that card
+    ///   is on this device, it is removed with its data.
+    /// - `"FAILED"` / `NO_TOKEN_CREATED` — the digitise ended before a token was created.
+    /// - `"FAILED"` / `DIGITISATION_NOT_FOUND` — no finished digitise with that ID from this device.
+    ///   One still running is not found until it ends: call again after it would have timed out.
+    /// - `"PENDING"` — sent, no usable answer; call again (a repeat is harmless).
+    ///
+    /// ``DigitiseResult/clientRequestID`` holds the ID, including one the SDK generated.
+    public func deactivateDigitise(clientRequestID: String) async throws -> TokenStatusUpdateResponse {
+        try await call { kmp in
+            let r = try await kmp.deactivateDigitise(clientRequestId: clientRequestID)
+            return TokenStatusUpdateResponse(tokenUniqueReference: r.tokenUniqueReference, status: r.status, message: r.message,
+                                             responseStatus: r.responseStatus ?? ResponseStatus.failed,
+                                             responseStatusReason: r.responseStatusReason)
         }
+    }
 
-        /// Shared guard + setup-error mapping. Every operation returns its outcome; what the shared
-        /// core still throws is a setup error, whose message starts with its code
-        /// (`INVALID_CONFIGURATION: …`). Anything else would be an SDK defect and is passed on
-        /// unchanged rather than dressed up as an outcome.
-        private func call<T>(_ body: (WalletKmp) async throws -> T) async throws -> T {
-            let kmp = try owner.requireKmp()
-            do {
-                return try await body(kmp)
-            } catch let error as VeyraWalletError {
-                throw error
-            } catch {
-                let message = error.localizedDescription
-                if message.hasPrefix("NOT_SIGNED_IN") { throw VeyraWalletError.notSignedIn }
-                if message.hasPrefix("NOT_CONFIGURED") { throw VeyraWalletError.notConfigured }
-                if message.hasPrefix("SESSION_REQUIRED") { throw VeyraWalletError.sessionRequired }
-                if message.hasPrefix("UNSUPPORTED_ON_PLATFORM") { throw VeyraWalletError.unsupportedOnPlatform }
-                if message.hasPrefix("INVALID_CONFIGURATION") { throw VeyraWalletError.invalidConfiguration(message: message) }
-                throw error
-            }
+    /// Current backend status of a token (e.g. `"ACTIVE"`), as an outcome — a read, never `PENDING`.
+    public func tokenStatus(tokenUniqueReference: String) async throws -> TokenStatusResult {
+        try await call { kmp in
+            let r = try await kmp.tokenStatus(tokenUniqueReference: tokenUniqueReference)
+            return TokenStatusResult(tokenStatus: r.tokenStatus, responseStatus: r.responseStatus,
+                                     responseStatusReason: r.responseStatusReason, message: r.message)
+        }
+    }
+
+    /// Observe a token until it activates:
+    /// the SDK polls the token's status every 10 seconds for up to 5 minutes. `onActivated`
+    /// fires exactly once when the token becomes ACTIVE (navigate to the wallet);
+    /// `onTimeout` after 5 minutes without activation; `onError` reports each failed check
+    /// and polling continues. Callbacks arrive on the main thread. Observing the same token
+    /// again replaces the previous observer. Pair with `pauseActivationObserver` /
+    /// `resumeActivationObserver` (scene background/foreground — the timeout clock keeps
+    /// running while paused) and `stopActivationObserver` (screen dismissed).
+    public func observeActivation(
+        tokenUniqueReference: String,
+        onActivated: @escaping () -> Void,
+        onTimeout: @escaping () -> Void,
+        onError: ((String) -> Void)? = nil
+    ) throws {
+        let kmp = try requireKmp()
+        let registration = UUID()
+        setActivationObserver(tokenUniqueReference, registration)
+        kmp.observeActivation(
+            tokenUniqueReference: tokenUniqueReference,
+            onActivated: { [self] in
+                endActivationObserver(tokenUniqueReference, ifRegistration: registration)
+                onActivated()
+            },
+            onTimeout: { [self] in
+                endActivationObserver(tokenUniqueReference, ifRegistration: registration)
+                onTimeout()
+            },
+            onError: onError
+        )
+    }
+
+    /// Whether an activation observer is running for the token — started by
+    /// ``observeActivation(tokenUniqueReference:onActivated:onTimeout:onError:)`` and not yet
+    /// activated, timed out or stopped. A paused observer is still running.
+    public func hasActivationObserver(tokenUniqueReference: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return observedActivations[tokenUniqueReference] != nil
+    }
+
+    private func setActivationObserver(_ tokenUniqueReference: String, _ registration: UUID?) {
+        lock.lock()
+        observedActivations[tokenUniqueReference] = registration
+        lock.unlock()
+    }
+
+    private func endActivationObserver(_ tokenUniqueReference: String, ifRegistration registration: UUID) {
+        lock.lock()
+        if observedActivations[tokenUniqueReference] == registration {
+            observedActivations[tokenUniqueReference] = nil
+        }
+        lock.unlock()
+    }
+
+    /// Pause an activation observer's polling (call when the app backgrounds); the
+    /// 5-minute timeout clock keeps running while paused.
+    public func pauseActivationObserver(tokenUniqueReference: String) throws {
+        try requireKmp().pauseActivationObserver(tokenUniqueReference: tokenUniqueReference)
+    }
+
+    /// Resume a paused activation observer; if the timeout window elapsed while paused,
+    /// `onTimeout` fires immediately.
+    public func resumeActivationObserver(tokenUniqueReference: String) throws {
+        try requireKmp().resumeActivationObserver(tokenUniqueReference: tokenUniqueReference)
+    }
+
+    /// Stop observing a token's activation (call when the screen is dismissed); no further
+    /// callbacks fire.
+    public func stopActivationObserver(tokenUniqueReference: String) throws {
+        try requireKmp().stopActivationObserver(tokenUniqueReference: tokenUniqueReference)
+        setActivationObserver(tokenUniqueReference, nil)
+    }
+
+    // ── Payment refusals ───────────────────────────────────────────────────────────────
+
+    /// Observe payments refused before any proof was built, **for one card**.
+    ///
+    /// Handlers are registered against a token's unique reference and only ever hear about
+    /// that card. Registering the same card again replaces its handlers; other cards are
+    /// untouched. Call ``stopObservingPaymentRefusals(forTokenUniqueReference:)`` to clear one.
+    ///
+    /// Two callbacks, because the advice differs and giving the payer the wrong one wastes
+    /// their time:
+    /// - `onRequireOnline` — the card's payment keys need refreshing and the wallet could not
+    ///   reach the server. Tell the payer to connect and try again.
+    /// - `onAmountExceedCardLimit` — the amount is larger than this card can carry in one
+    ///   payment. **Never tell them to go online here**: a refreshed key carries the same cap,
+    ///   so they would connect, retry and fail identically with no way to learn what was
+    ///   wrong. Tell them to pay less or use another card. `cardLimitMinorUnits` is that cap
+    ///   when it is known, and `nil` when it could not be read — omit the figure rather than
+    ///   show a guess.
+    ///
+    /// - `onDeviceNotBound` (optional) — the card was added on another device (or before this
+    ///   app was reinstalled) and cannot be issued payment keys here. Neither going online nor
+    ///   a smaller amount helps: tell the payer to add the card again on this phone. Unlike the
+    ///   other two this *is* a card state — `Token.deviceNotBound` reads `true` too.
+    ///
+    /// The first two report **this payment**, not the card's state: `requiresOnline` on a card answers
+    /// the different question "can this card pay *anything* offline?" and stays `false` for a
+    /// card that can still make smaller payments. Show a message about the payment that just
+    /// failed; don't grey the card out on the strength of one refused amount.
+    ///
+    /// These fire from the QR rails (`rail` is `"CPM_QR"` or `"MPM_QR"`); there is no
+    /// tap-to-pay on iOS, so no `"TAP"` refusal can occur. The pay calls also answer the same
+    /// refusal as their own outcome — `NOT_SENT` with reason `ONLINE_REQUIRED` /
+    /// `AMOUNT_EXCEEDS_CARD_LIMIT` — this observer is additional, for hosts that would rather
+    /// handle refusals in one place than at every call site.
+    ///
+    /// A refusal the SDK could not attribute to a card reaches **every** registered handler
+    /// rather than none: the payer was refused either way. The callback's own
+    /// `tokenUniqueReference` is `nil` in that case, so a host can tell the two apart.
+    ///
+    /// Callbacks arrive on the main thread.
+    public func observePaymentRefusals(
+        forTokenUniqueReference tokenUniqueReference: String,
+        onRequireOnline: @escaping (_ refusal: WalletPaymentRefusal) -> Void,
+        onAmountExceedCardLimit: @escaping (_ refusal: WalletPaymentRefusal) -> Void,
+        onDeviceNotBound: ((_ refusal: WalletPaymentRefusal) -> Void)? = nil
+    ) throws {
+        let kmp = try requireKmp()
+        kmp.observePaymentRefusals(
+            tokenUniqueReference: tokenUniqueReference,
+            onRequireOnline: { onRequireOnline(WalletPaymentRefusal($0)) },
+            onAmountExceedsCardLimit: { onAmountExceedCardLimit(WalletPaymentRefusal($0)) },
+            onDeviceNotBound: { onDeviceNotBound?(WalletPaymentRefusal($0)) }
+        )
+    }
+
+    /// Stop observing payment refusals for one card; its handlers fire no more. Other cards'
+    /// registrations are unaffected.
+    public func stopObservingPaymentRefusals(forTokenUniqueReference tokenUniqueReference: String) throws {
+        try requireKmp().stopObservingPaymentRefusals(tokenUniqueReference: tokenUniqueReference)
+    }
+
+    // ── The SDK tells you when stored truth changes ────────────────────────────────────
+
+    /// Observe the issuer changing a card's status — suspended, reactivated, expired,
+    /// deactivated.
+    ///
+    /// **Why you want this.** The SDK polls token status in the background and writes the
+    /// answer to its store. Without this observer your app finds out only the next time it
+    /// reads `tokens()` — which, if the customer is already sitting on a card screen, means it
+    /// never finds out at all. They tap a card your UI still shows as usable, and it fails at
+    /// the terminal.
+    ///
+    /// `canPay` is the SDK's own answer, not something to re-derive from `status`: it is
+    /// exactly the predicate the payment gates use, so a status added to the backend after
+    /// this SDK shipped is correctly reported as not payable rather than guessed at.
+    ///
+    /// - `status` is the parsed vocabulary value — `ACTIVE`, `PENDING_ACTIVATION`,
+    ///   `SUSPENDED`, `DEACTIVATED`, `EXPIRED`, or `UNKNOWN` for a value this build does not
+    ///   know. `rawStatus` is the literal as stored; quote it in logs and support calls,
+    ///   because for `UNKNOWN` it is the only thing that identifies the status.
+    /// - `previousStatus` is what the card held before, or `nil` if this is its first status —
+    ///   useful because the *transition* is often what you act on (`ACTIVE` → `SUSPENDED`
+    ///   deserves an interruption; `PENDING_ACTIVATION` → `ACTIVE` is good news).
+    ///
+    /// Register once, at start-up — not per card screen. It fires for **any** stored card,
+    /// including ones no screen is showing, which is the case that matters.
+    ///
+    /// It does **not** replay: an app that was not running when the status changed is served
+    /// by reading `tokens()` at start-up, so keep that read. The observer is a convenience over
+    /// the store, not a delivery guarantee.
+    ///
+    /// Callbacks arrive on the main thread. Observing again replaces the previous observer
+    /// (last registration wins); `stopObservingTokenStatusChanged()` clears it.
+    public func observeTokenStatusChanged(
+        onTokenStatusChanged: @escaping (_ change: TokenStatusChangedEvent) -> Void
+    ) throws {
+        let kmp = try requireKmp()
+        kmp.observeTokenLifecycle { tokenUniqueReference, status, rawStatus, canPay, previousRawStatus in
+            onTokenStatusChanged(TokenStatusChangedEvent(
+                tokenUniqueReference: tokenUniqueReference,
+                status: TokenStatus(raw: status),
+                rawStatus: rawStatus,
+                canPay: canPay.boolValue,
+                previousStatus: previousRawStatus
+            ))
+        }
+    }
+
+    /// Stop observing token status changes; no further callbacks fire.
+    public func stopObservingTokenStatusChanged() throws {
+        try requireKmp().stopObservingTokenLifecycle()
+    }
+
+    /// Observe a payment that was left `PENDING` reaching its final outcome.
+    ///
+    /// A wallet payment that gets no immediate answer is stored and polled by the SDK until
+    /// the backend settles it — which can be seconds or days. This is how your app hears the
+    /// answer without polling the store itself. It fires from every route that resolves a row:
+    /// the background sweep, an on-demand status check, and the scan-to-pay push.
+    ///
+    /// `status` is `APPROVED`, `DECLINED` or `FAILED` — never `PENDING`, because a row that is
+    /// still open has not resolved. `reason` is a plain string to display and log, never to
+    /// parse; `responseCode` is the wire literal for receipts and support.
+    ///
+    /// Register once, at start-up — not per payment: the payment most likely to need this is
+    /// one that settles after the screen (or the process) that made it is gone. It does
+    /// **not** replay, so keep reading history at start-up.
+    ///
+    /// Callbacks arrive on the main thread. Observing again replaces the previous observer
+    /// (last registration wins); `stopObservingTransactionResolved()` clears it.
+    public func observeTransactionResolved(
+        onTransactionResolved: @escaping (_ resolution: WalletTransactionResolvedEvent) -> Void
+    ) throws {
+        let kmp = try requireKmp()
+        kmp.observeTransactionResolved { transactionHash, tokenUniqueReference, status, responseCode, reason, amountMinorUnits, merchantName in
+            onTransactionResolved(WalletTransactionResolvedEvent(
+                transactionHash: transactionHash,
+                tokenUniqueReference: tokenUniqueReference,
+                status: status,
+                responseCode: responseCode,
+                reason: reason,
+                amountMinorUnits: amountMinorUnits.int64Value,
+                merchantName: merchantName
+            ))
+        }
+    }
+
+    /// Stop observing transaction resolutions; no further callbacks fire.
+    public func stopObservingTransactionResolved() throws {
+        try requireKmp().stopObservingTransactionResolved()
+    }
+
+    /// Observe a card running out of payment keys — or getting them back.
+    ///
+    /// Cards hold a pool of single-use payment keys. When it is exhausted the card cannot pay
+    /// until the SDK refreshes them, which is the state `Token.requiresOnline` reports.
+    /// `requiresOnline` here is that **same value** — the observer and `tokens()` read one
+    /// function, so a callback can never contradict the list you are about to draw.
+    ///
+    /// **What it covers, and what it does not.** It fires when a payment consumes a key and
+    /// when a refresh delivers new ones — the moments the SDK is actually executing. Keys also
+    /// expire by *clock*, which happens with no code running at all: a card whose last key
+    /// expires while your app sits idle is reported as `requiresOnline` by the next `tokens()`
+    /// read, exactly as it is today, and **nothing fires**. Write your UI copy accordingly and
+    /// keep reading the card list when a screen appears.
+    ///
+    /// The first evaluation of a card after launch is a silent baseline — there is nothing to
+    /// compare against yet, and at launch you are reading `tokens()` anyway.
+    ///
+    /// Observation only: there is deliberately no API to trigger a key refresh. The SDK owns
+    /// when keys are replenished.
+    ///
+    /// **A card that can never be re-keyed here.** When the backend refuses this device payment
+    /// keys for a card — it was added on another device, or before this app was reinstalled —
+    /// the event carries `deviceNotBound == true` and `requiresOnline == false` (going online
+    /// cannot help): prompt the user to add the card again.
+    ///
+    /// One listener receives every change as a `TokenKeyStateEvent`, as on Android and React
+    /// Native. Callbacks arrive on the main thread. Observing again replaces the previous
+    /// observer; `stopObservingTokenKeyStateChanged()` clears it.
+    public func observeTokenKeyStateChanged(
+        onTokenKeyStateChanged: @escaping (_ event: TokenKeyStateEvent) -> Void
+    ) throws {
+        let kmp = try requireKmp()
+        kmp.observeCardKeyState { tokenUniqueReference, requiresOnline, deviceNotBound in
+            onTokenKeyStateChanged(Self.tokenKeyStateEvent(
+                tokenUniqueReference: tokenUniqueReference,
+                requiresOnline: requiresOnline.boolValue,
+                deviceNotBound: deviceNotBound.boolValue
+            ))
+        }
+    }
+
+    /// The event one key-state change delivers. A card the backend will not re-key on this
+    /// device is never "requires online", whatever the core reported alongside it.
+    static func tokenKeyStateEvent(tokenUniqueReference: String, requiresOnline: Bool, deviceNotBound: Bool) -> TokenKeyStateEvent {
+        TokenKeyStateEvent(
+            tokenUniqueReference: tokenUniqueReference,
+            requiresOnline: deviceNotBound ? false : requiresOnline,
+            deviceNotBound: deviceNotBound
+        )
+    }
+
+    /// Stop observing card key state changes; no further callbacks fire.
+    public func stopObservingTokenKeyStateChanged() throws {
+        try requireKmp().stopObservingCardKeyState()
+    }
+
+    // ── Scan-to-pay: inspect → authenticate (Face ID / Touch ID) → pay ─────────────────
+
+    /// Inspect a scanned merchant QR payload. Verification happens **on-device** (gateway
+    /// signature against the SDK's pinned key + expiry). Only `.verified` may be shown on a
+    /// confirm screen; every `.rejected` must end the flow.
+    public func inspectScannedQr(_ payload: String) throws -> ScanInspection {
+        let kmp = try requireKmp()
+        let result = kmp.inspectScannedQr(payload: payload)
+        if let verified = result as? ScanInspectionVerified {
+            let ctx = verified.context
+            return .verified(VerifiedPayment(
+                txRef: ctx.txRef,
+                merchantID: ctx.merchantId,
+                merchantName: ctx.merchantName,
+                merchantCity: ctx.merchantCity,
+                amountDisplay: ctx.amountDisplay,
+                amountMinorUnits: ctx.amountMinorUnits,
+                currencyCode: ctx.currencyCode,
+                expiresAtEpochSeconds: ctx.expiresAtEpochSeconds,
+                merchantOrderID: ctx.merchantOrderId,
+                raw: ctx
+            ))
+        }
+        if let rejected = result as? ScanInspectionRejected {
+            let reason = ScanRejectionReason(rawValue: rejected.reason.name) ?? .malformed
+            return .rejected(reason, detail: rejected.detail)
+        }
+        return .rejected(.malformed, detail: "unrecognised inspection result")
+    }
+
+    // `authenticateForScannedPayment` was removed. It was the call an app had
+    // to make before paying; skipping it, or letting its single-use authentication go stale
+    // while the customer read the confirm screen, refused the payment. `payScannedContext` and
+    // `showQrToPay` now raise the same system sheet themselves.
+
+    /// Pay a verified scanned payment with the wallet's **active token**.
+    ///
+    /// **The SDK asks for the customer's authentication itself** — it raises the system
+    /// sheet (Face ID / Touch ID, falling back to the device passcode) before it builds the
+    /// payment, naming the merchant and amount so the gesture is bound to what it authorizes.
+    /// You make no authentication call. One gesture per payment attempt: a retry asks again.
+    ///
+    /// Every payment ends with an outcome — branch on `responseStatus`. `NOT_SENT` means nothing
+    /// was sent: `AUTH_CANCELLED` (the customer dismissed the sheet), `AUTH_FAILED`,
+    /// `AUTH_UNAVAILABLE` (no passcode or biometry), `ONLINE_REQUIRED`, `AMOUNT_EXCEEDS_CARD_LIMIT`,
+    /// `TOKEN_NOT_ACTIVE`, `DEVICE_NOT_BOUND`, `NO_ACTIVE_CARD`, `CARD_CANNOT_PAY`,
+    /// `NO_NETWORK_CONNECTION`, `SDK_UNABLE_TO_CONNECT`… — fix it and pay the same QR again.
+    /// `PENDING` means the push may have gone through: never pay again; the SDK resolves it.
+    ///
+    /// Whatever the gateway states — approved, declined, failed or still pending — also
+    /// lands in the paying token's `transactions(tokenUniqueReference:limit:)`; a pending row keeps being polled by the
+    /// SDK until the gateway states a final outcome.
+    ///
+    /// To cancel it while it is still on the device, call ``cancelPayment(merchantOrderID:)`` with
+    /// ``VerifiedPayment/merchantOrderID``, or cancel the Swift `Task` awaiting this call; it then
+    /// returns `NOT_SENT` / `CANCELLED`. A QR with no order ID cannot be cancelled.
+    public func payScannedContext(_ payment: VerifiedPayment) async throws -> PaymentOutcome {
+        guard let orderID = payment.merchantOrderID?.trimmingCharacters(in: .whitespaces).nilIfEmpty else {
+            return try await pay(payment)
+        }
+        return try await TaskCancelBridge.run(
+            cancel: { [self] in cancelPayment(merchantOrderID: orderID) },
+            notFound: .noPaymentInProgressForOrderID
+        ) { try await pay(payment) }
+    }
+
+    private func pay(_ payment: VerifiedPayment) async throws -> PaymentOutcome {
+        try await call { kmp in
+            let outcome = try await kmp.payScannedContext(verified: payment.raw)
+            return PaymentOutcome(
+                approved: outcome.approved,
+                responseCode: outcome.responseCode,
+                responseStatus: outcome.responseStatus,
+                responseStatusReason: outcome.responseStatusReason,
+                message: outcome.message,
+                merchantName: outcome.merchantName,
+                merchantLocation: outcome.merchantLocation,
+                creditTransactionID: outcome.creditTransactionId,
+                isCreditConfirmationSupported: outcome.isCreditConfirmationSupported?.boolValue
+            )
+        }
+    }
+
+    /// Render a **show QR to pay** code (dynamic CPM): key the merchant-stated amount first —
+    /// it rides inside the QR's cryptogram, so the merchant's scan charges exactly that
+    /// amount or fails verification. The SDK raises the system authentication sheet itself
+    /// (one gesture per QR — a regenerate after `expiresAtEpochMillis` is a fresh payment
+    /// attempt and asks again). Fully offline: nothing is sent; the merchant's SoftPOS
+    /// submits the payment and the outcome appears via the wallet's history polling.
+    /// - Parameter onExpired: the SDK calls this once, on the main thread, when the
+    /// returned QR reaches its `expiresAtEpochMillis`. Blank/replace the code on this so it
+    /// can't be scanned once lapsed (a dimmed QR is still machine-readable). The SDK owns the
+    /// timer: a new `showQrToPay` supersedes it, and `cancelQrExpiry()` stops it (call on
+    /// teardown). Omit to keep the old behaviour.
+    public func showQrToPay(amountMinorUnits: Int64, onExpired: (() -> Void)? = nil) async throws -> PaymentQr {
+        try await call { kmp in
+            let qr = try await kmp.showQrToPay(amountMinorUnits: amountMinorUnits, onExpired: onExpired)
+            return PaymentQr(
+                tokenUniqueReference: qr.tokenUniqueReference,
+                payload: qr.payload,
+                amountMinorUnits: qr.amountMinorUnits,
+                currencyCode: qr.currencyCode,
+                expiresAtEpochMillis: qr.expiresAtEpochMillis,
+                transactionHash: qr.transactionHash,
+                responseStatus: qr.responseStatus,
+                responseStatusReason: qr.responseStatusReason,
+                message: qr.message
+            )
+        }
+    }
+
+    /// Stop the active show-to-pay QR expiry watch started by `showQrToPay`. Call on
+    /// teardown (the QR screen is dismissed) so the `onExpired` callback can't fire into dead
+    /// UI. Idempotent; a new `showQrToPay` also supersedes any prior watch.
+    public func cancelQrExpiry() {
+        (try? requireKmp())?.cancelQrExpiry()
+    }
+
+    // ── Receipts & transaction history ─────────────────────────────────────
+
+    /// Process a scanned merchant-receipt QR: decode/validate, verify it matches a transaction
+    /// this wallet made, dedupe, and store. Raw JSON or base64. Checked on the phone; nothing is
+    /// sent. Answers a ``ReceiptScan``: `APPROVED` with the stored receipt, or `FAILED` with the
+    /// reason (`INVALID_RECEIPT`, `RECEIPT_NOT_FROM_THIS_WALLET`, `RECEIPT_MISMATCH`,
+    /// `PAYMENT_NOT_CONFIRMED`, `RECEIPT_FOR_ANOTHER_TRANSACTION`). Only a setup mistake throws.
+    /// - Parameter expectedTransactionHash: set when the scan was launched FROM a specific
+    /// transaction's screen — a receipt belonging to a different transaction is
+    /// rejected (and not stored) instead of silently linking elsewhere. Nil = unscoped.
+    @discardableResult
+    public func processReceipt(_ qrPayload: String, expectedTransactionHash: String? = nil) async throws -> ReceiptScan {
+        try await call { kmp in
+            let r = try await kmp.processReceipt(qrPayload: qrPayload, expectedTransactionHash: expectedTransactionHash)
+            return ReceiptScan(receipt: r.receipt.map(map), responseStatus: r.responseStatus,
+                               responseStatusReason: r.responseStatusReason, message: r.message)
+        }
+    }
+
+    /// The last `limit` stored receipts, most recent first. Local read, no network.
+    public func receipts(limit: Int = 100) async throws -> [TransactionReceipt] {
+        try await call { kmp in try await kmp.receipts(limit: Int32(limit)).map(map) }
+    }
+
+    /// The receipt linked to a transaction by its hash, or nil. Local read. The same call as
+    /// Android's and React Native's `getReceiptForTransaction`.
+    public func receiptForTransaction(_ transactionHash: String) async throws -> TransactionReceipt? {
+        try await call { kmp in
+            try await kmp.receiptForTransaction(transactionHash: transactionHash).map(map)
+        }
+    }
+
+    /// A card's transaction history: the last `limit` payments made with it, on every rail this
+    /// platform has (payment QR, scan-to-pay), most recent first. Each `TransactionSummary` carries
+    /// the outcome, the merchant and, where the merchant's bank supports it, the credit
+    /// confirmation — as the SDK last recorded them; the SDK keeps open rows up to date by itself.
+    ///
+    /// Local read — no network call. Empty when no card on this device has that reference, or the
+    /// card has no payments yet. Android's and React Native's `getTransactions`, with the same
+    /// default.
+    public func transactions(tokenUniqueReference: String, limit: Int = 50) async throws -> [TransactionSummary] {
+        try await call { kmp in
+            try await kmp.transactionHistory(tokenUniqueReference: tokenUniqueReference, limit: Int32(limit))
+                .map(Self.map)
+        }
+    }
+
+    /// Ask the backend about **one** pending transaction now, keyed by its transaction hash, and
+    /// return the updated stored row.
+    ///
+    /// The per-transaction counterpart to `reconcilePendingTransactions()`, which asks about
+    /// every open row and returns nothing — this one answers about the row the customer is
+    /// actually looking at. The SDK polls a pending transaction for you with exponential backoff
+    /// and **stops after 30 days**; this is how a customer gets an answer sooner than the next
+    /// rung, and the only route to one once that window has closed.
+    ///
+    /// It runs the SDK's own background sweep for this single row — same query, same reading of
+    /// the answer, same write into the same local history — so an on-demand check and a
+    /// background check cannot disagree. It is **not** a way to force an outcome: a payment that
+    /// is still unsettled answers `PENDING` again.
+    ///
+    /// - Returns: the transaction as it stands after the check, or `nil` if no row on this device
+    ///   carries that hash. A row that already has a final outcome is returned unchanged, without
+    ///   a network call.
+    /// A check that could not be made is not thrown: ``VeyraLookup/failureReason`` says why
+    /// (`NO_NETWORK_CONNECTION` when offline). A failed check never changes the stored row.
+    public func refreshTransactionStatus(transactionHash: String) async throws -> VeyraLookup<TransactionSummary> {
+        try await call { kmp in
+            let r = try await kmp.refreshTransactionStatus(transactionHash: transactionHash)
+            return VeyraLookup(value: r.transaction.map(Self.map), failureReason: r.failureReason, message: r.message)
+        }
+    }
+
+    /// Check the merchant credit **now** for one approved payment — "has the merchant's bank
+    /// actually received the funds I paid?" — and return the updated stored row.
+    ///
+    /// The SDK already asks this in the background, with exponential backoff, for **30 days**
+    /// after the payment, and then records the row as `"UNABLE_TO_CONFIRM"` — which means *"we
+    /// stopped asking"*, never *"the merchant was not paid"*. This is how a customer gets an
+    /// answer sooner than the next rung, and the only route to one once that window has closed:
+    /// it still works on a row already marked `"UNABLE_TO_CONFIRM"`, and a later `"RECEIVED"`
+    /// replaces that give-up.
+    ///
+    /// **Check `isCreditConfirmationSupported` on the transaction first.** Not every merchant's
+    /// bank is on the confirmation rail. Offer this action only while
+    /// ```swift
+    /// txn.authorizationStatus == "APPROVED"
+    ///     && txn.isCreditConfirmationSupported == true
+    ///     && txn.creditConfirmationStatus != "RECEIVED"
+    /// ```
+    /// A call on a row that fails that predicate makes **no network request** and returns the row
+    /// unchanged rather than throwing.
+    ///
+    /// Settlement only: nothing on this path can change the payment's `authorizationStatus`,
+    /// `responseCode` or `responseStatusReason`. There is deliberately no callback — the returned
+    /// row and the SDK's stored history are the whole surface.
+    ///
+    /// - Returns: the transaction as it stands after the check, or `nil` if no row on this device
+    ///   carries that hash.
+    /// A check that could not be made is not thrown: ``VeyraLookup/failureReason`` says why
+    /// (`NO_NETWORK_CONNECTION` when offline). A failed check never changes the stored row.
+    public func refreshCreditConfirmation(transactionHash: String) async throws -> VeyraLookup<TransactionSummary> {
+        try await call { kmp in
+            let r = try await kmp.refreshCreditConfirmation(transactionHash: transactionHash)
+            return VeyraLookup(value: r.transaction.map(Self.map), failureReason: r.failureReason, message: r.message)
+        }
+    }
+
+    private static func map(_ r: VeyraKMP.TransactionSummary) -> TransactionSummary {
+        TransactionSummary(
+            merchantName: r.merchantName,
+            amountMinorUnits: r.amountMinorUnits,
+            currencyCode: r.currencyCode,
+            transactionHash: r.transactionHash,
+            tokenUniqueReference: r.tokenUniqueReference,
+            authorizationStatus: r.authorizationStatus,
+            responseCode: r.responseCode,
+            responseStatusReason: r.responseStatusReason,
+            localTransactionDateTime: r.localTransactionDateTime,
+            atEpochMillis: r.atEpochMillis?.int64Value,
+            entryMethod: r.entryMethod,
+            merchantLocation: r.merchantLocation,
+            merchantTransactionReference: r.merchantTransactionReference,
+            merchantID: r.merchantId,
+            creditTransactionID: r.creditTransactionId,
+            isCreditConfirmationSupported: r.isCreditConfirmationSupported?.boolValue,
+            creditConfirmationStatus: r.creditConfirmationStatus,
+            creditedAt: r.creditedAt,
+            bankReference: r.bankReference,
+            merchantOrderID: r.merchantOrderId
+        )
+    }
+
+    /// Reconcile still-PENDING transactions against the backend. It asks about **every** open
+    /// transaction on the device, so call it on an occasion (scene-active, history opened), never
+    /// on a loop: a screen waiting for one payment — a displayed CPM QR — should call
+    /// ``refreshTransactionStatus(transactionHash:)`` with that payment's hash instead, which is
+    /// one request rather than one per open transaction. If the gateway throttles (`429`), the
+    /// pass stops and the rest wait for the SDK's next sweep. Best-effort: a row whose check fails
+    /// is left as it is. Answers a ``ReconcileResult``: `failureReason` is set only when the
+    /// reconcile itself could not run. Only a setup mistake throws.
+    @discardableResult
+    public func reconcilePendingTransactions() async throws -> ReconcileResult {
+        try await call { kmp in
+            let r = try await kmp.reconcilePendingTransactions()
+            return ReconcileResult(failureReason: r.failureReason, message: r.message)
+        }
+    }
+
+    private func map(_ r: VeyraKMP.TransactionReceipt) -> TransactionReceipt {
+        TransactionReceipt(
+            merchantName: r.merchantName,
+            merchantID: r.merchantId,
+            merchantAddress: r.merchantAddress,
+            transactionType: r.transactionType,
+            transactionStatus: r.transactionStatus,
+            transactionTime: r.transactionTime,
+            totalAmountMinorUnits: r.totalAmountMinorUnits,
+            totalAmountFormatted: r.totalAmountFormatted,
+            currencyCode: r.currencyCode,
+            maskedToken: r.maskedToken,
+            merchantTransactionReference: r.merchantTransactionReference,
+            cdcvmApprovedByWallet: r.cdcvmApprovedByWallet?.boolValue,
+            cdcvmOutcome: r.cdcvmOutcome,
+            transactionID: r.transactionId,
+            transactionHash: r.transactionHash
+        )
+    }
+
+    /// Shared guard + setup-error mapping. Every operation returns its outcome; what the shared
+    /// core still throws is a setup error, whose message starts with its code
+    /// (`INVALID_CONFIGURATION: …`). Anything else would be an SDK defect and is passed on
+    /// unchanged rather than dressed up as an outcome.
+    private func call<T>(_ body: (WalletKmp) async throws -> T) async throws -> T {
+        let kmp = try requireKmp()
+        do {
+            return try await body(kmp)
+        } catch let error as VeyraError {
+            throw error
+        } catch {
+            let message = error.localizedDescription
+            if message.hasPrefix("NOT_SIGNED_IN") { throw VeyraError.notSignedIn }
+            if message.hasPrefix("NOT_CONFIGURED") { throw VeyraError.notConfigured }
+            if message.hasPrefix("SESSION_REQUIRED") { throw VeyraError.sessionRequired }
+            if message.hasPrefix("UNSUPPORTED_ON_PLATFORM") { throw VeyraError.unsupportedOnPlatform }
+            if message.hasPrefix("INVALID_CONFIGURATION") { throw VeyraError.invalidConfiguration(message: message) }
+            throw error
         }
     }
 }

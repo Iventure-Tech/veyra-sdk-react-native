@@ -15,8 +15,8 @@
 // - iOS has no HCE (Apple platform lock); CoreNFC reader arming consults the same arbiter.
 //
 // Android ↔ iOS name mapping (excerpt; full table in the package README):
-// VeyraSdk.initialize(activity, config); sdk.currentMode()
-// ↔ VeyraSDK.configure(...); VeyraSDK.shared.currentMode
+// VeyraSdk.initialize(activity, customerId, config, provider); sdk.currentMode()
+// ↔ VeyraSDK.configure(customerID:config:provider:); VeyraSDK.shared.currentMode()
 import Foundation
 #if canImport(UIKit)
 import UIKit
@@ -33,19 +33,31 @@ public enum VeyraMode: String, Sendable {
     case wallet = "WALLET"
 }
 
-/// Errors thrown by the combined Veyra SDK.
-public enum VeyraSDKError: Error, Sendable {
-    /// `VeyraSDK.configure(_:)` has not been called.
-    case notConfigured
+/// The two member SDKs' settings for `VeyraSDK.configure(customerID:config:provider:)` — mirrors
+/// Android's `VeyraSdkConfig(softpos, wallet)` and RN's `{ softpos, wallet }`.
+public struct VeyraSDKConfiguration: Sendable {
+    public let softpos: VeyraSoftPOSConfiguration
+    public let wallet: VeyraWalletConfiguration
+
+    public init(softpos: VeyraSoftPOSConfiguration, wallet: VeyraWalletConfiguration) {
+        self.softpos = softpos
+        self.wallet = wallet
+    }
 }
 
 /// Entry point of the combined Veyra SDK on iOS (SoftPOS + Wallet + exclusive mode).
 ///
 /// The exclusive mode is SDK-managed — configure once at launch and use the two member SDKs;
-/// the mode follows your payment activity by itself. `currentMode` is observe-only.
+/// the mode follows your payment activity by itself. `currentMode()` is observe-only.
 ///
 /// ```swift
-/// VeyraSDK.configure(customerID: signedInCustomer, softpos: softposConfig, wallet: walletConfig)
+/// let sdk = try VeyraSDK.configure(
+///     customerID: signedInCustomer,
+///     config: VeyraSDKConfiguration(softpos: softposConfig, wallet: walletConfig),
+///     provider: provider
+/// )
+/// let wallet = try sdk.wallet
+/// let softpos = try sdk.softpos
 /// ```
 public final class VeyraSDK: @unchecked Sendable {
 
@@ -65,22 +77,25 @@ public final class VeyraSDK: @unchecked Sendable {
     ///   - customerID: The customer your app has authenticated. The wallet sends it to Veyra on
     ///     its card requests (add card, eligibility, activation) so support can find them;
     ///     SoftPOS never sends it. Device logs only ever show it masked.
+    ///   - config: Both member SDKs' settings.
     ///   - provider: How both SDKs reach Veyra — one provider shared by wallet and SoftPOS: your
     ///     `VeyraAssertionProvider` or `VeyraProxyProvider`.
+    /// - Returns: `VeyraSDK.shared`.
     /// - Throws: the member SDK's `invalidConfiguration` when the provider cannot be used.
+    @discardableResult
     public static func configure(
         customerID: String,
-        provider: any VeyraProvider,
-        softpos: VeyraSoftPOSConfiguration,
-        wallet: VeyraWalletConfiguration
-    ) throws {
+        config: VeyraSDKConfiguration,
+        provider: any VeyraProvider
+    ) throws -> VeyraSDK {
         shared.lock.lock()
         defer { shared.lock.unlock() }
-        try VeyraSoftPOS.configure(softpos, customerID: customerID, provider: provider)
-        try VeyraWallet.configure(wallet, customerID: customerID, provider: provider)
+        try VeyraSoftPOS.configure(customerID: customerID, config: config.softpos, provider: provider)
+        try VeyraWallet.configure(customerID: customerID, config: config.wallet, provider: provider)
         VeyraSdkKmp.shared.configure()
         shared.installBackgroundInertGuard()
         shared.configured = true
+        return shared
     }
 
     /// The customer has logged out: both member SDKs stop everything they run for them and drop
@@ -114,16 +129,32 @@ public final class VeyraSDK: @unchecked Sendable {
     private func requireConfigured() throws {
         lock.lock()
         defer { lock.unlock() }
-        guard configured else { throw VeyraSDKError.notConfigured }
+        guard configured else { throw VeyraError.notConfigured }
+    }
+
+    /// The wallet SDK this combined SDK configured — `VeyraWallet.shared`.
+    /// - Throws: `VeyraError.notConfigured` before `configure(customerID:config:provider:)`.
+    public var wallet: VeyraWallet {
+        get throws {
+            try requireConfigured()
+            return VeyraWallet.shared
+        }
+    }
+
+    /// The SoftPOS SDK this combined SDK configured — `VeyraSoftPOS.shared`.
+    /// - Throws: `VeyraError.notConfigured` before `configure(customerID:config:provider:)`.
+    public var softpos: VeyraSoftPOS {
+        get throws {
+            try requireConfigured()
+            return VeyraSoftPOS.shared
+        }
     }
 
     /// The app's current exclusive mode.
-    /// - Throws: `VeyraSDKError.notConfigured` before `configure(customerID:provider:softpos:wallet:)`.
-    public var currentMode: VeyraMode {
-        get throws {
-            try requireConfigured()
-            return VeyraMode(rawValue: VeyraSdkKmp.shared.currentMode()) ?? .none
-        }
+    /// - Throws: `VeyraError.notConfigured` before `configure(customerID:config:provider:)`.
+    public func currentMode() throws -> VeyraMode {
+        try requireConfigured()
+        return VeyraMode(rawValue: VeyraSdkKmp.shared.currentMode()) ?? .none
     }
 
 }

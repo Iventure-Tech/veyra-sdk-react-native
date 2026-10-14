@@ -20,7 +20,7 @@ import Foundation
 /// `NOT_SENT` are handled the same way: nothing was debited; retry with the same order ID.
 /// An order ID can be used again until the order is `APPROVED` or `PENDING`; after that a new attempt
 /// is refused `94` / `FAILED` / `DUPLICATE_MERCHANT_ORDER_ID`.
-public enum VeyraResponseStatus {
+public enum ResponseStatus {
     public static let approved = "APPROVED"
     public static let declined = "DECLINED"
     public static let failed = "FAILED"

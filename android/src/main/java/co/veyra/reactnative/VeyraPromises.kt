@@ -1,12 +1,12 @@
 package co.veyra.reactnative
 
-import co.veyra.common.VeyraSetupCode
-import co.veyra.common.VeyraSetupException
+import co.veyra.common.VeyraErrorCode
+import co.veyra.common.VeyraError
 import com.facebook.react.bridge.Promise
 
 /**
  * The bridge's one rejection path. Only a setup error rejects — a mistake in the app's
- * integration — and it is mapped by its [VeyraSetupCode], never by matching a message (the iOS
+ * integration — and it is mapped by its [VeyraErrorCode], never by matching a message (the iOS
  * module maps its error enums to the same five codes). Everything that happens **to** a call is an
  * outcome the SDK returns, which the module resolves; anything else reaching here is an SDK defect
  * and rejects `UNKNOWN`.
@@ -18,13 +18,13 @@ internal object VeyraPromises {
         promise.reject(code, t.message ?: code, t)
     }
 
-    fun reject(promise: Promise, code: VeyraSetupCode, message: String) {
+    fun reject(promise: Promise, code: VeyraErrorCode, message: String) {
         promise.reject(code.name, message)
     }
 
     /** The JS code for [t]: its setup code (no-customer included, by type), else `UNKNOWN`. */
     fun classify(t: Throwable): String = when (t) {
-        is VeyraSetupException -> t.code.name
+        is VeyraError -> t.code.name
         else -> "UNKNOWN"
     }
 
@@ -39,7 +39,7 @@ internal object VeyraPromises {
     }
 
     fun classifyInitialize(t: Throwable): String =
-        if (t is IllegalArgumentException) VeyraSetupCode.INVALID_CONFIGURATION.name else classify(t)
+        if (t is IllegalArgumentException) VeyraErrorCode.INVALID_CONFIGURATION.name else classify(t)
 }
 
 /**

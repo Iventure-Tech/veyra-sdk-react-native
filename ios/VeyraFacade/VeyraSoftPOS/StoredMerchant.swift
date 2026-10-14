@@ -1,9 +1,9 @@
 // StoredMerchant — SDK-owned persistence of the registered merchant.
 //
 // iOS twin of Android's MerchantDataStore/StoredMerchantData: a successful
-// VeyraSoftPOS.shared.merchant.register(_:) persists the merchant in a protected app-sandbox
+// VeyraSoftPOS.shared.register(_:) persists the merchant in a protected app-sandbox
 // file (moved off the Keychain so it is cleared on uninstall, not carried over) so
-// it survives app restarts, and apps gate on merchant.isRegistered instead of re-registering.
+// it survives app restarts, and apps gate on isRegistered() instead of re-registering.
 // Status/activate/deactivate/update responses keep the stored copy current.
 import CryptoKit
 import Foundation
@@ -11,7 +11,7 @@ import Security
 import VeyraKMP
 
 /// The merchant registered from this device, as persisted by the SDK after a successful
-/// `VeyraSoftPOS.Merchant.register(_:)` (mirrors Android `StoredMerchantData`).
+/// `VeyraSoftPOS.register(_:)` (mirrors Android `StoredMerchantData`).
 public struct StoredMerchant: Sendable, Hashable, Codable {
     public let merchantID: String
     /// `"PERSONAL"` or `"BUSINESS"`.

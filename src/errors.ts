@@ -2,9 +2,9 @@ import type { CancelResult } from './types';
 
 /**
  * The setup errors — the **only** thing a Veyra call rejects with. Each is a mistake in the app's
- * integration, found in development, and the same five codes exist on Android
- * (`VeyraSetupException`) and iOS (`VeyraWalletError` / `VeyraSoftPOSError`). Both native modules
- * map their platform's setup error to the code by its type, so JS never string-matches a message.
+ * integration, found in development, and the same type, with the same five codes, exists on Android
+ * and iOS (`VeyraError`). Both native modules map their platform's setup error to the code by its
+ * type, so JS never string-matches a message.
  *
  * Everything that happens **to** a call — refused on the phone, offline, authentication dismissed,
  * declined, no answer — is not an error: the promise resolves with the outcome, and its
@@ -24,10 +24,10 @@ export type VeyraErrorCode =
   /**
    * A payment API was called without its screen session open. Mount `usePaySession` /
    * `useGetPaidSession` on the payment screen — the SDK arms only while it is focused. Raised for
-   * `merchant.tap.*` and `wallet.setActiveCard`, on both platforms.
+   * `softpos.tap.*` and `wallet.setActiveToken`, on both platforms.
    */
   | 'SESSION_REQUIRED'
-  /** A method this platform cannot perform — e.g. wallet tap-to-pay (`wallet.onTapEvent`) on iOS. */
+  /** A method this platform cannot perform — e.g. wallet tap-to-pay (`wallet.observeTapEvents`) on iOS. */
   | 'UNSUPPORTED_ON_PLATFORM'
   /** Anything not otherwise classified — an SDK defect, not an outcome; see `message`. */
   | 'UNKNOWN';

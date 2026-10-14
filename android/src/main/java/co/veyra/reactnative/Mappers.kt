@@ -2,43 +2,45 @@
 
 package co.veyra.reactnative
 
-import co.veyra.softpos.payment.sdk.TransactionInfo
-import co.veyra.softpos.payment.sdk.TransactionResponse as SoftposTransactionResponse
+import co.veyra.softpos.payment.sdk.MerchantTransaction
+import co.veyra.softpos.payment.sdk.TapEvent
+import co.veyra.softpos.payment.sdk.TapRequest
+import co.veyra.softpos.payment.sdk.TapResult
 import co.veyra.common.cancel.CancelResult
 import co.veyra.common.outcome.OutcomeReason
-import co.veyra.common.outcome.OutcomeStatus
-import co.veyra.softpos.payment.sdk.TransactionRefreshResult
-import co.veyra.softpos.payment.sdk.context.CreatedPaymentContext
+import co.veyra.common.outcome.ResponseStatus
+import co.veyra.softpos.payment.sdk.context.PaymentContextQr
 import co.veyra.softpos.payment.sdk.payment.OriginalPayment
 import co.veyra.softpos.payment.sdk.context.PaymentContextStatus
-import co.veyra.softpos.payment.sdk.cpm.CpmInspection
-import co.veyra.softpos.payment.sdk.merchant.MerchantRegistrationData
-import co.veyra.softpos.payment.sdk.merchant.MerchantRegistrationResponse
-import co.veyra.softpos.payment.sdk.merchant.NubanBankListResponse
-import co.veyra.softpos.payment.sdk.merchant.StoredMerchantData
-import co.veyra.softpos.payment.sdk.merchant.TransactionReceiptResult
-import co.veyra.softpos.payment.sdk.payment.PaymentResponse
+import co.veyra.softpos.payment.sdk.cpm.CustomerQrInspection
+import co.veyra.softpos.payment.sdk.merchant.MerchantRegistration
+import co.veyra.softpos.payment.sdk.merchant.MerchantType
+import co.veyra.softpos.payment.sdk.merchant.MerchantUpdate
+import co.veyra.softpos.payment.sdk.merchant.MerchantRegistrationResult
+import co.veyra.softpos.payment.sdk.merchant.SettlementBankList
+import co.veyra.softpos.payment.sdk.merchant.StoredMerchant
+import co.veyra.softpos.payment.sdk.merchant.MerchantReceipt
 import co.veyra.wallet.sdk.AccountNumberSource
 import co.veyra.wallet.sdk.ActivateResponse
 import co.veyra.wallet.sdk.ActivationCodeResponse
 import co.veyra.wallet.sdk.BankList
-import co.veyra.wallet.sdk.CpmPaymentQr
+import co.veyra.wallet.sdk.PaymentQr
 import co.veyra.wallet.sdk.TokenStatusResult
 import co.veyra.wallet.sdk.TokenStatusUpdateResponse
 import co.veyra.wallet.sdk.Token
-import co.veyra.wallet.sdk.TokenisationResponse
+import co.veyra.wallet.sdk.DigitiseParams
+import co.veyra.wallet.sdk.DigitiseResult
 import co.veyra.wallet.sdk.TokenizationRecommendation
 import co.veyra.wallet.sdk.TokenizationRecommendationReason
-import co.veyra.wallet.sdk.TokenizationRequestParams
 import co.veyra.wallet.sdk.TransactionReceipt
-import co.veyra.wallet.sdk.TransactionRefresh
+import co.veyra.common.outcome.VeyraLookup
 import co.veyra.wallet.sdk.TransactionSummary
 import co.veyra.wallet.sdk.TrustScore
 import co.veyra.wallet.sdk.VerifyAccountParams
 import co.veyra.wallet.sdk.VerifyAccountResponse
-import co.veyra.wallet.sdk.api.mpm.MpmPushOutcome
-import co.veyra.wallet.sdk.api.mpm.MpmScanResult
-import co.veyra.wallet.sdk.api.mpm.VerifiedPaymentContext
+import co.veyra.wallet.sdk.api.mpm.PaymentOutcome
+import co.veyra.wallet.sdk.api.mpm.ScanInspection
+import co.veyra.wallet.sdk.api.mpm.VerifiedPayment
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.ReadableArray
 import com.facebook.react.bridge.ReadableMap
@@ -80,7 +82,7 @@ internal object Mappers {
         falseKeys: List<String> = emptyList(),
         nullKeys: List<String> = emptyList(),
         into: WritableMap = Arguments.createMap(),
-        status: String = OutcomeStatus.NOT_SENT,
+        status: String = ResponseStatus.NOT_SENT,
         /** The SDK never sees a call the bridge refuses itself, so the bridge logs its failure line. */
         operation: String? = null,
     ): WritableMap = into.apply {
@@ -104,7 +106,7 @@ internal object Mappers {
         nullKeys: List<String> = emptyList(),
         into: WritableMap = Arguments.createMap(),
         operation: String? = null,
-    ): WritableMap = notSent(reason, message, falseKeys, nullKeys, into, OutcomeStatus.FAILED, operation)
+    ): WritableMap = notSent(reason, message, falseKeys, nullKeys, into, ResponseStatus.FAILED, operation)
 
     /** `PaymentOutcome` (wallet scan-to-pay) refused before anything was sent. */
     fun paymentOutcomeNotSent(reason: String, message: String, into: WritableMap = Arguments.createMap()) =
@@ -133,6 +135,14 @@ internal object Mappers {
         refused(reason, message, nullKeys = listOf("merchantId", "merchantStatus"), into = into,
             operation = Ops.MERCHANT_STATUS)
 
+    /** `ActivationCodeResponse` refused before anything was sent: `FAILED`. */
+    fun activationCodeRefused(reason: String, message: String, into: WritableMap = Arguments.createMap()) =
+        refused(
+            reason, message,
+            nullKeys = listOf("tokenUniqueReference", "expirationDateTime", "status", "failureCode"),
+            into = into, operation = Ops.ACTIVATION,
+        )
+
     /** `VerifyAccountResponse` refused before anything was sent: `FAILED`. */
     fun verifyAccountRefused(reason: String, message: String, into: WritableMap = Arguments.createMap()) =
         refused(reason, message, listOf("isApproved"), listOf("responseCode"), into, operation = Ops.VERIFY_ACCOUNT)
@@ -145,7 +155,7 @@ internal object Mappers {
         methodsInto: WritableArray = Arguments.createArray(),
     ) = notSent(
         reason, message, listOf("isApproved", "requiresActivation"),
-        listOf("responseCode", "tokenUniqueReference", "tokenStored"), into, operation = Ops.DIGITISE,
+        listOf("responseCode", "tokenUniqueReference", "tokenStored", "clientRequestId"), into, operation = Ops.DIGITISE,
     ).apply { putArray("activationMethods", methodsInto) }
 
     // ── Readers ─────────────────────────────────────────────────────────────────
@@ -160,6 +170,20 @@ internal object Mappers {
     fun ReadableMap.optStringList(key: String): List<String>? =
         if (hasKey(key) && !isNull(key)) getArray(key)?.toStringList() else null
 
+    /**
+     * `requestTimeoutSeconds` from an SDK's config map: null when absent. JS numbers are doubles, so
+     * a fractional value is refused here, naming the SDK; the 5–60 range is the SDK's own rule and
+     * is checked at initialise like on every other platform.
+     */
+    fun ReadableMap.optRequestTimeoutSeconds(sdk: String): Int? {
+        if (!hasKey("requestTimeoutSeconds") || isNull("requestTimeoutSeconds")) return null
+        val value = getDouble("requestTimeoutSeconds")
+        require(value % 1.0 == 0.0 && value >= Int.MIN_VALUE && value <= Int.MAX_VALUE) {
+            "$sdk.requestTimeoutSeconds must be a whole number of seconds (was $value)"
+        }
+        return value.toInt()
+    }
+
     private fun ReadableArray.toStringList(): List<String> =
         (0 until size()).mapNotNull { getString(it) }
 
@@ -173,35 +197,39 @@ internal object Mappers {
             map.opt("accountNumberSource")?.let { accountNumberSource(AccountNumberSource.valueOf(it)) }
         }.build()
 
-    fun digitiseParams(map: ReadableMap): TokenizationRequestParams {
-        val builder = TokenizationRequestParams.Builder(
-            accountNumber = map.req("accountNumber"),
-            institutionCode = map.req("institutionCode"),
-            accountHolderName = map.req("accountHolderName"),
-            walletProviderTokenizationRecommendation =
-                TokenizationRecommendation.valueOf(map.req("recommendation")),
-            consumerIdentifier = map.req("consumerIdentifier"),
-            bvn = map.req("bvn"),
-            accountHolderAddress = map.req("accountHolderAddress"),
-            mobileNumber = map.req("mobileNumber"),
-            walletAccountId = map.req("walletAccountId"),
-            emailAddress = map.req("emailAddress"),
-        )
-        map.opt("clientRequestId")?.let { builder.clientRequestId(it) }
-        map.opt("accountNumberSource")?.let { builder.accountNumberSource(AccountNumberSource.valueOf(it)) }
-        map.opt("deviceScore")?.let { builder.walletProviderDeviceScore(TrustScore.valueOf(it)) }
-        map.opt("accountScore")?.let { builder.walletProviderAccountScore(TrustScore.valueOf(it)) }
-        map.optStringList("recommendationReasons")?.let { reasons ->
-            builder.walletProviderTokenizationRecommendationReasons(
-                reasons.map { TokenizationRecommendationReason.valueOf(it) }
-            )
-        }
-        return builder.build()
-    }
+    /**
+     * JS `DigitiseParams` → [DigitiseParams]: the same fields and the same required set on every
+     * platform. A required field missing or blank answers `NOT_SENT` / `INVALID_REQUEST` before
+     * anything is sent.
+     */
+    fun digitiseParams(map: ReadableMap): DigitiseParams = DigitiseParams(
+        accountNumber = map.req("accountNumber"),
+        institutionCode = map.req("institutionCode"),
+        accountHolderName = map.req("accountHolderName"),
+        walletAccountId = map.req("walletAccountId"),
+        emailAddress = map.req("emailAddress"),
+        recommendation = TokenizationRecommendation.valueOf(map.req("recommendation")),
+        consumerIdentifier = map.opt("consumerIdentifier"),
+        bvn = map.opt("bvn"),
+        accountHolderAddress = map.opt("accountHolderAddress"),
+        mobileNumber = map.opt("mobileNumber"),
+        clientRequestId = map.opt("clientRequestId")?.takeIf { it.isNotBlank() },
+        accountNumberSource = map.opt("accountNumberSource")?.let { AccountNumberSource.valueOf(it) },
+        deviceScore = map.opt("deviceScore")?.let { TrustScore.valueOf(it) },
+        accountScore = map.opt("accountScore")?.let { TrustScore.valueOf(it) },
+        recommendationReasons = map.optStringList("recommendationReasons")
+            ?.map { TokenizationRecommendationReason.valueOf(it) },
+        bankName = map.opt("bankName"),
+    )
 
-    fun merchantRegistration(map: ReadableMap): Pair<String, MerchantRegistrationData> {
-        val type = map.req("merchantType")
-        return type to MerchantRegistrationData(
+    /** `MerchantRegistration`; a missing field or an unknown `merchantType` throws [IllegalArgumentException]. */
+    fun merchantRegistration(map: ReadableMap): MerchantRegistration {
+        val type = map.req("merchantType").let { raw ->
+            MerchantType.entries.firstOrNull { it.name == raw }
+                ?: throw IllegalArgumentException("merchantType must be PERSONAL or BUSINESS")
+        }
+        return MerchantRegistration(
+            merchantType = type,
             merchantName = map.req("merchantName"),
             emailAddress = map.req("emailAddress"),
             phoneNumber = map.req("phoneNumber"),
@@ -217,6 +245,69 @@ internal object Mappers {
             walletAccountId = map.opt("walletAccountId"),
         )
     }
+
+    /** `MerchantUpdate`; a missing required field throws [IllegalArgumentException]. */
+    fun merchantUpdate(map: ReadableMap): MerchantUpdate = MerchantUpdate(
+        merchantName = map.req("merchantName"),
+        emailAddress = map.req("emailAddress"),
+        phoneNumber = map.req("phoneNumber"),
+        addressLine1 = map.req("addressLine1"),
+        city = map.req("city"),
+        state = map.req("state"),
+        countryCode = map.req("countryCode"),
+        accountNumber = map.req("accountNumber"),
+        institutionCode = map.req("institutionCode"),
+        addressLine2 = map.opt("addressLine2") ?: "",
+        walletAccountId = map.opt("walletAccountId"),
+        bvn = map.opt("bvn"),
+    )
+
+    /**
+     * `TapRequest` from JS — a purchase. A missing amount throws [IllegalArgumentException]; a blank
+     * order id or a bad currency is passed through so the SDK refuses it with its own `NOT_SENT` /
+     * `INVALID_REQUEST` result.
+     */
+    fun tapRequest(map: ReadableMap): TapRequest {
+        if (!map.hasKey("amountMinorUnits") || map.isNull("amountMinorUnits")) {
+            throw IllegalArgumentException("amountMinorUnits is required")
+        }
+        return TapRequest(
+            amountMinorUnits = map.getDouble("amountMinorUnits").toLong(),
+            currency = map.opt("currency") ?: "566",
+            merchantOrderId = map.opt("merchantOrderId").orEmpty(),
+        )
+    }
+
+    /** The JS name of each [TapEvent] — the native spellings, the same on Android and iOS. */
+    fun tapEventType(event: TapEvent): String = when (event) {
+        TapEvent.CardDetected -> "cardDetected"
+        TapEvent.CardContactLost -> "cardContactLost"
+        TapEvent.UnsupportedCard -> "unsupportedCard"
+        TapEvent.CardReadingComplete -> "cardReadingComplete"
+        TapEvent.SendingRequestOnline -> "sendingRequestOnline"
+        TapEvent.ReceivingOnlineResponse -> "receivingOnlineResponse"
+        is TapEvent.Result -> "result"
+    }
+
+    /** A `softpos.tap.onEvent` payload. [into]/[resultInto] exist for tests. */
+    fun tapEvent(
+        sessionId: String,
+        event: TapEvent,
+        into: WritableMap = Arguments.createMap(),
+        resultInto: WritableMap? = null,
+    ): WritableMap = into.apply {
+        putString("type", tapEventType(event))
+        putString("sessionId", sessionId)
+        if (event is TapEvent.Result) putMap("result", tapResult(event.result, resultInto ?: Arguments.createMap()))
+    }
+
+    /** A `result` tap event carrying a result map the bridge built itself. */
+    fun tapEventResult(sessionId: String, result: WritableMap, into: WritableMap = Arguments.createMap()): WritableMap =
+        into.apply {
+            putString("type", "result")
+            putString("sessionId", sessionId)
+            putMap("result", result)
+        }
 
     // ── Writers ─────────────────────────────────────────────────────────────────
 
@@ -238,7 +329,7 @@ internal object Mappers {
     }
 
     /** `SettlementBankList` — the merchant's settlement banks, same rules as [bankList]. */
-    fun settlementBankList(r: NubanBankListResponse): WritableMap = Arguments.createMap().apply {
+    fun settlementBankList(r: SettlementBankList): WritableMap = Arguments.createMap().apply {
         putArray("banks", bankArray(r.banks.map { Triple(it.slug, it.name, it.institutionCode) }))
         putOutcome(r.responseStatus, r.responseStatusReason, r.message)
     }
@@ -247,7 +338,7 @@ internal object Mappers {
         putString("responseCode", r.responseCode)
         // What the call did, and why it decided that — carried verbatim.
         putOutcome(r.responseStatus, r.responseStatusReason, r.message)
-        putBoolean("isApproved", r.responseCode == "APPROVED" || r.responseCode == "APPROVE_REQUIRE_AUTH")
+        putBoolean("isApproved", r.isApproved)
     }
 
     fun activationCode(r: ActivationCodeResponse, into: WritableMap = Arguments.createMap()): WritableMap = into.apply {
@@ -256,6 +347,7 @@ internal object Mappers {
         putString("status", r.status)
         // Raw wire value: JS carries codes verbatim (unknown codes included).
         putString("failureCode", r.failureCodeRaw)
+        putString("failureCodeRaw", r.failureCodeRaw)
         putOutcome(r.responseStatus, r.responseStatusReason, r.message)
     }
 
@@ -264,8 +356,10 @@ internal object Mappers {
         putString("status", r.status)
         // Raw wire values: JS carries codes verbatim (unknown codes included).
         putString("failureCode", r.failureCodeRaw)
+        putString("failureCodeRaw", r.failureCodeRaw)
         r.attemptsRemaining?.let { putInt("attemptsRemaining", it) } ?: putNull("attemptsRemaining")
         putString("recommendDelete", r.recommendDeleteRaw)
+        putString("recommendDeleteRaw", r.recommendDeleteRaw)
         putOutcome(r.responseStatus, r.responseStatusReason, r.message)
     }
 
@@ -278,17 +372,18 @@ internal object Mappers {
         putOutcome(r.responseStatus, r.responseStatusReason, r.message)
     }
 
-    fun digitiseResult(r: TokenisationResponse): WritableMap = Arguments.createMap().apply {
+    fun digitiseResult(r: DigitiseResult): WritableMap = Arguments.createMap().apply {
         putString("responseCode", r.responseCode)
         // The cause is a field, not prose: `responseCode` is the issuer's decision,
         // `responseStatus` what the call did, and `responseStatusReason` why — carried verbatim so
         // a cause added after this build still reaches JS.
         putOutcome(r.responseStatus, r.responseStatusReason, r.message)
         putString("tokenUniqueReference", r.tokenUniqueReference)
-        putArray("activationMethods", activationMethods(r.activationMethods?.map { it.medium to it.contact }))
-        putBoolean("isApproved", r.isSuccess)
-        putBoolean("requiresActivation", !r.activationMethods.isNullOrEmpty())
-        putNull("tokenStored")
+        putArray("activationMethods", activationMethods(r.activationMethods.map { it.medium to it.contact }))
+        putBoolean("isApproved", r.isApproved)
+        putBoolean("requiresActivation", r.requiresActivation)
+        putBoolean("tokenStored", r.tokenStored)
+        putString("clientRequestId", r.clientRequestId)
     }
 
     private fun activationMethods(
@@ -304,24 +399,24 @@ internal object Mappers {
             }
         }
 
-    fun card(
+    /** JS `Token`. Every token read from the SDK carries its `tokenUniqueReference`. */
+    fun token(
         t: Token,
         into: WritableMap = Arguments.createMap(),
         methodsInto: WritableArray = Arguments.createArray(),
     ): WritableMap = into.apply {
-        putString("id", t.tokenId)
         putString("tokenUniqueReference", t.tokenUniqueReference)
-        putString("tokenId", t.tokenId)
-        putString("maskedPan", t.getMaskedPAN())
-        putString("panLastFour", t.getLastFourDigits())
+        putString("maskedPan", t.maskedPan)
+        putString("panLastFour", t.panLastFour)
         putString("cardHolderName", t.cardHolderName)
-        putString("expiry", t.expiryDate)
-        putNull("bankName")
+        putString("expiry", t.expiry)
+        putString("bankName", t.bankName)
         putString("cardScheme", t.cardScheme?.name)
-        // the stored lifecycle status (verbatim), so a greyed card can say why.
-        putString("status", t.statusRaw)
+        // the stored lifecycle status, so a greyed card can say why.
+        putString("status", t.status?.name)
         putBoolean("isActive", t.isActive)
-        putBoolean("requiresActivation", !t.activationMethods.isNullOrEmpty())
+        putBoolean("isSelected", t.isSelected)
+        putBoolean("requiresActivation", t.requiresActivation)
         putArray(
             "activationMethods",
             activationMethods(t.activationMethods?.map { it.medium to it.contact }, methodsInto)
@@ -336,23 +431,23 @@ internal object Mappers {
      */
     fun cancelResult(r: CancelResult): String = r.name
 
-    fun scanInspection(result: MpmScanResult, handle: String?, into: WritableMap = Arguments.createMap()): WritableMap =
+    fun scanInspection(result: ScanInspection, handle: String?, into: WritableMap = Arguments.createMap()): WritableMap =
         into.apply {
             when (result) {
-                is MpmScanResult.Verified -> {
-                    val c: VerifiedPaymentContext = result.context
+                is ScanInspection.Verified -> {
+                    val c: VerifiedPayment = result.context
                     putBoolean("verified", true)
                     putString("handle", handle)
                     putString("merchantName", c.merchantName)
                     putString("merchantCity", c.merchantCity)
-                    putString("amountDisplay", c.amount)
+                    putString("amountDisplay", c.amountDisplay)
                     putDouble("amountMinorUnits", c.amountMinorUnits.toDouble())
-                    putString("currencyNumeric", c.currencyNumeric)
-                    putDouble("expiresAtEpochSeconds", c.expiryEpochSeconds.toDouble())
+                    putString("currencyCode", c.currencyCode)
+                    putDouble("expiresAtEpochSeconds", c.expiresAtEpochSeconds.toDouble())
                     // What wallet.cancelPayment takes; null on a QR that carries none.
                     putString("merchantOrderId", c.merchantOrderId)
                 }
-                is MpmScanResult.Rejected -> {
+                is ScanInspection.Rejected -> {
                     putBoolean("verified", false)
                     putString("reason", result.reason.name)
                     putString("detail", result.detail)
@@ -360,7 +455,7 @@ internal object Mappers {
             }
         }
 
-    fun paymentOutcome(o: MpmPushOutcome, into: WritableMap = Arguments.createMap()): WritableMap = into.apply {
+    fun paymentOutcome(o: PaymentOutcome, into: WritableMap = Arguments.createMap()): WritableMap = into.apply {
         // `approved` is the SDK's reading of the status, never of the code.
         putBoolean("approved", o.approved)
         putString("responseCode", o.responseCode)
@@ -372,11 +467,11 @@ internal object Mappers {
     }
 
     /** `PaymentQr` — a QR to render on `APPROVED`, or the reason none was made (no payload). */
-    fun paymentQr(qr: CpmPaymentQr, into: WritableMap = Arguments.createMap()): WritableMap = into.apply {
+    fun paymentQr(qr: PaymentQr, into: WritableMap = Arguments.createMap()): WritableMap = into.apply {
         putString("tokenUniqueReference", qr.tokenUniqueReference)
         putString("payload", qr.payload)
         putDouble("amountMinorUnits", qr.amountMinorUnits.toDouble())
-        putString("currencyNumeric", qr.currencyNumeric)
+        putString("currencyCode", qr.currencyCode)
         putDouble("expiresAtEpochMillis", qr.expiresAtEpochMillis.toDouble())
         putString("transactionHash", qr.transactionHash)
         putOutcome(qr.responseStatus, qr.responseStatusReason, qr.message)
@@ -392,12 +487,12 @@ internal object Mappers {
         if (value != null) putMap("value", value) else putNull("value")
         putString("failureReason", failureReason)
         putString("message", message)
+        putBoolean("checked", failureReason == null)
     }
 
-    /** `VeyraLookup<TransactionSummary>` — a wallet status or credit check. */
     /** `VeyraLookup<OrderPaymentStatus>` — the lookup by merchant order id. [into]/[make] exist for tests. */
     fun orderPaymentLookup(
-        r: co.veyra.softpos.payment.sdk.merchant.OrderPaymentLookup,
+        r: VeyraLookup<co.veyra.softpos.payment.sdk.merchant.OrderPaymentStatus>,
         into: WritableMap = Arguments.createMap(),
         make: () -> WritableMap = { Arguments.createMap() },
         makeArray: () -> com.facebook.react.bridge.WritableArray = { Arguments.createArray() },
@@ -415,14 +510,14 @@ internal object Mappers {
         putString("responseCode", o.responseCode)
         putString("merchantTransactionReference", o.merchantTransactionReference)
         putString("transactionId", o.transactionId)
-        o.amount?.let { putDouble("amountMinorUnits", it.toDouble()) } ?: putNull("amountMinorUnits")
+        o.amountMinorUnits?.let { putDouble("amountMinorUnits", it.toDouble()) } ?: putNull("amountMinorUnits")
         putString("answeredBy", o.answeredBy)
         putArray("attempts", makeArray().apply {
             o.attempts.forEach { a ->
                 pushMap(make().apply {
                     putString("merchantTransactionReference", a.merchantTransactionReference)
                     putString("transactionId", a.transactionId)
-                    a.amount?.let { putDouble("amountMinorUnits", it.toDouble()) } ?: putNull("amountMinorUnits")
+                    a.amountMinorUnits?.let { putDouble("amountMinorUnits", it.toDouble()) } ?: putNull("amountMinorUnits")
                     putString("responseCode", a.responseCode)
                     putString("responseStatus", a.responseStatus)
                     putString("responseStatusReason", a.responseStatusReason)
@@ -431,20 +526,71 @@ internal object Mappers {
         })
     }
 
-    fun transactionLookup(r: TransactionRefresh): WritableMap =
-        lookup(r.transaction?.let { transactionSummary(it) }, r.failureReason, r.message)
+    /** `VeyraLookup<TransactionSummary>` — a wallet status or credit check. */
+    fun transactionLookup(r: VeyraLookup<TransactionSummary>): WritableMap =
+        lookup(r.value?.let { transactionSummary(it) }, r.failureReason, r.message)
+
+    /** `VeyraLookup<TransactionStatus[]>` — the gateway's raw record of one transaction. [into]/[make] exist for tests. */
+    fun transactionStatusLookup(
+        r: VeyraLookup<List<co.veyra.softpos.payment.sdk.merchant.TransactionStatus>>,
+        into: WritableMap = Arguments.createMap(),
+        make: () -> WritableMap = { Arguments.createMap() },
+        makeArray: () -> WritableArray = { Arguments.createArray() },
+    ): WritableMap = into.apply {
+        val items = r.value
+        if (items == null) putNull("value") else putArray("value", makeArray().apply {
+            items.forEach { i ->
+                pushMap(make().apply {
+                    putString("merchantTransactionReference", i.merchantTransactionReference)
+                    putString("merchantId", i.merchantId)
+                    i.amountMinorUnits?.let { putDouble("amountMinorUnits", it.toDouble()) } ?: putNull("amountMinorUnits")
+                    putString("responseCode", i.responseCode)
+                    putString("responseStatus", i.responseStatus)
+                    putString("responseStatusReason", i.responseStatusReason)
+                    putString("merchantStatus", i.merchantStatus)
+                    putString("transactionId", i.transactionId)
+                    putString("creditTransactionId", i.creditTransactionId)
+                    i.isCreditConfirmationSupported?.let { putBoolean("isCreditConfirmationSupported", it) }
+                        ?: putNull("isCreditConfirmationSupported")
+                })
+            }
+        })
+        putString("failureReason", r.failureReason)
+        putString("message", r.message)
+        putBoolean("checked", r.checked)
+    }
+
+    /** `VeyraLookup<CreditConfirmationEvent>` — the merchant bank's raw answer for one sale. [into]/[valueInto] exist for tests. */
+    fun creditConfirmationLookup(
+        r: VeyraLookup<co.veyra.common.credit.CreditConfirmation>,
+        into: WritableMap = Arguments.createMap(),
+        valueInto: WritableMap? = null,
+    ): WritableMap = lookup(
+        r.value?.let { c ->
+            (valueInto ?: Arguments.createMap()).apply {
+                putString("creditTransactionId", c.creditTransactionId)
+                putString("status", c.status)
+                c.amountMinorUnits?.let { putDouble("amountMinorUnits", it.toDouble()) } ?: putNull("amountMinorUnits")
+                putString("creditedAt", c.creditedAt)
+                putString("bankReference", c.bankReference)
+                putString("message", c.message)
+            }
+        },
+        r.failureReason, r.message, into,
+    )
 
     /** `VeyraLookup<MerchantTransaction>` — a merchant status or credit check. */
-    fun merchantTransactionLookup(r: TransactionRefreshResult): WritableMap =
-        lookup(r.transaction?.let { merchantTransaction(it) }, r.failureReason, r.message)
+    fun merchantTransactionLookup(r: VeyraLookup<MerchantTransaction>): WritableMap =
+        lookup(r.value?.let { merchantTransaction(it) }, r.failureReason, r.message)
 
     fun transactionSummary(s: TransactionSummary): WritableMap = Arguments.createMap().apply {
         putString("merchantName", s.merchantName)
         // `putDouble`, like every other minor-unit field on this bridge — the summary's amount is a
         // Long and `putInt` cannot carry one. A JS number holds it exactly up to 2^53, far above
         // any amount this rail can see.
-        putDouble("amountMinorUnits", s.amountInMinorUnit.toDouble())
-        putString("transactionCurrencyCode", s.transactionCurrencyCode)
+        putDouble("amountMinorUnits", s.amountMinorUnits.toDouble())
+        putString("currencyCode", s.currencyCode)
+        putString("tokenUniqueReference", s.tokenUniqueReference)
         putString("transactionHash", s.transactionHash)
         putString("authorizationStatus", s.authorizationStatus)
         // the outcome's code and stated cause, verbatim, for the detail view.
@@ -470,8 +616,8 @@ internal object Mappers {
         putString("merchantOrderId", s.merchantOrderId)
     }
 
-    /** `CardSelection` — `APPROVED`, or `FAILED` / `CARD_NOT_FOUND` · `CARD_DATA_MISSING`. */
-    fun cardSelection(r: co.veyra.wallet.sdk.CardSelection, into: WritableMap = Arguments.createMap()): WritableMap =
+    /** `TokenSelection` — `APPROVED`, or `FAILED` / `CARD_NOT_FOUND` · `CARD_DATA_MISSING`. */
+    fun cardSelection(r: co.veyra.wallet.sdk.TokenSelection, into: WritableMap = Arguments.createMap()): WritableMap =
         into.apply { putOutcome(r.responseStatus, r.responseStatusReason, r.message) }
 
     /** `ReconcileResult` — `failureReason` only when the reconcile itself could not run. */
@@ -484,7 +630,7 @@ internal object Mappers {
 
     /** `ReceiptScan` — `APPROVED` with `receipt`, or `FAILED` with the reason and no receipt. */
     fun receiptScan(
-        r: co.veyra.wallet.sdk.ReceiptScanResult,
+        r: co.veyra.wallet.sdk.ReceiptScan,
         into: WritableMap = Arguments.createMap(),
         receiptInto: (TransactionReceipt) -> WritableMap = ::receipt,
     ): WritableMap = into.apply {
@@ -500,9 +646,9 @@ internal object Mappers {
         putString("transactionType", r.transactionType)
         putString("transactionStatus", r.transactionStatus)
         putString("transactionTime", r.transactionTime)
-        putString("totalAmountMinorUnits", r.totalAmount)
+        putDouble("totalAmountMinorUnits", r.totalAmountMinorUnits.toDouble())
         putString("totalAmountFormatted", r.totalAmountFormatted)
-        putString("currency", r.currency)
+        putString("currencyCode", r.currencyCode)
         putString("maskedToken", r.maskedToken)
         putString("merchantTransactionReference", r.merchantTransactionReference)
         r.cdcvmApprovedByWallet?.let { putBoolean("cdcvmApprovedByWallet", it) }
@@ -511,7 +657,7 @@ internal object Mappers {
         putString("transactionHash", r.transactionHash)
     }
 
-    fun merchantRegistrationResult(r: MerchantRegistrationResponse, into: WritableMap = Arguments.createMap()): WritableMap =
+    fun merchantRegistrationResult(r: MerchantRegistrationResult, into: WritableMap = Arguments.createMap()): WritableMap =
         into.apply {
             putBoolean("success", r.success)
             putString("merchantId", r.merchantId)
@@ -534,13 +680,10 @@ internal object Mappers {
         putOutcome(responseStatus, responseStatusReason, message)
     }
 
-    fun merchantStatus(r: co.veyra.softpos.payment.sdk.merchant.MerchantStatusResponse): WritableMap =
+    fun merchantStatus(r: co.veyra.softpos.payment.sdk.merchant.MerchantStatusResult): WritableMap =
         merchantStatus(r.merchantId, r.merchantStatus, r.responseStatus, r.responseStatusReason, r.message)
 
-    fun merchantStatus(r: co.veyra.softpos.payment.sdk.merchant.MerchantUpdateResponse): WritableMap =
-        merchantStatus(r.merchantId, r.merchantStatus, r.responseStatus, r.responseStatusReason, r.message)
-
-    fun storedMerchant(m: StoredMerchantData): WritableMap = Arguments.createMap().apply {
+    fun storedMerchant(m: StoredMerchant): WritableMap = Arguments.createMap().apply {
         putString("merchantId", m.merchantId)
         putString("merchantType", m.merchantType)
         putString("merchantName", m.merchantName)
@@ -558,6 +701,8 @@ internal object Mappers {
         putString("terminalId", m.terminalId)
         putString("merchantStatus", m.merchantStatus)
         putString("walletAccountId", m.walletAccountId)
+        putString("bvn", m.bvn)
+        putString("cacNumber", m.cacNumber)
     }
 
     /**
@@ -568,7 +713,7 @@ internal object Mappers {
         putString("responseCode", o.responseCode)
         putString("responseStatus", o.responseStatus)
         putString("responseStatusReason", o.responseStatusReason)
-        o.amount?.let { putDouble("amountMinorUnits", it.toDouble()) } ?: putNull("amountMinorUnits")
+        o.amountMinorUnits?.let { putDouble("amountMinorUnits", it.toDouble()) } ?: putNull("amountMinorUnits")
         putString("merchantTransactionReference", o.merchantTransactionReference)
         putString("transactionId", o.transactionId)
     }
@@ -581,7 +726,7 @@ internal object Mappers {
 
     // [into] exists for tests: Arguments.createMap() needs the native bridge, JavaOnlyMap doesn't.
     fun tapResult(
-        r: SoftposTransactionResponse,
+        r: TapResult,
         into: WritableMap = Arguments.createMap(),
         originalInto: WritableMap? = null,
     ): WritableMap = into.apply {
@@ -590,11 +735,9 @@ internal object Mappers {
         // recognise as FAILED, so `09`/`68`/`96` (still settling) and `25` (no record) all surfaced to
         // React Native as failures. `"99"` is retired: pending is said by `status` now.
         // A NOT_SENT tap never went on the wire, so it has no code.
-        putString("responseCode", r.transactionCode.takeIf { it.isNotEmpty() })
-        putOutcome(r.responseStatus?.name, r.responseStatusReason, r.message)
-        // Deprecated alias of responseStatus, kept for one release.
-        putString("status", r.responseStatus?.name)
-        putString("amountDisplay", r.amount)
+        putString("responseCode", r.responseCode?.takeIf { it.isNotEmpty() })
+        putOutcome(r.responseStatus, r.responseStatusReason, r.message)
+        r.amountMinorUnits?.let { putDouble("amountMinorUnits", it.toDouble()) } ?: putNull("amountMinorUnits")
         putString("cardScheme", r.cardScheme)
         putString("maskedTokenLast4", r.maskedTokenLast4)
         putString("merchantTransactionReference", r.merchantTransactionReference)
@@ -615,12 +758,12 @@ internal object Mappers {
         notSent(
             reason, message,
             nullKeys = listOf(
-                "responseCode", "amountDisplay", "cardScheme", "maskedTokenLast4", "merchantTransactionReference",
+                "responseCode", "amountMinorUnits", "cardScheme", "maskedTokenLast4", "merchantTransactionReference",
                 "transactionId", "merchantStatus", "creditTransactionId", "isCreditConfirmationSupported",
                 "originalPayment",
             ),
             into = into,
-        ).apply { putString("status", co.veyra.common.outcome.OutcomeStatus.NOT_SENT) }
+        )
 
     /**
      * The `VeyraTransactionResolvedEvent` payload. Extracted from the module's
@@ -644,10 +787,10 @@ internal object Mappers {
     }
 
     fun transactionResolved(
-        r: co.veyra.softpos.payment.sdk.merchant.TransactionResolution,
+        r: co.veyra.softpos.payment.sdk.merchant.TransactionResolvedEvent,
         into: WritableMap = Arguments.createMap(),
     ): WritableMap = into.apply {
-        putString("merchantTransactionReference", r.reference)
+        putString("merchantTransactionReference", r.merchantTransactionReference)
         putString("responseCode", r.responseCode)
         putString("status", r.status)
         putString("reason", r.reason)
@@ -659,10 +802,10 @@ internal object Mappers {
      * and a minor-unit amount is far inside the double's exact-integer range.
      */
     fun creditConfirmation(
-        c: co.veyra.softpos.payment.sdk.merchant.CreditConfirmation,
+        c: co.veyra.softpos.payment.sdk.merchant.CreditConfirmationEvent,
         into: WritableMap = Arguments.createMap(),
     ): WritableMap = into.apply {
-        putString("merchantTransactionReference", c.reference)
+        putString("merchantTransactionReference", c.merchantTransactionReference)
         putString("creditTransactionId", c.creditTransactionId)
         putString("status", c.status)
         c.amountMinorUnits?.let { putDouble("amountMinorUnits", it.toDouble()) }
@@ -681,14 +824,14 @@ internal object Mappers {
      * it. `rawStatus` is what to log — for an unrecognised status it is the only identifying value.
      */
     fun tokenStatusChanged(
-        c: co.veyra.wallet.sdk.api.TokenStatusChange,
+        c: co.veyra.wallet.sdk.api.TokenStatusChangedEvent,
         into: WritableMap = Arguments.createMap(),
     ): WritableMap = into.apply {
         putString("tokenUniqueReference", c.tokenUniqueReference)
         putString("status", c.status.value)
         putString("rawStatus", c.rawStatus)
         putBoolean("canPay", c.canPay)
-        putString("previousStatus", c.previousRawStatus)
+        putString("previousStatus", c.previousStatus)
     }
 
     /**
@@ -701,7 +844,7 @@ internal object Mappers {
      * `amountMinorUnits` crosses as a JS number (see [creditConfirmation]).
      */
     fun walletTransactionResolved(
-        r: co.veyra.wallet.sdk.api.WalletTransactionResolution,
+        r: co.veyra.wallet.sdk.api.WalletTransactionResolvedEvent,
         into: WritableMap = Arguments.createMap(),
     ): WritableMap = into.apply {
         putString("transactionHash", r.transactionHash)
@@ -709,16 +852,16 @@ internal object Mappers {
         putString("status", r.status)
         putString("responseCode", r.responseCode)
         putString("reason", r.reason)
-        putDouble("amountMinorUnits", r.amountInMinorUnit.toDouble())
+        putDouble("amountMinorUnits", r.amountMinorUnits.toDouble())
         putString("merchantName", r.merchantName)
     }
 
     /**
-     * The `VeyraCardKeyStateEvent` payload — a card ran out of payment keys,
+     * The `VeyraTokenKeyStateEvent` payload — a card ran out of payment keys,
      * or got them back. `requiresOnline` is the same value `StoredCard.requiresOnline` carries.
      */
-    fun cardKeyState(
-        s: co.veyra.wallet.sdk.api.CardKeyState,
+    fun tokenKeyState(
+        s: co.veyra.wallet.sdk.api.TokenKeyStateEvent,
         into: WritableMap = Arguments.createMap(),
     ): WritableMap = into.apply {
         putString("tokenUniqueReference", s.tokenUniqueReference)
@@ -732,7 +875,7 @@ internal object Mappers {
      * so JS never has to re-derive a gate the SDK already owns.
      */
     fun merchantStatusChanged(
-        c: co.veyra.softpos.payment.sdk.merchant.MerchantStatusChange,
+        c: co.veyra.softpos.payment.sdk.merchant.MerchantStatusEvent,
         into: WritableMap = Arguments.createMap(),
     ): WritableMap = into.apply {
         putString("merchantId", c.merchantId)
@@ -743,7 +886,7 @@ internal object Mappers {
 
     /** `PaymentContextQr` — `txRef` / `mpmPayload` only on `APPROVED`; otherwise the reason. */
     fun paymentContextQr(
-        c: CreatedPaymentContext,
+        c: PaymentContextQr,
         into: WritableMap = Arguments.createMap(),
         originalInto: WritableMap? = null,
     ): WritableMap = into.apply {
@@ -754,17 +897,12 @@ internal object Mappers {
         putOriginalPayment(c.originalPayment, originalInto)
     }
 
-    /** `PaymentContextQr` refused before anything was sent. */
-    fun paymentContextQrNotSent(reason: String, message: String, into: WritableMap = Arguments.createMap()) =
-        notSent(reason, message, nullKeys = listOf("txRef", "mpmPayload", "expiry", "originalPayment"), into = into,
-            operation = Ops.MPM_CONTEXT)
-
     /**
      * `CustomerQrInspection` — `qr` (display fields + the opaque [handle]) on `APPROVED`, else
      * `NOT_SENT` / `INVALID_REQUEST` and no `qr`. The card data stays native behind the handle.
      */
     fun customerQrInspection(
-        i: CpmInspection,
+        i: CustomerQrInspection,
         handle: String?,
         into: WritableMap = Arguments.createMap(),
         qrInto: WritableMap = Arguments.createMap(),
@@ -773,9 +911,9 @@ internal object Mappers {
         if (scanned != null && handle != null) {
             putMap("qr", qrInto.apply {
                 putString("handle", handle)
-                putString("maskedCard", "•••• " + scanned.dpan.takeLast(4))
+                putString("maskedCard", scanned.maskedCard)
                 putDouble("amountMinorUnits", scanned.amountMinorUnits.toDouble())
-                putString("currencyNumeric", scanned.currencyNumeric4)
+                putString("currencyCode", scanned.currencyCode)
                 putString("cardholderName", scanned.cardholderName)
             })
         } else putNull("qr")
@@ -787,13 +925,13 @@ internal object Mappers {
      * worked out from the code: a `00` with any other status is not an approval.
      */
     fun customerQrCharge(
-        r: PaymentResponse,
+        r: co.veyra.softpos.payment.sdk.cpm.CustomerQrChargeOutcome,
         into: WritableMap = Arguments.createMap(),
         originalInto: WritableMap? = null,
     ): WritableMap = into.apply {
-        putBoolean("approved", r.responseStatus?.name == OutcomeStatus.APPROVED)
+        putBoolean("approved", r.approved)
         putString("responseCode", r.responseCode)
-        putOutcome(r.responseStatus?.name, r.responseStatusReason, r.message)
+        putOutcome(r.responseStatus, r.responseStatusReason, r.message)
         putString("transactionId", r.transactionId)
         // the MINTED reference, from the gateway's echo — not a value the caller supplied, so every
         // receipt lookup and status poll built on it finds the stored payment.
@@ -817,13 +955,13 @@ internal object Mappers {
     }
 
     // [into] exists for tests: Arguments.createMap() needs the native bridge, JavaOnlyMap doesn't.
-    fun merchantTransaction(t: TransactionInfo, into: WritableMap = Arguments.createMap()): WritableMap = into.apply {
+    fun merchantTransaction(t: MerchantTransaction, into: WritableMap = Arguments.createMap()): WritableMap = into.apply {
         putString("merchantTransactionReference", t.merchantTransactionReference)
         // the app's own order id, from the stored row — so a transaction detail or history
         // screen can show it, not just the screen that took the payment.
         putString("merchantOrderId", t.merchantOrderId)
-        putDouble("amountMinorUnits", t.amount.toDouble())
-        putString("status", t.transactionStatus.name)
+        putDouble("amountMinorUnits", t.amountMinorUnits.toDouble())
+        putString("status", t.status)
         putString("responseCode", t.responseCode)
         // the outcome's stated cause, verbatim, for the detail view.
         putString("responseStatusReason", t.responseStatusReason)
@@ -832,7 +970,7 @@ internal object Mappers {
         putString("transactionId", t.transactionId)
         putString("rail", t.rail)
         putString("railLabel", t.railLabel)
-        // Android's TransactionInfo carries neither — the iOS record does (see the Swift bridge).
+        // Android's MerchantTransaction carries neither — the iOS record does (see the Swift bridge).
         putNull("maskedTokenLast4")
         putNull("transactionHash")
         putString("cardholderName", t.cardholderName)
@@ -845,11 +983,11 @@ internal object Mappers {
         putString("creditConfirmationStatus", t.creditConfirmationStatus)
     }
 
-    fun merchantReceipt(r: TransactionReceiptResult): WritableMap = Arguments.createMap().apply {
+    fun merchantReceipt(r: MerchantReceipt): WritableMap = Arguments.createMap().apply {
         putString("merchantName", r.merchantName)
         putString("merchantAddress", r.merchantAddress)
         putString("transactionType", r.transactionType)
-        putDouble("totalAmountMinorUnits", r.totalAmount.toDouble())
+        putDouble("totalAmountMinorUnits", r.totalAmountMinorUnits.toDouble())
         putString("totalAmountFormatted", r.totalAmountFormatted)
         putString("maskedToken", r.maskedToken)
         putString("merchantTransactionReference", r.merchantTransactionReference)
@@ -858,4 +996,17 @@ internal object Mappers {
         putNull("qrPayload")
         putString("cardholderName", r.cardholderName)
     }
+
+    /** `WalletPaymentRefusal` — one payload for the three refusals; [into] exists for tests. */
+    fun paymentRefusal(r: co.veyra.wallet.sdk.WalletPaymentRefusal, into: WritableMap = Arguments.createMap()): WritableMap =
+        into.apply {
+            putString("type", r.type)
+            putString("tokenUniqueReference", r.tokenUniqueReference)
+            putDouble("amountMinorUnits", r.amountMinorUnits.toDouble())
+            if (r.type == co.veyra.wallet.sdk.WalletPaymentRefusal.AMOUNT_EXCEED_CARD_LIMIT) {
+                r.cardLimitMinorUnits?.let { putDouble("cardLimitMinorUnits", it.toDouble()) } ?: putNull("cardLimitMinorUnits")
+            }
+            putString("rail", r.rail)
+            putString("message", r.message)
+        }
 }

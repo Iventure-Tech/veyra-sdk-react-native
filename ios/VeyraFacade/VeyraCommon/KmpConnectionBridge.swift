@@ -6,6 +6,22 @@ import VeyraKMP
 @_spi(VeyraInternal)
 public enum KmpConnectionBridge {
 
+    /// `requestTimeoutSeconds` as the KMP core takes it, or the problem naming the value and the
+    /// allowed range. The range itself is the shared rule's, so every platform refuses the same values.
+    public static func kmpRequestTimeout(_ seconds: Int?) -> Result<KotlinInt?, VeyraConnectionConfigError> {
+        guard let seconds else { return .success(nil) }
+        // A value that does not fit an Int32 is out of range by definition; ask the shared rule
+        // with a sentinel so the message still quotes the app's own value.
+        let boxed = KotlinInt(int: Int32(clamping: seconds))
+        if let problem = IosConnections.shared.requestTimeoutProblem(requestTimeoutSeconds: boxed) {
+            let message = Int32(exactly: seconds) == nil
+                ? problem.replacingOccurrences(of: "(was \(boxed.int32Value))", with: "(was \(seconds))")
+                : problem
+            return .failure(VeyraConnectionConfigError(message: message))
+        }
+        return .success(boxed)
+    }
+
     /// The KMP provider for `provider`, or the problem naming it. The method comes from
     /// `providerType`; the protocol actually conformed to must agree, and only one may be.
     public static func kmpProvider(_ provider: any VeyraProvider) -> Result<KmpVeyraProvider, VeyraConnectionConfigError> {

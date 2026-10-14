@@ -70,10 +70,12 @@ export interface VeyraLookup<T> {
   failureReason: string | null;
   /** A human-readable description of the failure, for logs and error text. */
   message: string | null;
+  /** `true` when the check was made and answered (`failureReason` is `null`). */
+  checked: boolean;
 }
 
 /**
- * The answer to a cancel — `merchant.cancelPayment`, `wallet.cancelPayment`, `wallet.cancelDigitise`.
+ * The answer to a cancel — `softpos.cancelPayment`, `wallet.cancelPayment`, `wallet.cancelDigitise`.
  * It is the reply to the **cancel**, never the call's status: the cancelled call still resolves (or,
  * for a tap, ends its event stream) with its own outcome.
  *
@@ -184,6 +186,14 @@ export interface VeyraSoftposConfig {
   paymentAppProviderId: string;
   /** Android only. Defaults to true. */
   enableNfc?: boolean;
+  /**
+   * The longest the SDK waits for one backend call, start to finish, in whole seconds (5–60).
+   * Omit it to keep the SDK's own timeouts. A value outside 5–60 makes `initialize` reject with
+   * `INVALID_CONFIGURATION`. A payment that runs out of time is **pending**, not failed: the
+   * request may have reached the server, so the SDK checks the result later. A shorter timeout
+   * answers sooner but leaves more payments pending.
+   */
+  requestTimeoutSeconds?: number;
 }
 
 export interface VeyraWalletConfig {
@@ -203,18 +213,32 @@ export interface VeyraWalletConfig {
   allowedMerchantIds?: string[];
   /** Android only. Defaults to true. */
   enableNfc?: boolean;
+  /**
+   * Whether the payment authentication sheet offers the device passcode as well as biometrics.
+   * Defaults to `true`.
+   */
+  cdcvmAllowDeviceCredential?: boolean;
+  /** The authentication sheet's title and subtitle for a scan-to-pay; the SDK's own wording when omitted. */
+  cdcvmPayTitle?: string;
+  cdcvmPaySubtitle?: string;
+  /** The authentication sheet's title and subtitle for showing a QR to pay; the SDK's own wording when omitted. */
+  cdcvmShowQrTitle?: string;
+  cdcvmShowQrSubtitle?: string;
+  /**
+   * The longest the SDK waits for one backend call, start to finish, in whole seconds (5–60).
+   * Omit it to keep the SDK's own timeouts. A value outside 5–60 makes `initialize` reject with
+   * `INVALID_CONFIGURATION`. A payment that runs out of time is **pending**, not failed: the
+   * request may have reached the server, so the SDK checks the result later. A shorter timeout
+   * answers sooner but leaves more payments pending.
+   */
+  requestTimeoutSeconds?: number;
 }
 
-export interface VeyraConfig {
-  /**
-   * The customer your app has signed in. Required on every launch: the SDKs keep cards,
-   * merchant and history per customer and never remember who is signed in. The wallet sends
-   * it to Veyra on its card requests (add card, eligibility, activation) so support can find
-   * them; SoftPOS never sends it. Device logs only ever show it masked.
-   */
-  customerId: string;
-  /** How both SDKs reach Veyra — one provider, required. See {@link VeyraProvider}. */
-  provider: VeyraProvider;
+/**
+ * The two SDKs' settings for {@link Veyra.initialize} — `Veyra.initialize(customerId, config, provider)`,
+ * the same order as Android `VeyraSdk.initialize` and iOS `VeyraSDK.configure`.
+ */
+export interface VeyraSdkConfig {
   softpos: VeyraSoftposConfig;
   wallet: VeyraWalletConfig;
 }
@@ -314,12 +338,13 @@ export interface VerifyAccountResponse {
    * about the account) or `'NOT_SENT'` (it never reached Veyra — `responseStatusReason` says why,
    * e.g. `INVALID_REQUEST` for a missing argument). A read, so never `'PENDING'`.
    */
-  responseStatus: ResponseStatus | null;
+  responseStatus: ResponseStatus;
   /**
    * **Why** — the symbolic cause, and the field to branch on. Same vocabulary as
    * {@link DigitiseResult.responseStatusReason}.
    */
   responseStatusReason: string | null;
+  /** `true` when the account can be tokenised — `responseStatus` is `'APPROVED'`. */
   isApproved: boolean;
 }
 
@@ -340,6 +365,11 @@ export interface DigitiseParams {
   recommendation: TokenizationRecommendation;
   /** Required on Android; optional on iOS. */
   consumerIdentifier?: string;
+  /**
+   * The account holder's BVN. Optional when your payment app provider is registered as the account
+   * issuer; otherwise the backend refuses with `'BVN_REQUIRED'` (`responseStatusReason`). Blank is
+   * sent as absent.
+   */
   bvn?: string;
   accountHolderAddress?: string;
   mobileNumber?: string;
@@ -380,15 +410,16 @@ export interface DigitiseResult {
    * (`NO_RESPONSE_RECEIVED` / `UPSTREAM_ERROR`), never `'PENDING'` — digitise again. Carried
    * verbatim — a value this SDK has never heard of still reaches you.
    */
-  responseStatus: ResponseStatus | null;
+  responseStatus: ResponseStatus;
   /**
    * **Why** — the symbolic cause, and the field to branch on.
    *
    * Carries the issuer's own cause verbatim (`'ACCOUNT_NAME_MISMATCH'`, `'BVN_MISMATCH'`,
    * `'ACCOUNT_NOT_LINKED_TO_BVN'`, `'ACCOUNT_ADDRESS_MISMATCH'`, `'ACCOUNT_BLOCKED'`,
    * `'MAX_ACTIVE_TOKENS_EXCEEDED'`, `'RISK_SCORE_BELOW_THRESHOLD'`, …), the token provider's when
-   * it decided this itself (`'INVALID_ACCOUNT_NUMBER'`, `'UNKNOWN_ISSUER'`, …), or an API failure
-   * on a `'FAILED'` call.
+   * it decided this itself (`'INVALID_ACCOUNT_NUMBER'`, `'UNKNOWN_ISSUER'`, `'BVN_REQUIRED'` — no
+   * `bvn` and your payment app provider is not registered as the account issuer, …), or an API
+   * failure on a `'FAILED'` call.
    *
    * **Present on `'APPROVE_REQUIRE_AUTH'` too**, which is the case worth handling: it says why
    * step-up is required — usually an identity mismatch — so your activation screen can say
@@ -405,6 +436,13 @@ export interface DigitiseResult {
   requiresActivation: boolean;
   /** iOS only. */
   tokenStored: boolean | null;
+  /**
+   * The `clientRequestId` this digitise was sent with — yours, or the one the SDK generated. Keep it
+   * when the result is `'FAILED'` with `NO_RESPONSE_RECEIVED` or `UPSTREAM_ERROR`: the token provider
+   * may have created a token whose details never reached the phone, and
+   * {@link WalletApi.deactivateDigitise} switches it off. Then digitise again with a new id.
+   */
+  clientRequestId: string | null;
 }
 
 // ── Wallet: activation ────────────────────────────────────────────────────────
@@ -441,8 +479,10 @@ export interface ActivationCodeResponse {
   message: string | null;
   /** Why the request failed — e.g. disable "resend" on CODE_REQUEST_RATE_LIMITED, end the flow on ACTIVATION_LOCKED. */
   failureCode: ActivationFailureCode | null;
+  /** The failure code exactly as the backend sent it — quote it in logs and support. */
+  failureCodeRaw: string | null;
   /** What the call did — `'NOT_SENT'` when it never reached Veyra (`responseStatusReason` says why). */
-  responseStatus: ResponseStatus | null;
+  responseStatus: ResponseStatus;
   responseStatusReason: string | null;
 }
 
@@ -452,12 +492,16 @@ export interface ActivateResponse {
   message: string | null;
   /** Why activation failed — branch on this, never on `message`. */
   failureCode: ActivationFailureCode | null;
+  /** The failure code exactly as the backend sent it — quote it in logs and support. */
+  failureCodeRaw: string | null;
   /** Code attempts left in this cycle, where an attempt cap applies (0 when exhausted/locked). */
   attemptsRemaining: number | null;
   /** Delete recommendation after an exhausted cycle. */
   recommendDelete: RecommendDelete | null;
+  /** The delete recommendation exactly as the backend sent it. */
+  recommendDeleteRaw: string | null;
   /** What the call did — `'NOT_SENT'` when it never reached Veyra (`responseStatusReason` says why). */
-  responseStatus: ResponseStatus | null;
+  responseStatus: ResponseStatus;
   responseStatusReason: string | null;
 }
 
@@ -473,7 +517,7 @@ export interface TokenStatusUpdateResponse {
    * What the call did: `'APPROVED'` (done), `'FAILED'`, `'PENDING'` (sent, no usable answer — check
    * `tokenStatus` before trying again) or `'NOT_SENT'` (never reached Veyra).
    */
-  responseStatus: ResponseStatus | null;
+  responseStatus: ResponseStatus;
   responseStatusReason: string | null;
 }
 
@@ -483,20 +527,15 @@ export interface TokenStatusUpdateResponse {
  * reaches you), or `'FAILED'` / `'NOT_SENT'` with `responseStatusReason` and no status. Never `'PENDING'`.
  */
 export interface TokenStatusResult {
-  tokenStatus: CardStatus | string | null;
+  tokenStatus: TokenStatus | string | null;
   responseStatus: ResponseStatus;
   responseStatusReason: string | null;
   message: string | null;
 }
 
-export type ActivationEvent =
-  | { tokenUniqueReference: string; event: 'activated' }
-  | { tokenUniqueReference: string; event: 'timeout' }
-  | { tokenUniqueReference: string; event: 'error'; message: string };
-
 // ── Wallet: cards ─────────────────────────────────────────────────────────────
 
-export type CardStatus =
+export type TokenStatus =
   | 'ACTIVE'
   | 'SUSPENDED'
   | 'EXPIRED'
@@ -512,16 +551,13 @@ export type CardScheme =
   | 'UNKNOWN';
 
 /**
- * A stored card. Union-superset of the two platforms' card DTOs: `tokenId` is the
- * Android identity, `tokenUniqueReference` the cross-platform one — pass `id` (always
- * populated) back into card APIs and the SDK resolves it per platform.
+ * A stored token (a card added to this wallet). Union-superset of the two platforms' token DTOs.
+ * `tokenUniqueReference` is the identity every wallet call takes — `setActiveToken`, `getToken`,
+ * `tokenStatus`, `getTransactions` and the rest.
  */
-export interface Card {
-  /** Stable identifier to pass back into card APIs (platform-appropriate). */
-  id: string;
-  tokenUniqueReference: string | null;
-  /** Android only. */
-  tokenId: string | null;
+export interface Token {
+  /** The token's identity — pass it back into every wallet call. */
+  tokenUniqueReference: string;
   maskedPan: string;
   panLastFour: string;
   /**
@@ -536,8 +572,12 @@ export interface Card {
   bankName: string | null;
   /** Android only. */
   cardScheme: CardScheme | null;
-  status: CardStatus | string | null;
+  /** The token's lifecycle status as the SDK last saw it; `null` when it has never been status-synced. */
+  status: TokenStatus | string | null;
+  /** `true` when the token is activated and can pay. */
   isActive: boolean;
+  /** `true` on the token payments use (`wallet.setActiveToken`). */
+  isSelected: boolean;
   /** Card must be activated (OTP) before first use. */
   requiresActivation: boolean;
   activationMethods: ActivationMethodInfo[] | null;
@@ -560,32 +600,31 @@ export interface Card {
 /**
  * Wallet payment events.
  *
- * **Android only** — tap-to-pay is not available on iOS, where `wallet.onTapEvent` throws
+ * **Android only** — tap-to-pay is not available on iOS, where `wallet.observeTapEvents` throws
  * `UNSUPPORTED_ON_PLATFORM`. A card-reading event, not a call's outcome: the payment's outcome
- * arrives in the transaction history and on `wallet.onTransactionResolved`.
+ * arrives in the transaction history and on `wallet.observeTransactionResolved`.
  */
 export type WalletTapEvent =
-  | { type: 'transactionStarted'; tokenId: string }
+  | { type: 'transactionStarted'; tokenUniqueReference: string }
   | {
       type: 'transactionCompleted';
       status: 'APPROVED' | 'DECLINED' | 'ERROR';
       message: string | null;
       amountMinorUnits: number | null;
-      tokenId: string | null;
+      tokenUniqueReference: string | null;
       cardScheme: CardScheme | null;
       reference: string | null;
-    }
-  | { type: 'activationFailed'; message: string };
+    };
 
 /** Which rail a payment was refused on. `TAP` is Android only. */
 export type WalletPayRail = 'TAP' | 'CPM_QR' | 'MPM_QR';
 
 /**
  * A payment refused **before any proof was built**, delivered to the handler registered for that
- * card with `wallet.onPaymentRefusal`.
+ * card with `wallet.observePaymentRefusals`.
  *
  * Separate shapes, not one, because the advice differs and a host that cannot tell them apart will
- * misdirect the payer. The first two describe **this payment**, not the card: `Card.requiresOnline`
+ * misdirect the payer. The first two describe **this payment**, not the card: `Token.requiresOnline`
  * answers the different question "can this card pay anything offline at all?" and stays `false`
  * for a card that can still make smaller payments — so don't grey a card out on the strength of
  * one refusal.
@@ -604,7 +643,6 @@ export type WalletPaymentRefusal =
    */
   | {
       type: 'requireOnline';
-      tokenId: string | null;
       tokenUniqueReference: string | null;
       amountMinorUnits: number;
       rail: WalletPayRail;
@@ -620,7 +658,6 @@ export type WalletPaymentRefusal =
    */
   | {
       type: 'amountExceedCardLimit';
-      tokenId: string | null;
       tokenUniqueReference: string | null;
       amountMinorUnits: number;
       cardLimitMinorUnits: number | null;
@@ -636,7 +673,6 @@ export type WalletPaymentRefusal =
    */
   | {
       type: 'deviceNotBound';
-      tokenId: string | null;
       tokenUniqueReference: string | null;
       amountMinorUnits: number;
       rail: WalletPayRail;
@@ -644,7 +680,10 @@ export type WalletPaymentRefusal =
       message: string;
     };
 
-/** What `wallet.onPaymentRefusal` returns; call `remove()` to stop that card's handler. */
+/**
+ * What a wallet `observeX` call returns; call `remove()` to stop that one listener. The matching
+ * `stopObservingX()` removes every listener of that kind at once.
+ */
 export interface VeyraSubscription {
   remove(): void;
 }
@@ -669,7 +708,8 @@ export type ScanInspection =
       merchantCity: string | null;
       amountDisplay: string;
       amountMinorUnits: number;
-      currencyNumeric: string;
+      /** ISO 4217 numeric, three digits, e.g. `'566'`. */
+      currencyCode: string;
       expiresAtEpochSeconds: number;
       /**
        * The merchant's order ID, signed into the QR — what `wallet.cancelPayment` takes to cancel
@@ -699,7 +739,7 @@ export interface PaymentOutcome {
    *
    * `null` only if the gateway stated none.
    */
-  responseStatus: ResponseStatus | null;
+  responseStatus: ResponseStatus;
   /** The stated cause (`'INSUFFICIENT_FUNDS'`, `'NO_RESPONSE_RECEIVED'`, `'AUTH_CANCELLED'`…) — display and log. */
   responseStatusReason: string | null;
   message: string | null;
@@ -713,6 +753,10 @@ export interface PaymentOutcome {
    * gateway did not supply one — fall back to the scanned QR's `merchantCity`.
    */
   merchantLocation: string | null;
+  /** The merchant-bank credit's identifier; `null` unless the payment was approved and the gateway sent one. */
+  creditTransactionId: string | null;
+  /** Whether the merchant's bank can confirm the credit at all. Settlement news only — never the outcome. */
+  isCreditConfirmationSupported: boolean | null;
 }
 
 /**
@@ -727,7 +771,8 @@ export interface PaymentQr {
   /** The QR to render; `null` when none was made (`responseStatus` is not `'APPROVED'`). */
   payload: string | null;
   amountMinorUnits: number;
-  currencyNumeric: string | null;
+  /** ISO 4217 numeric, three digits, e.g. `'566'`. */
+  currencyCode: string | null;
   expiresAtEpochMillis: number;
   transactionHash: string | null;
   responseStatus: ResponseStatus;
@@ -735,11 +780,11 @@ export interface PaymentQr {
   message: string | null;
 }
 
-export type QrExpiredEvent = { scope: 'wallet' | 'merchant'; handle: string | null };
+export type QrExpiredEvent = { scope: 'wallet' | 'softpos'; handle: string | null };
 
 /**
  * A payment the app was left waiting on has resolved — the push half of
- * `merchant.getTransactions()`.
+ * `softpos.getTransactions()`.
  *
  * A sale that gets no answer resolves to `PENDING`, and the SDK then polls it to a final status in
  * the background. This fires the moment one settles, including for a payment started in an earlier
@@ -807,7 +852,7 @@ export type TokenStatusChangedEvent = {
    *
    * Branch on this rather than on `status`: it already accounts for statuses this SDK build does
    * not recognise, so you cannot end up more permissive than the gate that will refuse the tap.
-   * It answers "is the card alive", not "can it pay this amount" — see {@link CardKeyStateEvent}.
+   * It answers "is the card alive", not "can it pay this amount" — see {@link TokenKeyStateEvent}.
    */
   canPay: boolean;
   /** What the card held before, or null when this is its first status. */
@@ -841,14 +886,14 @@ export type WalletTransactionResolvedEvent = {
 /**
  * A card ran out of payment keys, or a refresh replenished them.
  *
- * `requiresOnline` is the same value the card carries in `getCards()` — the SDK reads one
+ * `requiresOnline` is the same value the token carries in `getTokens()` — the SDK reads one
  * function for both, so this can never contradict the list you are about to draw.
  *
  * **Covers key consumption and refresh, not expiry by clock.** Keys also expire on a timer, which
  * happens with no SDK code running, so nothing fires for it; such a card simply reads as
  * `requiresOnline` on your next card read. Keep reading the card list when a screen appears.
  */
-export type CardKeyStateEvent = {
+export type TokenKeyStateEvent = {
   tokenUniqueReference: string;
   /** True when the card cannot pay until the SDK refreshes its keys. */
   requiresOnline: boolean;
@@ -887,8 +932,11 @@ export type EntryMethod = 'TAP' | 'QR_GENERATED' | 'QR_SCANNED';
 export interface TransactionSummary {
   merchantName: string;
   amountMinorUnits: number;
-  transactionCurrencyCode: string | null;
+  /** ISO 4217 numeric, three digits, e.g. `'566'`; `null` on legacy rows. */
+  currencyCode: string | null;
   transactionHash: string | null;
+  /** The token that paid. */
+  tokenUniqueReference: string | null;
   authorizationStatus: 'PENDING' | 'APPROVED' | 'DECLINED' | 'FAILED' | 'RETRY' | (string & {}) | null;
   /**
    * The outcome's response code (`"00"`, `"51"`, `"91"`…), carried verbatim from the rail that
@@ -948,11 +996,23 @@ export interface TransactionSummary {
 }
 
 /**
- * The outcome of choosing the active card (`wallet.setActiveCard`) — on the phone, nothing is sent.
+ * The outcome of choosing the active token (`wallet.setActiveToken`) — on the phone, nothing is sent.
  * `'APPROVED'`, or `'FAILED'` with `CARD_NOT_FOUND` (not in this wallet) or `CARD_DATA_MISSING`
  * (Android: the card's payment data is not on this phone — remove it and add it again).
  */
-export interface CardSelection {
+export interface TokenSelection {
+  responseStatus: ResponseStatus;
+  responseStatusReason: string | null;
+  message: string | null;
+}
+
+/**
+ * The answer to `wallet.openPaySession` — on the phone, nothing is sent. `'APPROVED'`: tap-to-pay
+ * is armed on the pay screen. `'FAILED'` (nothing changed) with `NFC_DISABLED` (turn NFC on),
+ * `NFC_UNAVAILABLE` (no NFC — always on iOS, which cannot pay by tap; offer QR), `MODE_REFUSED`
+ * (a SoftPOS payment is in progress) or `SCREEN_NOT_ACTIVE` (no screen in front).
+ */
+export interface PaySessionResult {
   responseStatus: ResponseStatus;
   responseStatusReason: string | null;
   message: string | null;
@@ -988,9 +1048,10 @@ export interface TransactionReceipt {
   transactionType: string;
   transactionStatus: string;
   transactionTime: string;
-  totalAmountMinorUnits: string;
+  totalAmountMinorUnits: number;
   totalAmountFormatted: string;
-  currency: string | null;
+  /** ISO 4217 numeric, three digits, e.g. `'566'`. */
+  currencyCode: string | null;
   maskedToken: string | null;
   merchantTransactionReference: string | null;
   cdcvmApprovedByWallet: boolean | null;
@@ -998,7 +1059,7 @@ export interface TransactionReceipt {
   transactionHash: string | null;
 }
 
-// ── Merchant (SoftPOS) ────────────────────────────────────────────────────────
+// ── SoftPOS: merchant ────────────────────────────────────────────────────────────
 
 export type MerchantType = 'PERSONAL' | 'BUSINESS';
 
@@ -1016,7 +1077,11 @@ export interface MerchantRegistration {
   countryCode: string;
   accountNumber: string;
   institutionCode: string;
-  /** Optional for every merchant type. */
+  /**
+   * Bank Verification Number, for either merchant type. Optional when your payment app provider is
+   * registered as the account issuer; otherwise the backend refuses with `'BVN_REQUIRED'`. Blank is
+   * sent as absent.
+   */
   bvn?: string;
   /** Required for BUSINESS. */
   cacNumber?: string;
@@ -1028,7 +1093,8 @@ export interface MerchantRegistration {
  * Branch on `responseStatus`: `'APPROVED'` (registered — `merchantId` is set; the same fact as
  * `success`), `'FAILED'` (refused — `responseStatusReason` names the field or rule), `'PENDING'`
  * (sent, no usable answer — check `refreshStatus` before registering again) or `'NOT_SENT'` (never
- * reached Veyra — e.g. `INVALID_REQUEST` for a missing field or an unknown `merchantType`).
+ * reached Veyra). A missing field or an unknown `merchantType` is refused before sending: `'FAILED'` /
+ * `INVALID_REQUEST`.
  */
 export interface MerchantRegistrationResult {
   success: boolean;
@@ -1036,17 +1102,17 @@ export interface MerchantRegistrationResult {
   terminalId: string | null;
   merchantStatus: MerchantStatus | string | null;
   message: string | null;
-  responseStatus: ResponseStatus | null;
+  responseStatus: ResponseStatus;
   responseStatusReason: string | null;
 }
 
 /**
- * The outcome of `merchant.refreshStatus` / `activate` / `deactivate` / `update`. Branch on
+ * The outcome of `softpos.refreshStatus` / `activate` / `deactivate` / `updateMerchant`. Branch on
  * `responseStatus`: `'APPROVED'` (answered — `merchantStatus` is set), `'FAILED'` (refused, e.g.
- * `MERCHANT_NOT_FOUND`), `'PENDING'` (activate / deactivate / update sent with no usable answer — read
- * the status before trying again) or `'NOT_SENT'` (never reached Veyra — `MISSING_MANDATORY_CONFIG`
- * when no merchant is registered, `INVALID_REQUEST` for a missing update field). A status read is never
- * `'PENDING'`.
+ * `MERCHANT_NOT_FOUND`; also refused on the phone, nothing sent — `MISSING_MANDATORY_CONFIG` when no
+ * merchant is stored, `INVALID_REQUEST` for a missing update field) or `'PENDING'` (activate /
+ * deactivate / update sent with no usable answer — read the status before trying again). A status
+ * read is never `'PENDING'`.
  */
 export interface MerchantStatusResult {
   merchantId: string | null;
@@ -1072,6 +1138,10 @@ export interface StoredMerchant {
   /** Gateway-resolved from the payment app provider; learned from responses, never app-supplied. */
   acquirerId: string;
   merchantCategoryCode: string;
+  /** The merchant's BVN, when one was supplied. */
+  bvn: string | null;
+  /** The business's CAC number — a `BUSINESS` merchant only. */
+  cacNumber: string | null;
   terminalId: string;
   merchantStatus: MerchantStatus | string | null;
   /** The merchant's wallet account id as stored by the gateway, if any. */
@@ -1091,12 +1161,17 @@ export interface MerchantUpdate {
   institutionCode: string;
   /** Optional — stored verbatim by the gateway when supplied. */
   walletAccountId?: string;
-  /** Optional — how an already-registered BUSINESS merchant supplies its BVN. */
+  /**
+   * Optional — how an already-registered merchant supplies its BVN; absent keeps the stored one.
+   * When your payment app provider is not registered as the account issuer, an update that leaves
+   * the merchant with no BVN is refused with `'BVN_REQUIRED'`.
+   */
   bvn?: string;
 }
 
-// ── Merchant: tap acceptance ──────────────────────────────────────────────────
+// ── SoftPOS: tap acceptance ───────────────────────────────────────────────────
 
+/** One tap payment — a purchase. The same request as Android and iOS `TapRequest`. */
 export interface TapRequest {
   amountMinorUnits: number;
   /** ISO 4217 numeric, e.g. '566'. Default '566'. */
@@ -1116,18 +1191,11 @@ export interface TapRequest {
    * and credit confirmation off that.
    */
   merchantOrderId: string;
-  /** Android only. Default 'PURCHASE'. */
-  txType?:
-    | 'PURCHASE'
-    | 'RECURRING_PURCHASE'
-    | 'REFUND'
-    | 'CASH_ADVANCE'
-    | 'PRE_AUTH_COMPLETION'
-    | 'OTHER';
 }
 
 /**
- * Tap acceptance events, identical on Android and iOS. `cardContactLost` / `unsupportedCard` mean
+ * Tap acceptance events (the `onEvent` of `softpos.tap.start`) — the same names as Android `TapEvent` and iOS
+ * `TapEvent`, identical on both platforms. `cardContactLost` / `unsupportedCard` mean
  * the reader stays armed for a re-tap — show a transient hint, keep the waiting screen up. Only
  * `result` (and iOS `ended`) are terminal. A tap refused before it was sent (a blank order id, the
  * other mode's payment in flight, cancelled) still ends with a `result`, whose `responseStatus` is
@@ -1137,22 +1205,29 @@ export interface TapRequest {
  * the field, which ends that card's dialogue — the session stays armed for a fresh tap, but the
  * interrupted attempt still reports its own `result`.
  */
-export type MerchantTapEvent =
+export type TapEvent =
+  /** A card or phone was tapped; reading it is starting. */
   | { type: 'cardDetected'; sessionId: string }
+  /** Contact was lost before the card could be read — still armed, ask for a re-tap. */
   | { type: 'cardContactLost'; sessionId: string }
+  /** The tapped target is not a usable payment card — still armed, ask for another card. */
   | { type: 'unsupportedCard'; sessionId: string }
-  | { type: 'readingComplete'; sessionId: string }
-  | { type: 'sendingOnline'; sessionId: string }
-  | { type: 'receivingOnline'; sessionId: string }
+  /** The card has been read; the customer can take it away. */
+  | { type: 'cardReadingComplete'; sessionId: string }
+  /** The payment request is being sent to the bank. */
+  | { type: 'sendingRequestOnline'; sessionId: string }
+  /** The bank's answer is arriving; the outcome still comes in `result`. */
+  | { type: 'receivingOnlineResponse'; sessionId: string }
   /** iOS only: session ended without a payment result. */
   | {
       type: 'ended';
       sessionId: string;
       outcome: 'CANCELLED' | 'TIMEOUT' | 'ERROR' | 'UNAVAILABLE';
     }
-  | { type: 'result'; sessionId: string; result: MerchantTapResult };
+  | { type: 'result'; sessionId: string; result: TapResult };
 
-export interface MerchantTapResult {
+/** The outcome of a tap payment, carried by the `result` {@link TapEvent}. */
+export interface TapResult {
   /**
    * The response code as reported for this tap. Branch on `responseStatus`, never on this: a
    * `'06'`, `'68'` or `'96'` with `'PENDING'` means the outcome is unknown and the sale must not be
@@ -1160,16 +1235,15 @@ export interface MerchantTapResult {
    */
   responseCode: string | null;
   /**
-   * The outcome — what you branch on: `'APPROVED'`, `'DECLINED'`, `'FAILED'`, `'PENDING'` or
-   * `'NOT_SENT'` (the payment never reached the gateway — retry with the **same** order id).
+   * The outcome — what you branch on: `'APPROVED'`, `'DECLINED'`, `'FAILED'`, `'PENDING'`, `'RETRY'`
+   * or `'NOT_SENT'` (the payment never reached the gateway — retry with the **same** order id).
    */
-  responseStatus: ResponseStatus | null;
+  responseStatus: ResponseStatus;
   /** Why it ended as it did (`'INSUFFICIENT_FUNDS'`, `'CANCELLED'`, `'NO_NETWORK_CONNECTION'`…). */
   responseStatusReason: string | null;
-  /** @deprecated The same value as `responseStatus`; read that. */
-  status: ResponseStatus | null;
   message: string | null;
-  amountDisplay: string | null;
+  /** The amount tapped, in minor units. */
+  amountMinorUnits: number | null;
   cardScheme: string | null;
   maskedTokenLast4: string | null;
   merchantTransactionReference: string | null;
@@ -1183,7 +1257,7 @@ export interface MerchantTapResult {
   /**
    * Whether the merchant's (beneficiary) bank can confirm the credit at all — the backend's
    * payment-time decision. When `true`, the SDK polls the confirmation rail in the background
-   * and fires `merchant.onCreditConfirmation` — show a "confirming credit…" state on the result
+   * and fires `softpos.observeCreditConfirmation` — show a "confirming credit…" state on the result
    * screen and flip it from that event. `false`/`null` means there is nothing to wait for.
    */
   isCreditConfirmationSupported: boolean | null;
@@ -1212,7 +1286,7 @@ export interface OriginalPayment {
   transactionId: string | null;
 }
 
-// ── Merchant: QR rails ────────────────────────────────────────────────────────
+// ── SoftPOS: QR rails ─────────────────────────────────────────────────────────
 
 /**
  * The outcome of creating a get-paid QR: `'APPROVED'` (render `mpmPayload`), `'FAILED'` (the
@@ -1253,7 +1327,8 @@ export interface ScannedCustomerQr {
   handle: string;
   maskedCard: string;
   amountMinorUnits: number;
-  currencyNumeric: string;
+  /** ISO 4217 numeric, three digits, e.g. `'566'`. */
+  currencyCode: string;
   /**
    * The paying card's display name (EMV tag `5F20`), e.g. `AFRIGO ****1234` — the same value a
    * tap presents. `null` when the QR carries none.
@@ -1266,7 +1341,7 @@ export interface ScannedCustomerQr {
 
 /**
  * The outcome of inspecting a scanned customer QR: `'APPROVED'` with `qr` — show its amount for the
- * merchant to confirm — or `'NOT_SENT'` / `INVALID_REQUEST` when the payload is not a Veyra payment
+ * merchant to confirm — or `'FAILED'` / `INVALID_REQUEST` when the payload is not a Veyra payment
  * QR (show a transient hint and stay armed). Nothing is sent either way.
  */
 export interface CustomerQrInspection {
@@ -1284,12 +1359,12 @@ export interface CustomerQrInspection {
 export interface CustomerQrChargeOutcome {
   /** `true` only when `responseStatus` is `'APPROVED'` — never worked out from the code. */
   approved: boolean;
-  responseStatus: ResponseStatus | null;
+  responseStatus: ResponseStatus;
   /** Why it ended as it did (`'INSUFFICIENT_FUNDS'`, `'NO_RESPONSE_RECEIVED'`…). Show and log. */
   responseStatusReason: string | null;
   /** The wire code (`'00'`, `'51'`, `'68'`…) — for receipts and support, never to branch on. `null` on `'NOT_SENT'`. */
   responseCode: string | null;
-  /** A human-readable description, for logs. Android only; always `null` on iOS. */
+  /** A human-readable description, for logs. */
   message: string | null;
   transactionId: string | null;
   /**
@@ -1309,8 +1384,8 @@ export interface CustomerQrChargeOutcome {
    * Whether the merchant's (beneficiary) bank can confirm the credit — the backend's
    * payment-time decision. `true` means the SDK's app-scoped background sweep polls the
    * confirmation rail and stamps the answer onto the sale's stored row — show a "confirming
-   * credit…" state on the result screen and flip it from `merchant.onCreditConfirmation`
-   * (Android) or the re-read row (`creditConfirmationStatus`).
+   * credit…" state on the result screen and flip it from `softpos.observeCreditConfirmation`
+   * or the re-read row (`creditConfirmationStatus`).
    */
   isCreditConfirmationSupported: boolean | null;
   /**
@@ -1321,7 +1396,7 @@ export interface CustomerQrChargeOutcome {
   originalPayment: OriginalPayment | null;
 }
 
-// ── Merchant: transactions & receipts ─────────────────────────────────────────
+// ── SoftPOS: transactions & receipts ──────────────────────────────────────────
 
 /** One payment attempt made under a merchant order id. */
 export interface OrderPaymentAttempt {
@@ -1336,7 +1411,7 @@ export interface OrderPaymentAttempt {
 }
 
 /**
- * What happened to a merchant order (`merchant.paymentStatus`). Branch on `responseStatus`:
+ * What happened to a merchant order (`softpos.paymentStatus`). Branch on `responseStatus`:
  * `'APPROVED'` — paid, never take another payment; `'PENDING'` — may have moved money, never retry;
  * `'DECLINED'` / `'FAILED'` / `'RETRY'` — no money moved, pay again with the **same** order id. The
  * other top-level fields are the deciding attempt's; `attempts` lists them all, newest first.
@@ -1445,3 +1520,43 @@ export interface MerchantReceipt {
  * loses focus. The app never chooses a mode.
  */
 export type SessionKind = 'pay' | 'getPaid';
+
+/**
+ * The gateway's own record of one of the stored merchant's transactions
+ * (`softpos.getTransactionStatus`). A raw read: it writes nothing to the stored row.
+ */
+export interface TransactionStatus {
+  merchantTransactionReference: string;
+  merchantId: string;
+  /** In minor units; `null` on a not-found answer (`25`), where the gateway holds no transaction. */
+  amountMinorUnits: number | null;
+  /** The wire code — for receipts and support, never to branch on. */
+  responseCode: string;
+  /** The payment's outcome as the gateway stated it — what you branch on. `null` from an older gateway. */
+  responseStatus: ResponseStatus | null;
+  /** Why it ended as it did, e.g. `UNABLE_TO_LOCATE_RECORD`. */
+  responseStatusReason: string | null;
+  merchantStatus: MerchantStatus | string | null;
+  transactionId: string | null;
+  /** The merchant-bank credit's identifier — sent when the transaction is approved. */
+  creditTransactionId: string | null;
+  /** Whether the merchant's bank can confirm the credit at all — the gate for `getCreditConfirmation`. */
+  isCreditConfirmationSupported: boolean | null;
+}
+
+/**
+ * The merchant bank's answer to `softpos.getCreditConfirmation` — has an approved sale's money
+ * arrived? Settlement news only: it never changes the payment's outcome.
+ */
+export interface CreditConfirmation {
+  creditTransactionId: string;
+  /** `'RECEIVED'` is final; anything else means ask again later. */
+  status: 'RECEIVED' | (string & {});
+  /** Credited amount in minor units, as the bank reported it. */
+  amountMinorUnits: number | null;
+  /** When the bank posted the credit (ISO date-time). */
+  creditedAt: string | null;
+  /** The bank's own reference for the credit. */
+  bankReference: string | null;
+  message: string | null;
+}

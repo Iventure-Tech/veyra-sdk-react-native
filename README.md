@@ -94,21 +94,24 @@ Copy the `Info.plist` NFC entries (including the Veyra AID) from the sample app.
 ```ts
 import Veyra from 'veyra-sdk-react-native';
 
-await Veyra.initialize({
-  customerId: signedInCustomerId,
-  provider,                                  // required, one for both SDKs — see "Connect to Veyra"
-  softpos: {
-    environment: 'TEST',
-    paymentAppProviderId: VEYRA_PAYMENT_APP_PROVIDER_ID,
+// (customerId, config, provider) — the same order as Android and iOS.
+await Veyra.initialize(
+  signedInCustomerId,
+  {
+    softpos: {
+      environment: 'TEST',
+      paymentAppProviderId: VEYRA_PAYMENT_APP_PROVIDER_ID,
+    },
+    wallet: {
+      environment: 'TEST',
+      paymentAppProviderId: VEYRA_PAYMENT_APP_PROVIDER_ID,
+      tokenRequestorId: VEYRA_TOKEN_REQUESTOR_ID,
+      recommendationStandardVersion: '1.0',    // Android
+      appleTeamId: 'YOURTEAMID',               // iOS
+    },
   },
-  wallet: {
-    environment: 'TEST',
-    paymentAppProviderId: VEYRA_PAYMENT_APP_PROVIDER_ID,
-    tokenRequestorId: VEYRA_TOKEN_REQUESTOR_ID,
-    recommendationStandardVersion: '1.0',    // Android
-    appleTeamId: 'YOURTEAMID',               // iOS
-  },
-});
+  provider,                                    // required, one for both SDKs — see "Connect to Veyra"
+);
 ```
 
 ## Connect to Veyra
@@ -324,11 +327,11 @@ receipts and support, never to branch on.
 | `RETRY` | reached Veyra, but was never sent to the bank; nothing was done | **unused** | fix the reason; retry with the **same** order id |
 | `NOT_SENT` | payments and digitise only: never reached Veyra; nothing was done | **unused** | fix the reason; retry with the **same** order id (or digitise request) |
 
-**`NOT_SENT` is only for payments and digitise** — `merchant.tap`, `chargeCustomerQr`,
+**`NOT_SENT` is only for payments and digitise** — `softpos.tap`, `chargeCustomerQr`,
 `createPaymentContext`, `wallet.payScannedContext`, `wallet.showQrToPay` and `wallet.digitise`,
 where it tells you the reference is still unused. Every other call (merchant registration,
 activation, status and bank lists, wallet banks, account verification, activation codes,
-`tokenStatus`, `deactivateToken`, `inspectCustomerQr`, `processReceipt`, `setActiveCard`) answers
+`tokenStatus`, `deactivateToken`, `inspectCustomerQr`, `processReceipt`, `setActiveToken`) answers
 **`FAILED`** with the same reason — fix it and call again.
 
 `NOT_SENT` never carries a `responseCode`. Its `responseStatusReason` says what to fix (a
@@ -349,17 +352,17 @@ and the vocabulary grows without an SDK release, so always keep a default branch
   or possibly paid — or the status is one your app doesn't know, which you treat as pending — a new
   attempt answers `94` (below); don't take another payment.
 - **A duplicate order id** is `94` / `FAILED` / `DUPLICATE_MERCHANT_ORDER_ID`, and carries
-  `originalPayment: OriginalPayment | null` (on `MerchantTapResult`, `CustomerQrChargeOutcome` and
+  `originalPayment: OriginalPayment | null` (on `TapResult`, `CustomerQrChargeOutcome` and
   `PaymentContextQr`) — the payment already holding the order. If its `responseStatus` is
   `PENDING`, tell the merchant "A payment for this order is still being confirmed - do not take
   another payment"; otherwise "This order is already paid - do not take another payment". Never
   offer a retry.
-- **Reads** — `merchant.contextStatus`, `merchant.refreshTransactionStatus` /
-  `refreshCreditConfirmation`, `merchant.paymentStatus`, `wallet.refreshTransactionStatus` / `refreshCreditConfirmation` —
-  resolve a `VeyraLookup<T>`: `{ value, failureReason, message }`. A read is never `PENDING`; when
+- **Reads** — `softpos.contextStatus`, `softpos.refreshTransactionStatus` /
+  `refreshCreditConfirmation`, `softpos.paymentStatus`, `wallet.refreshTransactionStatus` / `refreshCreditConfirmation` —
+  resolve a `VeyraLookup<T>`: `{ value, failureReason, message, checked }`. A read is never `PENDING`; when
   the check could not be made, `failureReason` says why and the payment is unchanged. Other
-  lookups (`getBanks`, `getSettlementBanks`, `tokenStatus`, `inspectCustomerQr`,
-  `merchant.refreshStatus`) carry `responseStatus` and are never `PENDING` either.
+  lookups (`wallet.getBanks`, `softpos.getBanks`, `tokenStatus`, `inspectCustomerQr`,
+  `softpos.refreshStatus`) carry `responseStatus` and are never `PENDING` either.
 
 **A promise rejects only with a setup error** — a `VeyraError` whose `code` is one of:
 
@@ -368,8 +371,8 @@ and the vocabulary grows without an SDK release, so always keep a default branch
 | `NOT_CONFIGURED` | `Veyra.initialize` has not run (on Android: also no Activity attached yet) |
 | `NOT_SIGNED_IN` | no customer is signed in — after `Veyra.signOut` |
 | `INVALID_CONFIGURATION` | `Veyra.initialize` was given a configuration it can't use; the message names the problem |
-| `SESSION_REQUIRED` | a payment API without its screen session (`merchant.tap.*`, `wallet.setActiveCard`) |
-| `UNSUPPORTED_ON_PLATFORM` | a method this platform can't perform — `wallet.onTapEvent` throws it on iOS |
+| `SESSION_REQUIRED` | a payment API without its screen session (`softpos.tap.*`, `wallet.setActiveToken`) |
+| `UNSUPPORTED_ON_PLATFORM` | a method this platform can't perform — `wallet.observeTapEvents` throws it on iOS |
 | `UNKNOWN` | anything not otherwise classified — an SDK defect; see `message` |
 
 These are integration bugs, found in development — don't build user-facing screens for them.
@@ -381,7 +384,7 @@ The wallet's on-phone calls answer too:
   `INVALID_RECEIPT`, `RECEIPT_NOT_FROM_THIS_WALLET`, `RECEIPT_MISMATCH` (amount, currency, date,
   merchant or reference disagree), `PAYMENT_NOT_CONFIRMED` (scan again shortly) or
   `RECEIPT_FOR_ANOTHER_TRANSACTION`. Nothing is sent.
-- `wallet.setActiveCard` resolves a `CardSelection` — `{ responseStatus, responseStatusReason,
+- `wallet.setActiveToken` resolves a `TokenSelection` — `{ responseStatus, responseStatusReason,
   message }`: `APPROVED`, or `FAILED` with `CARD_NOT_FOUND` (not in this wallet) or, on Android,
   `CARD_DATA_MISSING` (remove the card and add it again).
 - `wallet.reconcilePendingTransactions` is a read and resolves a `ReconcileResult` —
@@ -393,21 +396,53 @@ The wallet's on-phone calls answer too:
 `ONLINE_REQUIRED`, `AMOUNT_EXCEEDS_CARD_LIMIT`, `TOKEN_NOT_ACTIVE`, `DEVICE_NOT_BOUND`,
 `NO_ACTIVE_CARD`, `CARD_CANNOT_SHOW_QR`, `MODE_REFUSED`, `MISSING_MANDATORY_CONFIG`,
 `DUPLICATE_MERCHANT_ORDER_ID`, `REQUEST_FAILED`) are retired as rejections — the same names now
-arrive as `responseStatusReason` on a resolved outcome. `getBanks` / `getSettlementBanks` resolve
+arrive as `responseStatusReason` on a resolved outcome. `wallet.getBanks` / `softpos.getBanks` resolve
 `BankList` / `SettlementBankList`; `tokenStatus` resolves `TokenStatusResult`; `checkTokenActive`
 is removed; `deactivateToken` resolves `TokenStatusUpdateResponse` (only `APPROVED` removed the
 card); merchant `refreshStatus` / `activate` / `deactivate` / `update` resolve
 `MerchantStatusResult`; `inspectCustomerQr` resolves `CustomerQrInspection`; `processReceipt`
-resolves `ReceiptScan`, `setActiveCard` resolves `CardSelection` (it resolved `void`) and
+resolves `ReceiptScan`, `setActiveCard` (now `setActiveToken`) resolves `TokenSelection` (it resolved `void`) and
 `reconcilePendingTransactions` resolves `ReconcileResult`; `showQrToPay`
 (`PaymentQr`) and `createPaymentContext` (`PaymentContextQr`) carry a status, with their QR set
-only on `APPROVED`; the tap `result` branches on `responseStatus` (`status` is a deprecated
-alias). The sample app's developer guide has the full migration table.
+only on `APPROVED`; the tap `result` branches on `responseStatus` (the old `status` alias is
+removed). The sample app's developer guide has the full migration table.
+
+**Upgrading from 3.0.0 (wallet):** the wallet uses the same names as the Android and iOS SDKs.
+Cards are tokens — `getCards` / `getActiveCard` / `setActiveCard(cardId)` are now `getTokens` /
+`getActiveToken` / `setActiveToken(tokenUniqueReference)`, and the `Card` type is `Token` (no `id` or
+`tokenId`; use `tokenUniqueReference`). Every `onX` listener is now `observeX`, with a matching
+`stopObservingX()` that removes all listeners of that kind: `observeTapEvents`,
+`observeTokenStatusChanged`, `observeTransactionResolved`, `observeTokenKeyStateChanged`, and `observePaymentRefusals(tokenUniqueReference, listener)` /
+`stopObservingPaymentRefusals(tokenUniqueReference)`. `wallet.onQrExpired` is gone: pass the
+callback to the QR itself, `showQrToPay(amountMinorUnits, onExpired)`, as on Android and iOS.
+`wallet.onActivationEvent` is gone too: `observeActivation(tokenUniqueReference, onActivated,
+onTimeout, onError?)` takes the callbacks for that card.
+`requestActivationCode` no longer takes a `contact`. New: `getToken`,
+`hasActivationObserver` and `getPaymentApplicationInstanceId`. The sample app's
+developer guide has the full table.
+
+**Upgrading from 3.0.0 (setup):** `Veyra.initialize` takes `(customerId, config, provider)`, the
+same order as Android `VeyraSdk.initialize` and iOS `VeyraSDK.configure`. `customerId` and
+`provider` move out of the config object, which is now `VeyraSdkConfig` (`{ softpos, wallet }`;
+the `VeyraConfig` type is gone).
+
+**Upgrading from 3.0.0 (type and field names):** in 3.0.1 the type and field names match the
+Android and iOS SDKs, and the old names are removed, not deprecated. Amounts are
+`amountMinorUnits` (`TapResult.amountDisplay` is gone, and `TransactionReceipt.totalAmountMinorUnits`
+is a number), currencies are `currencyCode` with three digits (`'566'`), and every outcome states
+`responseStatus` — never `null`; `TapResult`'s `status` alias is removed. `CardStatus`,
+`CardKeyStateEvent` and `CardSelection` are `TokenStatus`, `TokenKeyStateEvent` and
+`TokenSelection`; `wallet.observeCardKeyStateChanged` / `stopObservingCardKeyStateChanged` are
+`observeTokenKeyStateChanged` / `stopObservingTokenKeyStateChanged`. `Token.isActive` now means
+activated and can pay, and `Token.isSelected` marks the token payments use. `WalletPaymentRefusal`
+and `WalletTapEvent` name the token by `tokenUniqueReference` only. `VeyraLookup` gains `checked`.
+The sample app's developer guide lists every change under "Migrating from 3.0.0 — type and field
+names".
 
 ## Looking up a payment by your order ID
 
-`merchant.paymentStatus(merchantOrderId)` answers "what happened to this order?" for every merchant
-rail — `merchant.tap`, `createPaymentContext` and `chargeCustomerQr` — without saying which. Use it
+`softpos.paymentStatus(merchantOrderId)` answers "what happened to this order?" for every merchant
+rail — `softpos.tap`, `createPaymentContext` and `chargeCustomerQr` — without saying which. Use it
 for a payment that ended `PENDING`, or when your app restarted before the result arrived. It
 resolves `VeyraLookup<OrderPaymentStatus>`: `responseStatus` is the **order's** status, by
 precedence over all its attempts — any `APPROVED`, else any `PENDING`, else the latest attempt
@@ -426,25 +461,25 @@ why and `value` is what this device holds, if anything. A blank order id resolve
 
 ```ts
 import { Platform } from 'react-native';
-import Veyra, { wallet, merchant, VeyraError } from 'veyra-sdk-react-native';
+import Veyra, { wallet, softpos, VeyraError } from 'veyra-sdk-react-native';
 
 // Wallet: add a card
 const banks = await wallet.getBanks();
 if (banks.responseStatus !== 'APPROVED') showProblem(banks.message ?? banks.responseStatusReason);
 const result = await wallet.digitise({ /* … */ recommendation: 'APPROVE' });
 
-// Wallet: tap to pay (Android only — onTapEvent throws UNSUPPORTED_ON_PLATFORM on iOS)
-const selection = await wallet.setActiveCard(cardId);
+// Wallet: tap to pay (Android only — observeTapEvents throws UNSUPPORTED_ON_PLATFORM on iOS)
+const selection = await wallet.setActiveToken(token.tokenUniqueReference);
 if (selection.responseStatus !== 'APPROVED') showProblem(selection.message ?? selection.responseStatusReason);
 if (Platform.OS === 'android') {
-  const tapSub = wallet.onTapEvent((e) => {
+  const tapSub = wallet.observeTapEvents((e) => {
     if (e.type === 'transactionCompleted') console.log(e.status);  // the card-reading leg
   });
 }
 
-// Merchant: accept a tap. The order id stays usable until the order is APPROVED or PENDING.
-const { sessionId } = await merchant.tap.start({ amountMinorUnits: 105000, merchantOrderId: 'ORDER-1042' });
-const sub = merchant.tap.onEvent((e) => {
+// SoftPOS: accept a tap. The order id stays usable until the order is APPROVED or PENDING.
+// Events arrive on the callback — this tap's only — ending with one `result` (iOS: or `ended`).
+await softpos.tap.start({ amountMinorUnits: 105000, merchantOrderId: 'ORDER-1042' }, (e) => {
   if (e.type === 'unsupportedCard') showHint('Card not supported — try another');
   if (e.type !== 'result') return;
   const r = e.result;
@@ -481,7 +516,7 @@ if (outcome.responseStatus === 'NOT_SENT') {
 
 // Only setup mistakes reject — never string-match messages.
 try {
-  await Veyra.initialize(config);
+  await Veyra.initialize(customerId, config, provider);
 } catch (e) {
   if (e instanceof VeyraError && e.code === 'INVALID_CONFIGURATION') console.error(e.message);
 }
@@ -500,7 +535,7 @@ call delivers its normal result. Every cancel names the call by a reference you 
 
 | Call | Cancel with | Reference |
 |---|---|---|
-| `merchant.tap.start`, `merchant.chargeCustomerQr`, `merchant.createPaymentContext` | `merchant.cancelPayment(merchantOrderId)` | the order ID you started the payment with |
+| `softpos.tap.start`, `softpos.chargeCustomerQr`, `softpos.createPaymentContext` | `softpos.cancelPayment(merchantOrderId)` | the order ID you started the payment with |
 | `wallet.payScannedContext` | `wallet.cancelPayment(merchantOrderId)` | `merchantOrderId` from `wallet.inspectScannedQr` (`null` on a QR that carries none — it cannot be cancelled) |
 | `wallet.digitise` | `wallet.cancelDigitise(clientRequestId)` | the `clientRequestId` you passed in its params (without one, an add-card cannot be cancelled) |
 
@@ -517,10 +552,10 @@ call still resolves (for a tap, ends its event stream) with its own outcome.
 | `NO_PAYMENT_IN_PROGRESS_FOR_ORDER_ID` / `NO_DIGITISATION_IN_PROGRESS_FOR_CLIENT_REQUEST_ID` | Nothing with that reference is in progress (wrong reference, never started, or already finished). | Nothing is in progress. |
 
 ```ts
-import { merchant, type CancelResult } from 'veyra-sdk-react-native';
+import { softpos, type CancelResult } from 'veyra-sdk-react-native';
 
 async function onCancelPressed(orderId: string) {
-  const answer: CancelResult = await merchant.cancelPayment(orderId);
+  const answer: CancelResult = await softpos.cancelPayment(orderId);
   switch (answer) {
     case 'CANCELLED':
       return navigation.goBack();                         // the tap's result is NOT_SENT / CANCELLED
@@ -540,12 +575,31 @@ await wallet.cancelDigitise(requestId);
 
 Leaving the get-paid screen (its session closing) cancels a tap that has not been sent yet — waiting
 for a card, reading it, or read and not yet sent — on Android and iOS alike; a tap already sent runs
-to its result. To cancel at any other moment, call `merchant.cancelPayment`.
+to its result. To cancel at any other moment, call `softpos.cancelPayment`.
 
 **Migrating:** `merchant.tap.cancel(sessionId)` is removed. Use
-`merchant.cancelPayment(merchantOrderId)` with the order ID you passed to `merchant.tap.start`; it
+`softpos.cancelPayment(merchantOrderId)` with the order ID you passed to `softpos.tap.start`; it
 resolves with a `CancelResult` instead of `void`, and it also cancels a customer-QR charge or a
 payment-QR create. Unlike the old cancel, it never stops a payment that is already with the bank.
+
+## Migrating from 3.0.0 (SoftPOS)
+
+The SoftPOS module is now `softpos` (it was `merchant`), with the same names as the native SDKs:
+
+| 3.0.0 | Now |
+|---|---|
+| `import { merchant }` / `Veyra.merchant` | `import { softpos }` / `Veyra.softpos` |
+| tap events `readingComplete` / `sendingOnline` / `receivingOnline` | `cardReadingComplete` / `sendingRequestOnline` / `receivingOnlineResponse` |
+| `MerchantTapEvent` / `MerchantTapResult` | `TapEvent` / `TapResult` |
+| `merchant.tap.start(request)` + `merchant.tap.onEvent(listener)` | `softpos.tap.start(request, onEvent)` — the events are a parameter, this tap's only, as on Android and iOS; nothing to remove afterwards |
+| `merchant.onTransactionResolved` / `onCreditConfirmation` / `onMerchantStatusChanged` | `softpos.observeTransactionResolved` / `observeCreditConfirmation` / `observeMerchantStatusChanged` — each with a matching `stopObservingX()` (`stopObservingMerchantStatusChanged()`…) |
+| `merchant.onQrExpired(listener)` | the `onExpired` argument of `softpos.createPaymentContext(amountMinorUnits, currency, merchantOrderId, onExpired)` |
+| `merchant.getSettlementBanks()` / `getStored()` / `update(update)` | `softpos.getBanks()` / `getStoredMerchantData()` / `updateMerchant(update)` |
+| `TapRequest.txType` | removed — a tap is a purchase |
+| — | `softpos.getStoredMerchantId()`, `hasStoredMerchant()`, `isMerchantActive()`, `isTransactionInProgress()`, `isAwaitingCardTap()`, `getTransactionStatus(ref, date)`, `getCreditConfirmation(creditTransactionId, amountMinorUnits)` |
+| — | `softpos.getStoredMerchantData(customerId)` / `isMerchantRegistered(customerId)` — callable before `Veyra.initialize` |
+
+Every other call keeps its name under `softpos.`. The sample app's developer guide has the full table.
 
 ## The full API
 

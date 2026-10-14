@@ -29,7 +29,7 @@ export const veyraEmitter = new NativeEventEmitter(
 export const Events = {
   activation: 'VeyraActivationEvent',
   walletTap: 'VeyraWalletTapEvent',
-  merchantTap: 'VeyraMerchantTapEvent',
+  softposTap: 'VeyraSoftposTapEvent',
   qrExpired: 'VeyraQrExpiredEvent',
   transactionResolved: 'VeyraTransactionResolvedEvent',
   creditConfirmation: 'VeyraCreditConfirmationEvent',
@@ -47,7 +47,7 @@ export const Events = {
    */
   paymentRefusal: 'VeyraPaymentRefusalEvent',
   /** A card ran out of payment keys, or a refresh replenished them. */
-  cardKeyState: 'VeyraCardKeyStateEvent',
+  tokenKeyState: 'VeyraTokenKeyStateEvent',
   /** The merchant was deactivated, suspended or activated. */
   merchantStatus: 'VeyraMerchantStatusEvent',
   /**

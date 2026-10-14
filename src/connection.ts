@@ -1,5 +1,5 @@
 import type {
-  VeyraConfig,
+  VeyraSdkConfig,
   VeyraProvider,
   VeyraRelayFailureKind,
   VeyraRelayFunction,
@@ -210,8 +210,14 @@ export class ConnectionRegistry {
  * Validate the provider, register it, and return the config with the provider replaced by its
  * bridge-safe description. Throws (naming the problem) before anything reaches native.
  */
+/** What `Veyra.initialize` hands the bridge before the provider is made bridge-safe. Module-internal. */
+export interface InitInput extends VeyraSdkConfig {
+  customerId: string;
+  provider: VeyraProvider;
+}
+
 export function prepareConfig(
-  config: VeyraConfig,
+  config: InitInput,
   registry: ConnectionRegistry
 ): Record<string, unknown> {
   const problem = providerProblem(config?.provider);
