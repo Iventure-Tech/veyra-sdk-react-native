@@ -289,7 +289,8 @@ class VeyraSdkReactNative: RCTEventEmitter {
       cdcvmPaySubtitle: walletMap["cdcvmPaySubtitle"] as? String,
       cdcvmShowQrTitle: walletMap["cdcvmShowQrTitle"] as? String,
       cdcvmShowQrSubtitle: walletMap["cdcvmShowQrSubtitle"] as? String,
-      requestTimeoutSeconds: walletTimeout
+      requestTimeoutSeconds: walletTimeout,
+      requireAdditionalQrAuthenticationPrompt: walletMap["requireAdditionalQrAuthenticationPrompt"] as? Bool ?? true
     )
 
     do {

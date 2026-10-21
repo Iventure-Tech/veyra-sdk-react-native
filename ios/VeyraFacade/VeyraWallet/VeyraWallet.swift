@@ -62,6 +62,13 @@ public struct VeyraWalletConfiguration: Sendable {
     /// the request may have reached the server, so the SDK checks the result later. A shorter
     /// timeout answers sooner but leaves more payments pending.
     public let requestTimeoutSeconds: Int?
+    /// Whether the SDK shows the device authentication sheet before every QR payment — showing a
+    /// payment QR, and paying a scanned merchant QR. Default `true`.
+    ///
+    /// Set `false` to skip the sheet while the phone is unlocked (by Face ID, Touch ID or the
+    /// passcode). The Secure Enclave checks this; the SDK never trusts its own record of it. When
+    /// it cannot be confirmed, the sheet is shown anyway — once.
+    public let requireAdditionalQrAuthenticationPrompt: Bool
 
     public init(
         environment: VeyraEnvironment,
@@ -76,7 +83,8 @@ public struct VeyraWalletConfiguration: Sendable {
         cdcvmPaySubtitle: String? = nil,
         cdcvmShowQrTitle: String? = nil,
         cdcvmShowQrSubtitle: String? = nil,
-        requestTimeoutSeconds: Int? = nil
+        requestTimeoutSeconds: Int? = nil,
+        requireAdditionalQrAuthenticationPrompt: Bool = true
     ) {
         self.environment = environment
         self.paymentAppProviderID = paymentAppProviderID
@@ -91,6 +99,7 @@ public struct VeyraWalletConfiguration: Sendable {
         self.cdcvmShowQrTitle = cdcvmShowQrTitle
         self.cdcvmShowQrSubtitle = cdcvmShowQrSubtitle
         self.requestTimeoutSeconds = requestTimeoutSeconds
+        self.requireAdditionalQrAuthenticationPrompt = requireAdditionalQrAuthenticationPrompt
     }
 }
 
@@ -1106,7 +1115,8 @@ public final class VeyraWallet: @unchecked Sendable {
                 cdcvmPayTitle: configuration.cdcvmPayTitle,
                 cdcvmPaySubtitle: configuration.cdcvmPaySubtitle,
                 cdcvmShowQrTitle: configuration.cdcvmShowQrTitle,
-                cdcvmShowQrSubtitle: configuration.cdcvmShowQrSubtitle
+                cdcvmShowQrSubtitle: configuration.cdcvmShowQrSubtitle,
+                requireAdditionalQrAuthenticationPrompt: configuration.requireAdditionalQrAuthenticationPrompt
             )
         )
     }

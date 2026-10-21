@@ -242,6 +242,9 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
                 cdcvmPayPrompt(walletMap.opt("cdcvmPayTitle"), walletMap.opt("cdcvmPaySubtitle"))
                 cdcvmShowQrPrompt(walletMap.opt("cdcvmShowQrTitle"), walletMap.opt("cdcvmShowQrSubtitle"))
                 requestTimeoutSeconds(walletMap.optRequestTimeoutSeconds("wallet"))
+                if (walletMap.hasKey("requireAdditionalQrAuthenticationPrompt")) {
+                    requireAdditionalQrAuthenticationPrompt(walletMap.getBoolean("requireAdditionalQrAuthenticationPrompt"))
+                }
             }.build()
 
             // The umbrella installs the exclusive arbiter + InertBackstop (reset to inert), then

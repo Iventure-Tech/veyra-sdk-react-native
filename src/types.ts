@@ -232,6 +232,14 @@ export interface VeyraWalletConfig {
    * answers sooner but leaves more payments pending.
    */
   requestTimeoutSeconds?: number;
+  /**
+   * Whether the SDK shows the device authentication sheet before every QR payment — showing a
+   * payment QR, and paying a scanned merchant QR. Defaults to `true`. Set `false` to skip it when
+   * the customer recently unlocked the phone (Android: biometric or screen lock in the last 5
+   * minutes; iOS: while unlocked) — the phone's secure hardware checks this. Without such an
+   * unlock the sheet is shown anyway, once. Contactless taps never show a sheet.
+   */
+  requireAdditionalQrAuthenticationPrompt?: boolean;
 }
 
 /**
