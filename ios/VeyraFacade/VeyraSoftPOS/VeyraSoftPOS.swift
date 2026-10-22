@@ -25,7 +25,7 @@ public struct VeyraSoftPOSConfiguration: Sendable {
     /// acquirer id and MCC from it; the app never supplies an acquirer id.
     public let paymentAppProviderID: String
     /// The longest the SDK waits for one backend call, start to finish, in seconds (5–60).
-    /// `nil` (the default) keeps the SDK's own timeouts. A value outside 5–60 makes `configure`
+    /// `nil` (the default) means 60 seconds. A value outside 5–60 makes `configure`
     /// throw `invalidConfiguration`. A payment that runs out of time is **pending**, not failed:
     /// the request may have reached the server, so the SDK checks the result later. A shorter
     /// timeout answers sooner but leaves more payments pending.
@@ -1029,9 +1029,10 @@ public final class VeyraSoftPOS: @unchecked Sendable {
         if let id = loadStoredMerchant()?.merchantID, !id.trimmingCharacters(in: .whitespaces).isEmpty {
             return id
         }
-        // One failure line for the refusal (`devices/CLAUDE.md` §25), like every other outcome.
+        // One failure line for the refusal (`devices/CLAUDE.md` §25), like every other outcome —
+        // naming what is missing under the generic reason.
         kmp.logRefusal(operation: operation, action: action, status: status,
-                       reason: Self.noMerchantReason)
+                       reason: Self.noMerchantReason, cause: FailureCause.shared.NO_MERCHANT_REGISTERED)
         return nil
     }
 
@@ -1821,7 +1822,8 @@ public final class VeyraSoftPOS: @unchecked Sendable {
             let kmp = try owner.requireKmp()
             guard let currencyCode = request.currencyCode else {
                 kmp.logRefusal(operation: SdkOperation.shared.MERCHANT_TAP, action: nil,
-                               status: ResponseStatus.notSent, reason: "INVALID_REQUEST")
+                               status: ResponseStatus.notSent, reason: "INVALID_REQUEST",
+                               cause: FailureCause.shared.invalidArgument(name: "currency"))
                 TapPaymentSession.EventsBridge(onEvent: onEvent).emit(.result(TapResult.refused(
                     reason: "INVALID_REQUEST",
                     message: "currency must be an ISO 4217 numeric code, e.g. \"566\"")))

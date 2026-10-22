@@ -397,7 +397,9 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
         val request = try {
             Mappers.verifyAccountParams(params)
         } catch (e: IllegalArgumentException) {
-            return@withInit promise.resolve(Mappers.verifyAccountRefused(Mappers.INVALID_REQUEST, e.message ?: "Invalid request"))
+            return@withInit promise.resolve(
+                Mappers.verifyAccountRefused(Mappers.INVALID_REQUEST, e.message ?: "Invalid request", cause = Mappers.badArgumentCause(e)),
+            )
         }
         wallet().verifyAccount(request) { promise.resolve(Mappers.verifyAccount(it)) }
     }
@@ -407,7 +409,9 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
         val request = try {
             Mappers.digitiseParams(params)
         } catch (e: IllegalArgumentException) {
-            return@withInit promise.resolve(Mappers.digitiseNotSent(Mappers.INVALID_REQUEST, e.message ?: "Invalid request"))
+            return@withInit promise.resolve(
+                Mappers.digitiseNotSent(Mappers.INVALID_REQUEST, e.message ?: "Invalid request", cause = Mappers.badArgumentCause(e)),
+            )
         }
         wallet().digitise(request) { promise.resolve(Mappers.digitiseResult(it)) }
     }
@@ -431,7 +435,10 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
         // separate contact to send.
         val activationMedium = ActivationMedium.entries.firstOrNull { it.value == medium }
             ?: return@withInit promise.resolve(
-                Mappers.activationCodeRefused(Mappers.INVALID_REQUEST, "Unknown activation medium: $medium"),
+                Mappers.activationCodeRefused(
+                    Mappers.INVALID_REQUEST, "Unknown activation medium: $medium",
+                    cause = Mappers.argumentCause("medium"),
+                ),
             )
         val activationReason = ActivationReason.entries.firstOrNull { it.value == reason } ?: ActivationReason.OTHER
         wallet().requestActivationCode(ref, activationMedium, activationReason) {
@@ -604,6 +611,7 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
             ?: return@withInit promise.resolve(
                 Mappers.paymentOutcomeNotSent(
                     Mappers.INVALID_REQUEST, "Unknown or already-used payment handle — re-inspect the QR",
+                    cause = Mappers.argumentCause("handle"),
                 ),
             )
         // Every refusal and no-answer is the outcome; only a setup error is a failure here.
@@ -748,7 +756,9 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
             Mappers.merchantRegistration(registration)
         } catch (e: IllegalArgumentException) {
             return@withInit promise.resolve(
-                Mappers.merchantRegistrationRefused(Mappers.INVALID_REQUEST, e.message ?: "Invalid request"),
+                Mappers.merchantRegistrationRefused(
+                    Mappers.INVALID_REQUEST, e.message ?: "Invalid request", cause = Mappers.badArgumentCause(e),
+                ),
             )
         }
         softpos().register(data) { promise.resolve(Mappers.merchantRegistrationResult(it)) }
@@ -830,7 +840,9 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
             Mappers.merchantUpdate(update)
         } catch (e: IllegalArgumentException) {
             // Raised by the argument reads, before anything reaches the SDK.
-            return@withInit promise.resolve(Mappers.merchantStatusRefused(Mappers.INVALID_REQUEST, e.message ?: "Invalid request"))
+            return@withInit promise.resolve(
+                Mappers.merchantStatusRefused(Mappers.INVALID_REQUEST, e.message ?: "Invalid request", cause = Mappers.badArgumentCause(e)),
+            )
         }
         softpos().updateMerchant(data) { promise.resolve(Mappers.merchantStatus(it)) }
     }
@@ -862,6 +874,7 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
                 reason = Mappers.INVALID_REQUEST,
                 stage = co.veyra.common.logging.failure.FailureStage.VALIDATE,
                 ids = mapOf("merchant_order_id" to merchantOrderId),
+                cause = Mappers.badArgumentCause(e),
             )
             emit(EventNames.SOFTPOS_TAP, Mappers.tapEventResult(sessionId,
                 Mappers.tapResultNotSent(Mappers.INVALID_REQUEST, e.message ?: "Invalid request")))
@@ -965,7 +978,10 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
         withInit(promise) {
             val scanned = cpmQrs.take(handle)
                 ?: return@withInit promise.resolve(
-                    Mappers.customerQrChargeNotSent(Mappers.INVALID_REQUEST, "Unknown or already-used QR handle — re-scan"),
+                    Mappers.customerQrChargeNotSent(
+                        Mappers.INVALID_REQUEST, "Unknown or already-used QR handle — re-scan",
+                        cause = Mappers.argumentCause("handle"),
+                    ),
                 )
             val sdk = softpos()
             scope.launch {

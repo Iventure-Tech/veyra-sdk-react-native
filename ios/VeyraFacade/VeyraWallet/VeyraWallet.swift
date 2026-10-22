@@ -57,7 +57,7 @@ public struct VeyraWalletConfiguration: Sendable {
     public let cdcvmShowQrTitle: String?
     public let cdcvmShowQrSubtitle: String?
     /// The longest the SDK waits for one backend call, start to finish, in seconds (5–60).
-    /// `nil` (the default) keeps the SDK's own timeouts. A value outside 5–60 makes `configure`
+    /// `nil` (the default) means 60 seconds. A value outside 5–60 makes `configure`
     /// throw `invalidConfiguration`. A payment that runs out of time is **pending**, not failed:
     /// the request may have reached the server, so the SDK checks the result later. A shorter
     /// timeout answers sooner but leaves more payments pending.

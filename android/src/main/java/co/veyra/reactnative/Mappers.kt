@@ -85,10 +85,12 @@ internal object Mappers {
         status: String = ResponseStatus.NOT_SENT,
         /** The SDK never sees a call the bridge refuses itself, so the bridge logs its failure line. */
         operation: String? = null,
+        /** The line's cause: which argument was refused ([badArgumentCause]). */
+        cause: String? = null,
     ): WritableMap = into.apply {
         if (operation != null) {
             @OptIn(co.veyra.common.VeyraInternalApi::class)
-            co.veyra.common.logging.failure.OperationFailureLog.reportBridgeRefusal(operation, status, reason)
+            co.veyra.common.logging.failure.OperationFailureLog.reportBridgeRefusal(operation, status, reason, cause)
         }
         putOutcome(status, reason, message)
         falseKeys.forEach { putBoolean(it, false) }
@@ -106,15 +108,16 @@ internal object Mappers {
         nullKeys: List<String> = emptyList(),
         into: WritableMap = Arguments.createMap(),
         operation: String? = null,
-    ): WritableMap = notSent(reason, message, falseKeys, nullKeys, into, ResponseStatus.FAILED, operation)
+        cause: String? = null,
+    ): WritableMap = notSent(reason, message, falseKeys, nullKeys, into, ResponseStatus.FAILED, operation, cause)
 
     /** `PaymentOutcome` (wallet scan-to-pay) refused before anything was sent. */
-    fun paymentOutcomeNotSent(reason: String, message: String, into: WritableMap = Arguments.createMap()) =
+    fun paymentOutcomeNotSent(reason: String, message: String, into: WritableMap = Arguments.createMap(), cause: String? = null) =
         notSent(reason, message, listOf("approved"), listOf("responseCode", "merchantName", "merchantLocation"), into,
-            operation = Ops.SCAN_TO_PAY)
+            operation = Ops.SCAN_TO_PAY, cause = cause)
 
     /** `CustomerQrChargeOutcome` refused before anything was sent. */
-    fun customerQrChargeNotSent(reason: String, message: String, into: WritableMap = Arguments.createMap()) =
+    fun customerQrChargeNotSent(reason: String, message: String, into: WritableMap = Arguments.createMap(), cause: String? = null) =
         notSent(
             reason, message, listOf("approved"),
             listOf(
@@ -123,29 +126,30 @@ internal object Mappers {
             ),
             into,
             operation = Ops.CPM_CHARGE,
+            cause = cause,
         )
 
     /** `MerchantRegistrationResult` refused before anything was sent: `FAILED`. */
-    fun merchantRegistrationRefused(reason: String, message: String, into: WritableMap = Arguments.createMap()) =
+    fun merchantRegistrationRefused(reason: String, message: String, into: WritableMap = Arguments.createMap(), cause: String? = null) =
         refused(reason, message, listOf("success"), listOf("merchantId", "terminalId", "merchantStatus"), into,
-            operation = Ops.MERCHANT_REGISTER)
+            operation = Ops.MERCHANT_REGISTER, cause = cause)
 
     /** `MerchantStatusResult` refused before anything was sent: `FAILED`. */
-    fun merchantStatusRefused(reason: String, message: String, into: WritableMap = Arguments.createMap()) =
+    fun merchantStatusRefused(reason: String, message: String, into: WritableMap = Arguments.createMap(), cause: String? = null) =
         refused(reason, message, nullKeys = listOf("merchantId", "merchantStatus"), into = into,
-            operation = Ops.MERCHANT_STATUS)
+            operation = Ops.MERCHANT_STATUS, cause = cause)
 
     /** `ActivationCodeResponse` refused before anything was sent: `FAILED`. */
-    fun activationCodeRefused(reason: String, message: String, into: WritableMap = Arguments.createMap()) =
+    fun activationCodeRefused(reason: String, message: String, into: WritableMap = Arguments.createMap(), cause: String? = null) =
         refused(
             reason, message,
             nullKeys = listOf("tokenUniqueReference", "expirationDateTime", "status", "failureCode"),
-            into = into, operation = Ops.ACTIVATION,
+            into = into, operation = Ops.ACTIVATION, cause = cause,
         )
 
     /** `VerifyAccountResponse` refused before anything was sent: `FAILED`. */
-    fun verifyAccountRefused(reason: String, message: String, into: WritableMap = Arguments.createMap()) =
-        refused(reason, message, listOf("isApproved"), listOf("responseCode"), into, operation = Ops.VERIFY_ACCOUNT)
+    fun verifyAccountRefused(reason: String, message: String, into: WritableMap = Arguments.createMap(), cause: String? = null) =
+        refused(reason, message, listOf("isApproved"), listOf("responseCode"), into, operation = Ops.VERIFY_ACCOUNT, cause = cause)
 
     /** `DigitiseResult` refused before anything was sent. */
     fun digitiseNotSent(
@@ -153,16 +157,39 @@ internal object Mappers {
         message: String,
         into: WritableMap = Arguments.createMap(),
         methodsInto: WritableArray = Arguments.createArray(),
+        cause: String? = null,
     ) = notSent(
         reason, message, listOf("isApproved", "requiresActivation"),
         listOf("responseCode", "tokenUniqueReference", "tokenStored", "clientRequestId"), into, operation = Ops.DIGITISE,
+        cause = cause,
     ).apply { putArray("activationMethods", methodsInto) }
 
     // ── Readers ─────────────────────────────────────────────────────────────────
 
+    /** A call argument the bridge refuses, by its JS name (the failure line's cause). */
+    class BadArgument(val argument: String, message: String) : IllegalArgumentException(message)
+
+    /** The failure line's cause for the refused argument [name]: `INVALID_ARGUMENT:<name>`. */
+    @OptIn(co.veyra.common.VeyraInternalApi::class)
+    fun argumentCause(name: String): String = co.veyra.common.logging.failure.FailureCause.invalidArgument(name)
+
+    /** [argumentCause] for a [BadArgument], else the exception's own cause code. */
+    @OptIn(co.veyra.common.VeyraInternalApi::class)
+    fun badArgumentCause(e: Throwable): String =
+        (e as? BadArgument)?.let { argumentCause(it.argument) } ?: co.veyra.common.logging.failure.FailureCause.of(e)
+
+    /** [read] the argument [key], any refusal attributed to it. */
+    private inline fun <T> arg(key: String, read: () -> T): T = try {
+        read()
+    } catch (e: BadArgument) {
+        throw e
+    } catch (e: IllegalArgumentException) {
+        throw BadArgument(key, e.message ?: "$key is invalid")
+    }
+
     fun ReadableMap.req(key: String): String =
-        if (hasKey(key) && !isNull(key)) getString(key)!!.also { require(it.isNotBlank()) { "$key must not be blank" } }
-        else throw IllegalArgumentException("$key is required")
+        if (hasKey(key) && !isNull(key)) getString(key)!!.also { if (it.isBlank()) throw BadArgument(key, "$key must not be blank") }
+        else throw BadArgument(key, "$key is required")
 
     fun ReadableMap.opt(key: String): String? =
         if (hasKey(key) && !isNull(key)) getString(key) else null
@@ -194,7 +221,7 @@ internal object Mappers {
             walletAccountId = map.req("walletAccountId"),
         ).apply {
             map.opt("accountHolderName")?.let { accountHolderName(it) }
-            map.opt("accountNumberSource")?.let { accountNumberSource(AccountNumberSource.valueOf(it)) }
+            map.opt("accountNumberSource")?.let { accountNumberSource(arg("accountNumberSource") { AccountNumberSource.valueOf(it) }) }
         }.build()
 
     /**
@@ -208,17 +235,17 @@ internal object Mappers {
         accountHolderName = map.req("accountHolderName"),
         walletAccountId = map.req("walletAccountId"),
         emailAddress = map.req("emailAddress"),
-        recommendation = TokenizationRecommendation.valueOf(map.req("recommendation")),
+        recommendation = arg("recommendation") { TokenizationRecommendation.valueOf(map.req("recommendation")) },
         consumerIdentifier = map.opt("consumerIdentifier"),
         bvn = map.opt("bvn"),
         accountHolderAddress = map.opt("accountHolderAddress"),
         mobileNumber = map.opt("mobileNumber"),
         clientRequestId = map.opt("clientRequestId")?.takeIf { it.isNotBlank() },
-        accountNumberSource = map.opt("accountNumberSource")?.let { AccountNumberSource.valueOf(it) },
-        deviceScore = map.opt("deviceScore")?.let { TrustScore.valueOf(it) },
-        accountScore = map.opt("accountScore")?.let { TrustScore.valueOf(it) },
+        accountNumberSource = map.opt("accountNumberSource")?.let { arg("accountNumberSource") { AccountNumberSource.valueOf(it) } },
+        deviceScore = map.opt("deviceScore")?.let { arg("deviceScore") { TrustScore.valueOf(it) } },
+        accountScore = map.opt("accountScore")?.let { arg("accountScore") { TrustScore.valueOf(it) } },
         recommendationReasons = map.optStringList("recommendationReasons")
-            ?.map { TokenizationRecommendationReason.valueOf(it) },
+            ?.map { arg("recommendationReasons") { TokenizationRecommendationReason.valueOf(it) } },
         bankName = map.opt("bankName"),
     )
 
@@ -226,7 +253,7 @@ internal object Mappers {
     fun merchantRegistration(map: ReadableMap): MerchantRegistration {
         val type = map.req("merchantType").let { raw ->
             MerchantType.entries.firstOrNull { it.name == raw }
-                ?: throw IllegalArgumentException("merchantType must be PERSONAL or BUSINESS")
+                ?: throw BadArgument("merchantType", "merchantType must be PERSONAL or BUSINESS")
         }
         return MerchantRegistration(
             merchantType = type,
@@ -269,7 +296,7 @@ internal object Mappers {
      */
     fun tapRequest(map: ReadableMap): TapRequest {
         if (!map.hasKey("amountMinorUnits") || map.isNull("amountMinorUnits")) {
-            throw IllegalArgumentException("amountMinorUnits is required")
+            throw BadArgument("amountMinorUnits", "amountMinorUnits is required")
         }
         return TapRequest(
             amountMinorUnits = map.getDouble("amountMinorUnits").toLong(),

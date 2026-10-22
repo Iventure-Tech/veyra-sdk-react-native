@@ -147,13 +147,15 @@ class VeyraSdkReactNative: RCTEventEmitter {
   private func opt(_ value: Any?) -> Any { value ?? NSNull() }
 
   /// A `NOT_SENT` outcome the bridge itself gives for a bad call argument — nothing reached the
-  /// SDK. `falseKeys` / `nullKeys` are the type's other keys, present and empty.
+  /// SDK. `falseKeys` / `nullKeys` are the type's other keys, present and empty. `cause` names the
+  /// refused argument(s) on the failure line — see `badArguments`.
   private func notSent(_ reason: String, _ message: String,
                        falseKeys: [String] = [], nullKeys: [String] = [],
-                       status: String = notSentStatus, operation: String? = nil) -> [String: Any] {
+                       status: String = notSentStatus, operation: String? = nil,
+                       cause: String? = nil) -> [String: Any] {
     // The SDK never sees a call the bridge refuses itself, so the bridge logs the failure line.
     if let operation = operation {
-      OperationFailureLog.shared.reportBridgeRefusal(operation: operation, status: status, reason: reason)
+      OperationFailureLog.shared.reportBridgeRefusal(operation: operation, status: status, reason: reason, cause: cause)
     }
     var body: [String: Any] = [
       "responseStatus": status,
@@ -165,39 +167,53 @@ class VeyraSdkReactNative: RCTEventEmitter {
     return body
   }
 
-  private func paymentOutcomeNotSent(_ message: String) -> [String: Any] {
-    notSent(Self.invalidRequest, message, falseKeys: ["approved"],
-            nullKeys: ["responseCode", "merchantName", "merchantLocation"],
-            operation: SdkOperation.shared.SCAN_TO_PAY)
+  /// The failure line's cause for refused bridge arguments: `INVALID_ARGUMENT:a,b`.
+  private func badArguments(_ names: [String]) -> String {
+    FailureCause.shared.invalidArgument(name: names.joined(separator: ","))
   }
 
-  private func customerQrChargeNotSent(_ message: String) -> [String: Any] {
+  /// The [keys] of [params] that are not strings — the arguments a `guard let … as? String` refused.
+  private func nonStringKeys(_ params: NSDictionary, _ keys: [String]) -> [String] {
+    keys.filter { params[$0] as? String == nil }
+  }
+
+  private func paymentOutcomeNotSent(_ message: String, cause: String) -> [String: Any] {
+    notSent(Self.invalidRequest, message, falseKeys: ["approved"],
+            nullKeys: ["responseCode", "merchantName", "merchantLocation"],
+            operation: SdkOperation.shared.SCAN_TO_PAY, cause: cause)
+  }
+
+  private func customerQrChargeNotSent(_ message: String, cause: String) -> [String: Any] {
     notSent(Self.invalidRequest, message, falseKeys: ["approved"],
             nullKeys: ["responseCode", "transactionId", "merchantTransactionReference", "merchantOrderId",
                        "creditTransactionId", "isCreditConfirmationSupported", "originalPayment"],
-            operation: SdkOperation.shared.CPM_CHARGE)
+            operation: SdkOperation.shared.CPM_CHARGE, cause: cause)
   }
 
   /// Not a payment or digitisation, so a refusal is `FAILED`, never `NOT_SENT` (devices §15.2).
   private static let failedStatus = "FAILED"
 
-  private func merchantRegistrationRefused(_ message: String) -> [String: Any] {
+  /// The string fields merchant registration and update both require.
+  private static let merchantProfileKeys = ["merchantName", "emailAddress", "phoneNumber", "addressLine1", "city",
+                                            "state", "countryCode", "accountNumber", "institutionCode"]
+
+  private func merchantRegistrationRefused(_ message: String, cause: String) -> [String: Any] {
     notSent(Self.invalidRequest, message, falseKeys: ["success"],
             nullKeys: ["merchantId", "terminalId", "merchantStatus"], status: Self.failedStatus,
-            operation: SdkOperation.shared.MERCHANT_REGISTER)
+            operation: SdkOperation.shared.MERCHANT_REGISTER, cause: cause)
   }
 
-  private func merchantStatusRefused(_ reason: String, _ message: String) -> [String: Any] {
+  private func merchantStatusRefused(_ reason: String, _ message: String, cause: String) -> [String: Any] {
     notSent(reason, message, nullKeys: ["merchantId", "merchantStatus"], status: Self.failedStatus,
-            operation: SdkOperation.shared.MERCHANT_STATUS)
+            operation: SdkOperation.shared.MERCHANT_STATUS, cause: cause)
   }
 
-  private func tapResultNotSent(_ message: String) -> [String: Any] {
+  private func tapResultNotSent(_ message: String, cause: String) -> [String: Any] {
     notSent(Self.invalidRequest, message,
                        nullKeys: ["responseCode", "amountMinorUnits", "cardScheme", "maskedTokenLast4",
                                   "merchantTransactionReference", "transactionId", "merchantStatus",
                                   "creditTransactionId", "isCreditConfirmationSupported", "originalPayment"],
-                       operation: SdkOperation.shared.MERCHANT_TAP)
+                       operation: SdkOperation.shared.MERCHANT_TAP, cause: cause)
   }
 
   /// `OriginalPayment`: on a `DUPLICATE_MERCHANT_ORDER_ID` refusal, the payment already holding the
@@ -533,7 +549,8 @@ class VeyraSdkReactNative: RCTEventEmitter {
     else {
       return resolve(notSent(Self.invalidRequest, "accountNumber, institutionCode and walletAccountId are required",
                              falseKeys: ["isApproved"], nullKeys: ["responseCode"],
-                             status: Self.failedStatus, operation: SdkOperation.shared.VERIFY_ACCOUNT))
+                             status: Self.failedStatus, operation: SdkOperation.shared.VERIFY_ACCOUNT,
+                             cause: badArguments(nonStringKeys(params, ["accountNumber", "institutionCode", "walletAccountId"]))))
     }
     Task {
       do {
@@ -567,10 +584,15 @@ class VeyraSdkReactNative: RCTEventEmitter {
           let recommendationRaw = params["recommendation"] as? String,
           let recommendation = TokenizationRecommendation(rawValue: recommendationRaw)
     else {
+      // Which ones — a missing field, or a recommendation that is not a known value.
+      let refusedArgs = nonStringKeys(params, ["accountNumber", "institutionCode", "accountHolderName",
+                                               "walletAccountId", "emailAddress"])
+        + ((params["recommendation"] as? String).flatMap(TokenizationRecommendation.init(rawValue:)) == nil
+           ? ["recommendation"] : [])
       var refused = notSent(Self.invalidRequest, "required digitise fields missing",
                             falseKeys: ["isApproved", "requiresActivation"],
                             nullKeys: ["responseCode", "tokenUniqueReference", "tokenStored", "clientRequestId"],
-                            operation: SdkOperation.shared.DIGITISE)
+                            operation: SdkOperation.shared.DIGITISE, cause: badArguments(refusedArgs))
       refused["activationMethods"] = [Any]()
       return resolve(refused)
     }
@@ -628,7 +650,7 @@ class VeyraSdkReactNative: RCTEventEmitter {
       return resolve(notSent(
         Self.invalidRequest, "On iOS the activation medium must be MASKED_EMAIL or MASKED_MOBILE_PHONE",
         nullKeys: ["tokenUniqueReference", "expirationDateTime", "status", "failureCode"],
-        status: Self.failedStatus, operation: SdkOperation.shared.ACTIVATION
+        status: Self.failedStatus, operation: SdkOperation.shared.ACTIVATION, cause: badArguments(["medium"])
       ))
     }
     let activationReason = ActivationReason(rawValue: reason) ?? .other
@@ -952,7 +974,8 @@ class VeyraSdkReactNative: RCTEventEmitter {
   func walletPayScannedContext(_ handle: String, resolver resolve: @escaping RCTPromiseResolveBlock,
                                rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     guard let payment = mpmContexts.removeValue(forKey: handle) else {
-      return resolve(paymentOutcomeNotSent("Unknown or already-used payment handle — re-inspect the QR"))
+      return resolve(paymentOutcomeNotSent("Unknown or already-used payment handle — re-inspect the QR",
+                                           cause: badArguments(["handle"])))
     }
     Task {
       do {
@@ -1196,7 +1219,10 @@ class VeyraSdkReactNative: RCTEventEmitter {
                        rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     guard let typeRaw = registration["merchantType"] as? String,
           let merchantType = MerchantRegistration.MerchantType(rawValue: typeRaw)
-    else { return resolve(merchantRegistrationRefused("merchantType must be PERSONAL or BUSINESS")) }
+    else {
+      return resolve(merchantRegistrationRefused("merchantType must be PERSONAL or BUSINESS",
+                                                 cause: badArguments(["merchantType"])))
+    }
     guard
           let merchantName = registration["merchantName"] as? String,
           let emailAddress = registration["emailAddress"] as? String,
@@ -1207,7 +1233,10 @@ class VeyraSdkReactNative: RCTEventEmitter {
           let countryCode = registration["countryCode"] as? String,
           let accountNumber = registration["accountNumber"] as? String,
           let institutionCode = registration["institutionCode"] as? String
-    else { return resolve(merchantRegistrationRefused("required merchant registration fields missing")) }
+    else {
+      return resolve(merchantRegistrationRefused("required merchant registration fields missing",
+                                                 cause: badArguments(nonStringKeys(registration, Self.merchantProfileKeys))))
+    }
     let reg = MerchantRegistration(
       merchantType: merchantType,
       merchantName: merchantName,
@@ -1373,7 +1402,10 @@ class VeyraSdkReactNative: RCTEventEmitter {
           let countryCode = update["countryCode"] as? String,
           let accountNumber = update["accountNumber"] as? String,
           let institutionCode = update["institutionCode"] as? String
-    else { return resolve(merchantStatusRefused(Self.invalidRequest, "required merchant update fields missing")) }
+    else {
+      return resolve(merchantStatusRefused(Self.invalidRequest, "required merchant update fields missing",
+                                           cause: badArguments(nonStringKeys(update, Self.merchantProfileKeys))))
+    }
     let merchantUpdate = MerchantUpdate(
       merchantName: merchantName,
       emailAddress: emailAddress,
@@ -1448,7 +1480,7 @@ class VeyraSdkReactNative: RCTEventEmitter {
       sendEvent(withName: EventName.softposTap, body: [
         "sessionId": sessionId,
         "type": "result",
-        "result": tapResultNotSent("amountMinorUnits is required"),
+        "result": tapResultNotSent("amountMinorUnits is required", cause: badArguments(["amountMinorUnits"])),
       ])
       return
     }
@@ -1607,7 +1639,8 @@ class VeyraSdkReactNative: RCTEventEmitter {
                                resolver resolve: @escaping RCTPromiseResolveBlock,
                                rejecter rejecter: @escaping RCTPromiseRejectBlock) {
     guard let scanned = cpmQrs.removeValue(forKey: handle) else {
-      return resolve(customerQrChargeNotSent("Unknown or already-used QR handle — re-scan"))
+      return resolve(customerQrChargeNotSent("Unknown or already-used QR handle — re-scan",
+                                             cause: badArguments(["handle"])))
     }
     Task {
       do {

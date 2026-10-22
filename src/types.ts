@@ -188,7 +188,7 @@ export interface VeyraSoftposConfig {
   enableNfc?: boolean;
   /**
    * The longest the SDK waits for one backend call, start to finish, in whole seconds (5–60).
-   * Omit it to keep the SDK's own timeouts. A value outside 5–60 makes `initialize` reject with
+   * Omit it for 60 seconds. A value outside 5–60 makes `initialize` reject with
    * `INVALID_CONFIGURATION`. A payment that runs out of time is **pending**, not failed: the
    * request may have reached the server, so the SDK checks the result later. A shorter timeout
    * answers sooner but leaves more payments pending.
@@ -226,7 +226,7 @@ export interface VeyraWalletConfig {
   cdcvmShowQrSubtitle?: string;
   /**
    * The longest the SDK waits for one backend call, start to finish, in whole seconds (5–60).
-   * Omit it to keep the SDK's own timeouts. A value outside 5–60 makes `initialize` reject with
+   * Omit it for 60 seconds. A value outside 5–60 makes `initialize` reject with
    * `INVALID_CONFIGURATION`. A payment that runs out of time is **pending**, not failed: the
    * request may have reached the server, so the SDK checks the result later. A shorter timeout
    * answers sooner but leaves more payments pending.
