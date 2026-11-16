@@ -315,7 +315,7 @@ export const softpos = {
    *   non-blank — a blank one is `'NOT_SENT'` / `INVALID_REQUEST`, nothing sent. The SDK
    *   mints the transaction reference itself — the gateway makes `(merchantId, reference)` unique
    *   and only the SDK can promise that — and returns it on the outcome. This is the field for
-   *   *your* identifier. Reusable until the order is `APPROVED` or `PENDING`; after that a reused
+   *   *your* identifier. Reusable until the order is `APPROVED`, `ACCEPTED` or `PENDING`; after that a reused
    *   one is refused `94` / `FAILED` / `DUPLICATE_MERCHANT_ORDER_ID` — do not take another payment
    *   for the order.
    */
@@ -335,6 +335,10 @@ export const softpos = {
    * `APPROVED` / `DECLINED` / `FAILED`. Fires on Android and iOS alike, for any transaction that
    * settles (including one started in an earlier app launch), so match the event to its sale by
    * `merchantTransactionReference`.
+   *
+   * It also fires once with status `'ACCEPTED'` when a payment becomes accepted (the customer was
+   * debited, the credit to the merchant's bank is queued). That is not final: keep the goods and keep
+   * waiting — it fires again with the final status.
    *
    * There is no replay on subscription: a screen still reads {@link getTransaction} when it
    * appears, and uses this as the live update while it is up. Subscribe once, at start-up.
@@ -403,7 +407,7 @@ export const softpos = {
    * The same operation as Android `softpos.paymentStatus` and iOS
    * `VeyraSoftPOS.shared.paymentStatus(merchantOrderID:)`.
    *
-   * The order's `responseStatus` is decided by precedence over all its attempts: any `'APPROVED'`, else
+   * The order's `responseStatus` is decided by precedence over all its attempts: any `'APPROVED'`, else any `'ACCEPTED'`, else
    * any `'PENDING'`, else the latest attempt (`'DECLINED'`, `'FAILED'` or `'RETRY'`); an order with no
    * attempts is `'RETRY'` / `25` / `UNABLE_TO_LOCATE_RECORD`. `attempts` lists every attempt, newest
    * first. Answered from this device's own record when it is final, otherwise from the gateway

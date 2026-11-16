@@ -324,6 +324,7 @@ receipts and support, never to branch on.
 | `DECLINED` | done; someone with authority refused; no money moved | free | show the reason; another card or method may be tried under the **same** order id |
 | `FAILED` | it was not performed, and retrying with the same reference won't help — on a call other than a payment or digitise, also when it never reached Veyra (no network, not authenticated, …) | free, except after `94` (the order is already paid or possibly paid) | fix the reason and try again |
 | `PENDING` | may have been done; not known yet | used | **never retry**; the SDK resolves it in the background |
+| `ACCEPTED` | payments only: the customer was debited and the credit to the merchant's bank is queued; **not final** | used | **never retry**, and don't release goods yet; the SDK keeps checking and tells you when it becomes `APPROVED`, or `FAILED` / `CREDIT_FAILED` (the credit failed and the debit was reversed) |
 | `RETRY` | reached Veyra, but was never sent to the bank; nothing was done | **unused** | fix the reason; retry with the **same** order id |
 | `NOT_SENT` | payments and digitise only: never reached Veyra; nothing was done | **unused** | fix the reason; retry with the **same** order id (or digitise request) |
 
@@ -346,7 +347,21 @@ and the vocabulary grows without an SDK release, so always keep a default branch
 `21` / `NAME_ENQUIRY_FAILED`) and the payment is recorded in history. Handle it exactly like
 `NOT_SENT` — nothing was debited; the reason says where it stopped.
 
-- **The retry rule.** An order id can be used again until the order is `APPROVED` or `PENDING`.
+`ACCEPTED` is payments only and is **not final**: the customer has been debited and the credit to
+the merchant's bank is queued. The SDK keeps checking it exactly as it does a `PENDING` payment and
+tells you when it becomes `APPROVED`, or `FAILED` with `CREDIT_FAILED` (the credit failed and the
+debit was reversed). A merchant app shows "Payment accepted - customer debited. Wait for approval
+before releasing goods"; a wallet app shows "Payment accepted - waiting for credit approval". There
+is no receipt and no credit confirmation until the payment is `APPROVED`. An SDK older than this
+status treats it as a status it doesn't know: unresolved, and still checked.
+
+`ACCEPTED` is not `PENDING`. `PENDING` means the outcome is unknown: the customer may or may not
+have been debited. `ACCEPTED` means the outcome so far is known: the debit happened and only the
+credit is outstanding. Expect `ACCEPTED` on inter-bank payments, where the customer's bank and the
+merchant's bank differ and the credit travels through the inter-bank network. A payment within one
+bank is normally settled in one step and does not answer `ACCEPTED`.
+
+- **The retry rule.** An order id can be used again until the order is `APPROVED`, `ACCEPTED` or `PENDING`.
   After `NOT_SENT`, `RETRY`, `DECLINED` or `FAILED` no money moved: keep the order id and pay again
   under the same one (fix the reason first; after a decline, another card). Once the order is paid
   or possibly paid — or the status is one your app doesn't know, which you treat as pending — a new
@@ -445,7 +460,7 @@ names".
 rail — `softpos.tap`, `createPaymentContext` and `chargeCustomerQr` — without saying which. Use it
 for a payment that ended `PENDING`, or when your app restarted before the result arrived. It
 resolves `VeyraLookup<OrderPaymentStatus>`: `responseStatus` is the **order's** status, by
-precedence over all its attempts — any `APPROVED`, else any `PENDING`, else the latest attempt
+precedence over all its attempts — any `APPROVED`, else any `ACCEPTED`, else any `PENDING`, else the latest attempt
 (`DECLINED`, `FAILED` or `RETRY`); an order with no attempts (including a merchant QR not paid yet)
 is `RETRY` / `25` / `UNABLE_TO_LOCATE_RECORD`. It also carries the deciding attempt's code, reason,
 `merchantTransactionReference`, `transactionId` and `amountMinorUnits`, every attempt newest first,
@@ -455,7 +470,7 @@ why and `value` is what this device holds, if anything. A blank order id resolve
 `failureReason: 'INVALID_REQUEST'`, a device with no registered merchant
 `'MISSING_MANDATORY_CONFIG'`. The wallet has no lookup by order id. The retry rule is above: after
 `NOT_SENT`, `RETRY`, `DECLINED` or `FAILED`, pay again under the **same** order id; after
-`APPROVED` or `PENDING`, don't take another payment.
+`APPROVED`, `ACCEPTED` or `PENDING`, don't take another payment.
 
 ## Use it
 
@@ -498,6 +513,8 @@ await softpos.tap.start({ amountMinorUnits: 105000, merchantOrderId: 'ORDER-1042
       return showNotSent(r.responseStatusReason);            // retry with the same order id
     case 'RETRY':
       return showNotSent(r.responseStatusReason);            // not sent to the bank: same order id
+    case 'ACCEPTED':
+      return showAccepted(r.merchantTransactionReference);  // debited, credit queued: hold the goods
     default:
       return showPending(r.merchantTransactionReference);   // PENDING: never charge again
   }

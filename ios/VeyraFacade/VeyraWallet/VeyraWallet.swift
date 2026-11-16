@@ -786,7 +786,8 @@ public struct TokenStatusChangedEvent: Sendable, Hashable {
     public let previousStatus: String?
 }
 
-/// A wallet payment that was left `PENDING` has reached its final outcome. Delivered to
+/// A wallet payment that was left `PENDING` has reached its final outcome — or, once before that,
+/// has become `ACCEPTED` (debited, credit queued; not final). Delivered to
 /// `VeyraWallet.shared.observeTransactionResolved`.
 public struct WalletTransactionResolvedEvent: Sendable, Hashable {
     /// The hash identifying this payment on every rail — the same value a receipt links on, and
@@ -794,7 +795,8 @@ public struct WalletTransactionResolvedEvent: Sendable, Hashable {
     public let transactionHash: String
     /// The card that paid.
     public let tokenUniqueReference: String?
-    /// `APPROVED`, `DECLINED` or `FAILED` — never `PENDING`.
+    /// `APPROVED`, `DECLINED` or `FAILED` when the payment ended, or `ACCEPTED` (not final — the
+    /// final status follows). Never `PENDING`.
     public let status: String
     /// The wire literal (`"00"`, `"51"`, …), for receipts and support. `nil` if the answer had none.
     public let responseCode: String?
@@ -841,7 +843,7 @@ public struct TransactionSummary: Sendable, Hashable {
     public let transactionHash: String?
     /// The token that paid.
     public let tokenUniqueReference: String?
-    /// `"PENDING"`, `"APPROVED"`, `"DECLINED"`, `"FAILED"`, or nil for unknown.
+    /// `"PENDING"`, `"ACCEPTED"`, `"APPROVED"`, `"DECLINED"`, `"FAILED"`, or nil for unknown.
     public let authorizationStatus: String?
     /// The outcome's response code (`"00"`, `"51"`, `"91"`…), carried verbatim from the rail
     /// that resolved this row; nil on legacy rows and rows still awaiting their reconcile.
@@ -1577,7 +1579,9 @@ extension VeyraWallet {
     /// the background sweep, an on-demand status check, and the scan-to-pay push.
     ///
     /// `status` is `APPROVED`, `DECLINED` or `FAILED` — never `PENDING`, because a row that is
-    /// still open has not resolved. `reason` is a plain string to display and log, never to
+    /// still open has not resolved. One exception: it fires once with `ACCEPTED` when the payment
+    /// becomes accepted (you were debited; the credit to the merchant's bank is queued). That is not
+    /// final — show "Payment accepted - waiting for credit approval"; the final status follows. `reason` is a plain string to display and log, never to
     /// parse; `responseCode` is the wire literal for receipts and support.
     ///
     /// Register once, at start-up — not per payment: the payment most likely to need this is

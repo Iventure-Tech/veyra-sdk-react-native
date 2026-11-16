@@ -511,7 +511,9 @@ export const wallet = {
 
   /**
    * Fires when a wallet payment that was left `PENDING` reaches its final outcome — from the
-   * SDK's background sweep, an on-demand status check, or the scan-to-pay push.
+   * SDK's background sweep, an on-demand status check, or the scan-to-pay push. It also fires once
+   * with status `'ACCEPTED'` when the payment becomes accepted (debited, credit queued): not final,
+   * the final status follows.
    *
    * Match the event to its payment by `transactionHash`. Subscribe once, at start-up: a payment
    * can settle days later, long after the screen that made it is gone. No replay, so a screen

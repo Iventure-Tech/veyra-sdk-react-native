@@ -212,19 +212,21 @@ public struct ScannedCustomerQr: Sendable {
 /// | `DECLINED` | someone with authority refused; no money moved | free | show the reason; another card or method may be tried under the **same** order ID |
 /// | `FAILED` | the gateway received it and did not perform it, and retrying with the same order ID won't help | free, except after `94` (the order is paid or possibly paid) | fix the reason |
 /// | `PENDING` | may have been done; not known yet | used | **never retry**; the SDK resolves it in the background |
+/// | `ACCEPTED` | payments only: the customer was debited and the credit to the merchant's bank is queued; **not final** | used | **never retry**, and don't release goods yet; the SDK keeps checking and tells you when it becomes `APPROVED`, or `FAILED` / `CREDIT_FAILED` (the credit failed and the debit was reversed) |
 /// | `RETRY` | reached the gateway, but was never sent to the bank; nothing was done | **unused** | fix the reason; retry with the **same** order ID |
 /// | `NOT_SENT` | never reached the gateway; nothing was done | **unused** | fix the reason; retry with the **same** order ID |
 /// The payment that already holds a merchant order ID, carried on a `FAILED` /
 /// `DUPLICATE_MERCHANT_ORDER_ID` refusal from a card tap, a customer-QR charge or a merchant QR.
 ///
 /// The refusal only says "this order ID is used". ``responseStatus`` says what happened to the order:
-/// `APPROVED` means it is already paid, `PENDING` that a payment is still being confirmed. **Do not take
+/// `APPROVED` means it is already paid, `ACCEPTED` that the customer was debited and the credit is queued,
+/// `PENDING` that a payment is still being confirmed. **Do not take
 /// another payment for the order** either way. Nil on the refusal when the gateway could not read the
 /// original (two attempts raced for the same order ID).
 public struct OriginalPayment: Sendable, Hashable {
     /// The original payment's wire code, e.g. `00`. For receipts and support only.
     public let responseCode: String?
-    /// The original payment's status: `APPROVED`, `DECLINED`, `FAILED` or `PENDING`.
+    /// The original payment's status: `APPROVED`, `ACCEPTED`, `DECLINED`, `FAILED` or `PENDING`.
     public let responseStatus: String?
     /// Why the original payment ended as it did, e.g. `INSUFFICIENT_FUNDS`.
     public let responseStatusReason: String?
@@ -261,14 +263,15 @@ public struct OrderPaymentAttempt: Sendable, Hashable {
     public let amountMinorUnits: Int64?
     /// The wire code — receipts and support only.
     public let responseCode: String?
-    /// `APPROVED`, `DECLINED`, `FAILED`, `PENDING` or `RETRY`.
+    /// `APPROVED`, `ACCEPTED`, `DECLINED`, `FAILED`, `PENDING` or `RETRY`.
     public let responseStatus: String?
     public let responseStatusReason: String?
 }
 
 /// What happened to a merchant order (`paymentStatus(merchantOrderID:)`). Branch on
-/// ``responseStatus``: `APPROVED` — paid, never take another payment; `PENDING` — may have moved money,
-/// never retry; `DECLINED` / `FAILED` / `RETRY` — no money moved, pay again with the **same** order ID.
+/// ``responseStatus``: `APPROVED` — paid, never take another payment; `ACCEPTED` — the customer was debited and the credit
+/// is queued, never take another payment and wait for `APPROVED` before releasing goods; `PENDING` — may
+/// have moved money, never retry; `DECLINED` / `FAILED` / `RETRY` — no money moved, pay again with the **same** order ID.
 /// The other top-level fields are the deciding attempt's; ``attempts`` lists them all, newest first.
 public struct OrderPaymentStatus: Sendable, Hashable {
     public let merchantOrderID: String
@@ -286,7 +289,7 @@ public struct OrderPaymentStatus: Sendable, Hashable {
 public struct CustomerQrChargeOutcome: Sendable, Hashable {
     /// True only when ``responseStatus`` is `APPROVED` — never worked out from the code.
     public let approved: Bool
-    /// `APPROVED` · `DECLINED` · `FAILED` · `PENDING` · `RETRY` · `NOT_SENT`. A plain string, so a status
+    /// `APPROVED` · `ACCEPTED` · `DECLINED` · `FAILED` · `PENDING` · `RETRY` · `NOT_SENT`. A plain string, so a status
     /// added after this SDK shipped still reaches you; treat one you don't know as unresolved.
     public let responseStatus: String
     /// Why it ended as it did (`INSUFFICIENT_FUNDS`, `NO_RESPONSE_RECEIVED`, `NO_NETWORK_CONNECTION`…).
@@ -465,7 +468,7 @@ public struct TransactionStatus: Sendable, Hashable {
 
 /// One payment the merchant has taken, kept locally by the SDK. `amountMinorUnits` is
 /// in **minor units**; `rail` is `"TAP"` / `"QR_MPM"` / `"QR_CPM"`; `status` is
-/// `"APPROVED"` / `"DECLINED"` / `"PENDING"` / `"FAILED"` / `"RETRY"` (see `ResponseStatus`); treat
+/// `"APPROVED"` / `"ACCEPTED"` / `"DECLINED"` / `"PENDING"` / `"FAILED"` / `"RETRY"` (see `ResponseStatus`); treat
 /// one you don't know as unresolved.
 public struct MerchantTransaction: Sendable, Hashable {
     /// The sale's reference, **minted by the SDK** (`{terminalID}-YYYYMMDDHHmmssSSS`) and unique
@@ -587,6 +590,10 @@ public struct CreditConfirmation: Sendable, Hashable {
 /// needs to know whether to print a receipt (`status == "APPROVED"`), tell the cashier the card
 /// was refused (`"DECLINED"`, with `reason` naming the cause) or offer a retry (`"FAILED"` —
 /// nothing happened).
+///
+/// It is also delivered once, with `status == "ACCEPTED"`, when a payment becomes accepted: the
+/// customer was debited and the credit to the merchant's bank is queued. That is **not final** — keep
+/// the goods and keep waiting; the final status follows in a second event.
 public struct TransactionResolvedEvent: Sendable, Hashable {
     /// The merchant transaction reference passed in when the payment was started. The SDK walks
     /// every pending row, so this can fire for a sale other than the one on screen — always match
@@ -595,7 +602,8 @@ public struct TransactionResolvedEvent: Sendable, Hashable {
     /// The response code exactly as the backend sent it (`"00"`, `"51"`, `"96"`…). Receipts and
     /// disputes quote this literal, never a renamed enum. Nil on rows recorded before it existed.
     public let responseCode: String?
-    /// `"APPROVED"` / `"DECLINED"` / `"FAILED"` — always one of the three finals, never `"PENDING"`.
+    /// `"APPROVED"` / `"DECLINED"` / `"FAILED"` when the payment ended, or `"ACCEPTED"` (not final —
+    /// the final status follows). Never `"PENDING"`.
     public let status: String
     /// Why it ended that way, e.g. `"INSUFFICIENT_FUNDS"`. Nil when the backend sent none.
     public let reason: String?
@@ -1298,6 +1306,12 @@ public final class VeyraSoftPOS: @unchecked Sendable {
     /// transaction that resolves — including one started in an earlier app launch — so match
     /// `resolution.reference` to the sale you care about.
     ///
+    /// It also fires once with status `ACCEPTED` when a payment becomes accepted (the customer was
+    /// debited, the credit is queued). That is not final: show "Payment accepted - customer debited.
+    /// Wait for approval before releasing goods" and keep waiting — it fires again with the final
+    /// status (`APPROVED`, or `FAILED` / `CREDIT_FAILED` when the credit failed and the debit was
+    /// reversed).
+    ///
     /// **A notification, never the source of truth.** There is no replay on registration: an app
     /// that was not running when the row settled learns about it from ``transactions(limit:)``.
     ///
@@ -1441,7 +1455,7 @@ public final class VeyraSoftPOS: @unchecked Sendable {
     /// - Parameter merchantOrderID: your own order/basket/invoice id for this sale.
     ///   **Required** and non-blank — a blank one is a `NOT_SENT` / `INVALID_REQUEST` outcome.
     ///   The SDK mints the transaction reference itself; this is the field for *your*
-    ///   identifier. Reusable until the order is `APPROVED` or `PENDING`; after that a reused one
+    ///   identifier. Reusable until the order is `APPROVED`, `ACCEPTED` or `PENDING`; after that a reused one
     ///   is refused `94` / `FAILED` / `DUPLICATE_MERCHANT_ORDER_ID` — do not take another payment
     ///   for the order.
     public func chargeCustomerQr(
@@ -1602,7 +1616,7 @@ public final class VeyraSoftPOS: @unchecked Sendable {
     /// tap, ``createPaymentContext(amountMinorUnits:currency:merchantOrderID:onExpired:)`` or
     /// ``chargeCustomerQr(_:merchantOrderID:)``. Works for all three rails; you don't say which.
     ///
-    /// The order's status is decided by precedence over all its attempts: any `APPROVED`, else any
+    /// The order's status is decided by precedence over all its attempts: any `APPROVED`, else any `ACCEPTED`, else any
     /// `PENDING`, else the latest attempt (`DECLINED`, `FAILED` or `RETRY`); an order with no
     /// attempts is `RETRY` / `25` / `UNABLE_TO_LOCATE_RECORD`. ``OrderPaymentStatus/attempts`` lists
     /// every attempt. Answered from this phone's own record when it is final, otherwise from the
@@ -1932,8 +1946,8 @@ public enum TapSessionOutcome: String, Sendable {
 
 /// The outcome of a tap payment, carried by ``TapEvent/result(_:)``.
 public struct TapResult: Sendable {
-    /// The outcome — what you branch on: `"APPROVED"`, `"DECLINED"`, `"FAILED"`, `"PENDING"`,
-    /// `"RETRY"`, or `"NOT_SENT"` when the payment never reached the gateway (``responseStatusReason``
+    /// The outcome — what you branch on: `"APPROVED"`, `"ACCEPTED"`, `"DECLINED"`, `"FAILED"`,
+    /// `"PENDING"`, `"RETRY"`, or `"NOT_SENT"` when the payment never reached the gateway (``responseStatusReason``
     /// says why — `NO_NETWORK_CONNECTION`, `CARD_READ_FAILED`, `MODE_REFUSED`, `INVALID_REQUEST`,
     /// `CANCELLED`…; retry with the same order ID). `"PENDING"` always means "the SDK is still
     /// resolving it — never charge again". A status you don't know is unresolved, never a decline.

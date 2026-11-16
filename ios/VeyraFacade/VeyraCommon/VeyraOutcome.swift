@@ -12,19 +12,24 @@ import Foundation
 /// | `DECLINED` | done; someone with authority refused; no money moved | free | show the reason; another card or method may be tried under the **same** reference |
 /// | `FAILED` | received, but not performed, and retrying with the same reference won't help | free, except after `94` (the order is paid or possibly paid) | fix the reason |
 /// | `PENDING` | may have been done; not known yet | used | **never retry**; the SDK resolves it in the background |
+/// | `ACCEPTED` | payments only: the customer was debited and the credit to the merchant's bank is queued; **not final** | used | **never retry**, and don't release goods yet; the SDK keeps checking and tells you when it becomes `APPROVED`, or `FAILED` / `CREDIT_FAILED` (the credit failed and the debit was reversed) |
 /// | `RETRY` | Veyra received it and did not send it to the bank; nothing was done | **unused** | fix the reason; retry with the **same** reference |
 /// | `NOT_SENT` | never reached Veyra; nothing was done | **unused** | fix the reason; retry with the **same** reference |
 ///
 /// `NOT_SENT` is the SDK's own status: no service ever states it, and it never carries a response code.
 /// `RETRY` is stated by Veyra, carries its response code, and is recorded in history. `RETRY` and
 /// `NOT_SENT` are handled the same way: nothing was debited; retry with the same order ID.
-/// An order ID can be used again until the order is `APPROVED` or `PENDING`; after that a new attempt
+/// An order ID can be used again until the order is `APPROVED`, `ACCEPTED` or `PENDING`; after that a new attempt
 /// is refused `94` / `FAILED` / `DUPLICATE_MERCHANT_ORDER_ID`.
 public enum ResponseStatus {
     public static let approved = "APPROVED"
     public static let declined = "DECLINED"
     public static let failed = "FAILED"
     public static let pending = "PENDING"
+    /// Payments only, and **not final**: the customer was debited and the credit to the merchant's
+    /// bank is queued. The SDK keeps checking as it does for `pending`; the payment then becomes
+    /// `approved`, or `failed` with `CREDIT_FAILED` (the credit failed and the debit was reversed).
+    public static let accepted = "ACCEPTED"
     public static let notSent = "NOT_SENT"
     public static let retry = "RETRY"
 }

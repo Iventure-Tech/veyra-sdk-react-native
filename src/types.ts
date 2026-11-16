@@ -27,14 +27,18 @@ export type VeyraMode = 'NONE' | 'SOFTPOS' | 'WALLET';
  * | `DECLINED` | done; someone with authority refused; no money moved | free | show the reason; another card or method may be tried under the **same** reference |
  * | `FAILED` | Veyra received it and did not perform it, and retrying with the same reference won't help | free, except after `94` (the order is paid or possibly paid) | fix the reason |
  * | `PENDING` | may have been done; not known yet | used | **never retry**; the SDK resolves it in the background |
+ * | `ACCEPTED` | payments only: the customer was debited and the credit to the merchant's bank is queued; **not final** | used | **never retry**, and don't release goods yet; the SDK keeps checking and tells you when it becomes `APPROVED`, or `FAILED` / `CREDIT_FAILED` (the credit failed and the debit was reversed) |
  * | `RETRY` | Veyra received it and did not send it to the bank; nothing was done | **unused** | fix the reason; retry with the **same** reference |
  * | `NOT_SENT` | never reached Veyra; nothing was done | **unused** | fix the reason; retry with the **same** reference |
  *
  * `RETRY` is stated by Veyra and carries its `responseCode` (e.g. `91`, `25`); the payment is recorded
  * in history. `NOT_SENT` never left the phone and is not recorded. Handle the two the same way: nothing
  * was debited; retry with the same order id. An order id can be used again until the order is
- * `APPROVED` or `PENDING`; after that a new attempt is refused `94` / `FAILED` /
+ * `APPROVED`, `ACCEPTED` or `PENDING`; after that a new attempt is refused `94` / `FAILED` /
  * `DUPLICATE_MERCHANT_ORDER_ID`.
+ *
+ * `ACCEPTED` is payments only and is not final: the SDK keeps checking it as it does `PENDING`, and it
+ * becomes `APPROVED`, or `FAILED` with `CREDIT_FAILED` (the credit failed and the debit was reversed).
  *
  * `NOT_SENT` is the SDK's own status — no service states it — and never carries a `responseCode`. Its
  * `responseStatusReason` says what to fix: `INVALID_REQUEST`, `NO_NETWORK_CONNECTION`,
@@ -50,6 +54,7 @@ export type ResponseStatus =
   | 'DECLINED'
   | 'FAILED'
   | 'PENDING'
+  | 'ACCEPTED'
   | 'RETRY'
   | 'NOT_SENT'
   | (string & {});
@@ -806,8 +811,11 @@ export type TransactionResolvedEvent = {
   merchantTransactionReference: string;
   /** The response code exactly as the backend sent it (`'00'`, `'51'`, `'96'`…). */
   responseCode: string | null;
-  /** Always one of the three finals — never `'PENDING'`. */
-  status: 'APPROVED' | 'DECLINED' | 'FAILED' | 'RETRY' | string;
+  /**
+   * A final status, or `'ACCEPTED'` once before it (debited, credit queued — not final; the final
+   * status follows in a second event). Never `'PENDING'`.
+   */
+  status: 'APPROVED' | 'ACCEPTED' | 'DECLINED' | 'FAILED' | 'RETRY' | string;
   /** Why it ended that way, e.g. `'INSUFFICIENT_FUNDS'`. Null when the backend sent none. */
   reason: string | null;
 };
@@ -879,8 +887,11 @@ export type WalletTransactionResolvedEvent = {
   transactionHash: string;
   /** The card that paid. */
   tokenUniqueReference: string | null;
-  /** Always one of the three finals — never `'PENDING'`. */
-  status: 'APPROVED' | 'DECLINED' | 'FAILED' | 'RETRY' | string;
+  /**
+   * A final status, or `'ACCEPTED'` once before it (debited, credit queued — not final; the final
+   * status follows in a second event). Never `'PENDING'`.
+   */
+  status: 'APPROVED' | 'ACCEPTED' | 'DECLINED' | 'FAILED' | 'RETRY' | string;
   /** The response code exactly as the backend sent it. */
   responseCode: string | null;
   /** Why it ended that way, e.g. `'INSUFFICIENT_FUNDS'`. Display and log it; never parse it. */
@@ -945,7 +956,7 @@ export interface TransactionSummary {
   transactionHash: string | null;
   /** The token that paid. */
   tokenUniqueReference: string | null;
-  authorizationStatus: 'PENDING' | 'APPROVED' | 'DECLINED' | 'FAILED' | 'RETRY' | (string & {}) | null;
+  authorizationStatus: 'PENDING' | 'ACCEPTED' | 'APPROVED' | 'DECLINED' | 'FAILED' | 'RETRY' | (string & {}) | null;
   /**
    * The outcome's response code (`"00"`, `"51"`, `"91"`…), carried verbatim from the rail that
    * resolved this row; `null` on legacy rows and rows still awaiting their reconcile. Receipts
@@ -1190,7 +1201,7 @@ export interface TapRequest {
    *
    * Echoed back on the result and shown on the transaction detail and receipt. An order can have
    * several attempts: reuse the order id after `DECLINED`, `FAILED`, `RETRY` or `NOT_SENT`. Once the
-   * order is `APPROVED` or `PENDING`, a reused one ends the payment `94` / `FAILED` /
+   * order is `APPROVED`, `ACCEPTED` or `PENDING`, a reused one ends the payment `94` / `FAILED` /
    * `DUPLICATE_MERCHANT_ORDER_ID` — do not take another payment for the order.
    *
    * The transaction **reference** is not yours to supply: the SDK mints it
@@ -1243,8 +1254,8 @@ export interface TapResult {
    */
   responseCode: string | null;
   /**
-   * The outcome — what you branch on: `'APPROVED'`, `'DECLINED'`, `'FAILED'`, `'PENDING'`, `'RETRY'`
-   * or `'NOT_SENT'` (the payment never reached the gateway — retry with the **same** order id).
+   * The outcome — what you branch on: `'APPROVED'`, `'ACCEPTED'`, `'DECLINED'`, `'FAILED'`, `'PENDING'`,
+   * `'RETRY'` or `'NOT_SENT'` (the payment never reached the gateway — retry with the **same** order id).
    */
   responseStatus: ResponseStatus;
   /** Why it ended as it did (`'INSUFFICIENT_FUNDS'`, `'CANCELLED'`, `'NO_NETWORK_CONNECTION'`…). */
@@ -1413,14 +1424,16 @@ export interface OrderPaymentAttempt {
   amountMinorUnits: number | null;
   /** The wire code — receipts and support only. */
   responseCode: string | null;
-  /** `'APPROVED'`, `'DECLINED'`, `'FAILED'`, `'PENDING'` or `'RETRY'`. */
+  /** `'APPROVED'`, `'ACCEPTED'`, `'DECLINED'`, `'FAILED'`, `'PENDING'` or `'RETRY'`. */
   responseStatus: ResponseStatus | null;
   responseStatusReason: string | null;
 }
 
 /**
  * What happened to a merchant order (`softpos.paymentStatus`). Branch on `responseStatus`:
- * `'APPROVED'` — paid, never take another payment; `'PENDING'` — may have moved money, never retry;
+ * `'APPROVED'` — paid, never take another payment; `'ACCEPTED'` — the customer was debited and the
+ * credit is queued, never take another payment and wait for `'APPROVED'` before releasing goods;
+ * `'PENDING'` — may have moved money, never retry;
  * `'DECLINED'` / `'FAILED'` / `'RETRY'` — no money moved, pay again with the **same** order id. The
  * other top-level fields are the deciding attempt's; `attempts` lists them all, newest first.
  */
@@ -1446,7 +1459,7 @@ export interface MerchantTransaction {
    */
   merchantOrderId: string | null;
   amountMinorUnits: number;
-  status: 'APPROVED' | 'DECLINED' | 'PENDING' | 'FAILED' | 'RETRY' | (string & {});
+  status: 'APPROVED' | 'ACCEPTED' | 'DECLINED' | 'PENDING' | 'FAILED' | 'RETRY' | (string & {});
   responseCode: string | null;
   /**
    * The outcome's stated cause (`"INSUFFICIENT_FUNDS"`, `"QR_EXPIRED"`…), carried verbatim as a
