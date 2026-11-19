@@ -1076,6 +1076,11 @@ export interface TransactionReceipt {
   cdcvmApprovedByWallet: boolean | null;
   transactionId: string | null;
   transactionHash: string | null;
+  /**
+   * The beneficiary credit's identifier (NIP session id inter-bank, batch reference intra-bank),
+   * when known: this wallet's own record of the payment first, the receipt QR's value otherwise.
+   */
+  creditTransactionId: string | null;
 }
 
 // ── SoftPOS: merchant ────────────────────────────────────────────────────────────

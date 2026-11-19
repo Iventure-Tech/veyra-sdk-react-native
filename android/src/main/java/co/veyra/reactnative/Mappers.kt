@@ -682,6 +682,7 @@ internal object Mappers {
             ?: putNull("cdcvmApprovedByWallet")
         putString("transactionId", r.transactionId)
         putString("transactionHash", r.transactionHash)
+        putString("creditTransactionId", r.creditTransactionId)
     }
 
     fun merchantRegistrationResult(r: MerchantRegistrationResult, into: WritableMap = Arguments.createMap()): WritableMap =

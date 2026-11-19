@@ -941,7 +941,7 @@ public struct ReconcileResult: Sendable, Hashable {
 /// The outcome of scanning a merchant receipt QR (`processReceipt`). On the phone; nothing is sent.
 /// `APPROVED` with ``receipt``, or `FAILED` with the reason: `INVALID_RECEIPT` (not a readable Veyra
 /// receipt), `RECEIPT_NOT_FROM_THIS_WALLET`, `RECEIPT_MISMATCH` (amount / currency / date / merchant /
-/// reference disagree with this wallet's record), `PAYMENT_NOT_CONFIRMED` (scan again shortly) or
+/// reference / credit transaction id disagree with this wallet's record), `PAYMENT_NOT_CONFIRMED` (scan again shortly) or
 /// `RECEIPT_FOR_ANOTHER_TRANSACTION`.
 public struct ReceiptScan: Sendable, Hashable {
     /// The stored receipt; nil unless `responseStatus` is `APPROVED`.
@@ -972,6 +972,9 @@ public struct TransactionReceipt: Sendable, Hashable {
     public let transactionID: String?
     /// SHA-256(cryptogram‖ATC‖UN) hex — links this receipt to a `TransactionSummary`.
     public let transactionHash: String?
+    /// The beneficiary credit's identifier (NIP session id inter-bank, batch reference intra-bank),
+    /// when known: this wallet's own record of the payment first, the receipt QR's value otherwise.
+    public let creditTransactionID: String?
 }
 
 // Without LocalizedError, `error.localizedDescription` renders the useless
@@ -1951,7 +1954,8 @@ extension VeyraWallet {
             cdcvmApprovedByWallet: r.cdcvmApprovedByWallet?.boolValue,
             cdcvmOutcome: r.cdcvmOutcome,
             transactionID: r.transactionId,
-            transactionHash: r.transactionHash
+            transactionHash: r.transactionHash,
+            creditTransactionID: r.creditTransactionId
         )
     }
 

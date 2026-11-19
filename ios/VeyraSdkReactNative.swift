@@ -1104,6 +1104,7 @@ class VeyraSdkReactNative: RCTEventEmitter {
       "cdcvmApprovedByWallet": r.cdcvmApprovedByWallet as Any,
       "transactionId": r.transactionID as Any,
       "transactionHash": r.transactionHash as Any,
+      "creditTransactionId": r.creditTransactionID as Any,
     ]
   }
 

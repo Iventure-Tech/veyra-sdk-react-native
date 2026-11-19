@@ -397,7 +397,7 @@ The wallet's on-phone calls answer too:
 - `wallet.processReceipt` resolves a `ReceiptScan` — `{ receipt, responseStatus,
   responseStatusReason, message }`: `APPROVED` with the stored `receipt`, or `FAILED` with
   `INVALID_RECEIPT`, `RECEIPT_NOT_FROM_THIS_WALLET`, `RECEIPT_MISMATCH` (amount, currency, date,
-  merchant or reference disagree), `PAYMENT_NOT_CONFIRMED` (scan again shortly) or
+  merchant, reference or credit transaction id disagree), `PAYMENT_NOT_CONFIRMED` (scan again shortly) or
   `RECEIPT_FOR_ANOTHER_TRANSACTION`. Nothing is sent.
 - `wallet.setActiveToken` resolves a `TokenSelection` — `{ responseStatus, responseStatusReason,
   message }`: `APPROVED`, or `FAILED` with `CARD_NOT_FOUND` (not in this wallet) or, on Android,
