@@ -175,12 +175,14 @@ class VeyraSdkModule(private val reactContext: ReactApplicationContext) :
 
     private fun hostActivity(): AppCompatActivity? = currentActivity as? AppCompatActivity
 
+    @OptIn(co.veyra.common.VeyraInternalApi::class)
     private inline fun withInit(promise: Promise, body: () -> Unit) {
         if (!initialized) {
             VeyraPromises.reject(promise, VeyraErrorCode.NOT_CONFIGURED, "Call Veyra.initialize first")
             return
         }
         if (!signedIn) {
+            co.veyra.common.logging.failure.OperationFailureLog.reportNotSignedIn(null)
             VeyraPromises.reject(
                 promise, VeyraErrorCode.NOT_SIGNED_IN,
                 "No customer is signed in — call Veyra.initialize with the customerId first",

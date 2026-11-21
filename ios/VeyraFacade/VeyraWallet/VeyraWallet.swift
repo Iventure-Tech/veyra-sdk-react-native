@@ -301,6 +301,10 @@ public struct Token: Sendable, Hashable, Identifiable {
     /// again: prompt the user to remove it and add it again. A token in this state always reads
     /// `requiresOnline == false`.
     public let deviceNotBound: Bool
+    /// True when this token's payment data is no longer on this phone: it cannot pay, and the
+    /// user must remove it and add it again. The same field as Android and React Native; on iOS
+    /// a token is listed only while its payment data is stored, so it reads `false`.
+    public let cardDataMissing: Bool
 
     public var id: String { tokenUniqueReference }
 }
@@ -1157,7 +1161,11 @@ public final class VeyraWallet: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard let kmp else {
-            throw configuration == nil ? VeyraError.notConfigured : VeyraError.notSignedIn
+            if configuration == nil { throw VeyraError.notConfigured }
+            // One failure line per signed-out period says a call was refused and how long
+            // after the sign-out, so a host that treats the throw as "no card" still leaves a trace.
+            OperationFailureLog.shared.reportNotSignedIn(action: nil)
+            throw VeyraError.notSignedIn
         }
         return kmp
     }
@@ -1272,7 +1280,8 @@ extension VeyraWallet {
                     requiresActivation: $0.requiresActivation,
                     activationMethods: nil,
                     requiresOnline: $0.requiresOnline,
-                    deviceNotBound: $0.deviceNotBound
+                    deviceNotBound: $0.deviceNotBound,
+                    cardDataMissing: $0.cardDataMissing
                 )
             }
         }

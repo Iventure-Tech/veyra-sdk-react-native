@@ -606,6 +606,12 @@ export interface Token {
    * always reads `requiresOnline: false`; payments with it are refused with `DEVICE_NOT_BOUND`.
    */
   deviceNotBound: boolean;
+  /**
+   * True when the card's payment data is no longer on this phone. It cannot pay and cannot be
+   * selected (`setActiveToken` answers `CARD_DATA_MISSING`): prompt the user to remove it and add
+   * it again. Android only; always `false` on iOS.
+   */
+  cardDataMissing: boolean;
 }
 
 // ── Wallet: payments ──────────────────────────────────────────────────────────

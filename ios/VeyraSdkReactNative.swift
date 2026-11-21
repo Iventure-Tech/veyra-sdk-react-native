@@ -128,6 +128,7 @@ class VeyraSdkReactNative: RCTEventEmitter {
 
   private func rejectNotInitialized(_ rejecter: RCTPromiseRejectBlock) {
     if configuredOnce {
+      OperationFailureLog.shared.reportNotSignedIn(action: nil)
       rejecter("NOT_SIGNED_IN", "No customer is signed in — call Veyra.initialize with the customerId first", nil)
     } else {
       rejecter("NOT_CONFIGURED", "Call Veyra.initialize first", nil)
@@ -787,6 +788,7 @@ class VeyraSdkReactNative: RCTEventEmitter {
       } as Any,
       "requiresOnline": token.requiresOnline,
       "deviceNotBound": token.deviceNotBound,
+      "cardDataMissing": token.cardDataMissing,
     ]
   }
 

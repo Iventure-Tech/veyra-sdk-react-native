@@ -450,6 +450,7 @@ internal object Mappers {
         )
         putBoolean("requiresOnline", t.requiresOnline)
         putBoolean("deviceNotBound", t.deviceNotBound)
+        putBoolean("cardDataMissing", t.cardDataMissing)
     }
 
     /**
